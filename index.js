@@ -307,80 +307,177 @@ document.getElementById('genBtn').addEventListener('click', function() {
   var btn = document.getElementById('genBtn');
   var st = document.getElementById('genStatus');
   var key = document.getElementById('ytKey').value.trim();
-  if (!key) { st.className='status err'; st.textContent='Paste your YouTube API key first.'; return; }
+  if (!key) {
+    st.className = 'status err';
+    st.textContent = 'Paste your YouTube API key first.';
+    return;
+  }
   btn.disabled = true;
   btn.textContent = 'Validating key...';
   st.className = 'status spin';
   st.textContent = 'Checking your API key with YouTube...';
+
   fetch('/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ytApiKey: key })
-  }).then(function(r){ return r.json(); }).then(function(d){
-    if (d.error) { st.className='status err'; st.textContent=d.error; btn.disabled=false; btn.textContent='Generate My Addon URL'; return; }
-    addonUrl = d.manifestUrl;
-    document.getElementById('genUrl').textContent = addonUrl;
-    document.getElementById('genBox').style.display = 'block';
-    document.getElementById('expToken').value = addonUrl;
-    st.className = 'status ok';
-    st.textContent = '\u2713 Your addon URL is ready';
-    btn.disabled = false;
-    btn.textContent = 'Regenerate URL';
-  }).catch(function(e){
+  }).then(function(r) {
+    if (!r.ok) {
+      return r.json().then(function(e) {
+        throw new Error(e.error || 'Bad response from server');
+      });
+    }
+    return r.json();
+  }).then(function(d) {
+    if (d.error) {
+      st.className = 'status err';
+      st.textContent = d.error;
+      addonUrl = '';
+    } else {
+      addonUrl = d.manifestUrl;
+      document.getElementById('genUrl').textContent = addonUrl;
+      document.getElementById('genUrl').style.display = 'block';
+      document.getElementById('genBox').style.display = 'block';
+      document.getElementById('expToken').value = addonUrl;
+      st.className = 'status ok';
+      st.textContent = '\\u2713 Your addon URL is ready';
+    }
+  }).catch(function(e) {
     st.className = 'status err';
     st.textContent = 'Error: ' + e.message;
+  }).finally(function() {
     btn.disabled = false;
     btn.textContent = 'Generate My Addon URL';
   });
 });
+
 document.getElementById('copyBtn').addEventListener('click', function() {
-  if (!addonUrl) return;
-  navigator.clipboard.writeText(addonUrl).then(function() {
-    var b = document.getElementById('copyBtn');
-    b.textContent = 'Copied!';
-    setTimeout(function() { b.textContent = 'Copy URL'; }, 1500);
-  });
+  var urlElem = document.getElementById('genUrl');
+  var url = (urlElem && urlElem.textContent || '').trim();
+  if (!url) return;
+
+  // Try modern Clipboard API, fall back to old school
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(url).then(function() {
+      var b = document.getElementById('copyBtn');
+      b.textContent = 'Copied!';
+      setTimeout(function() { b.textContent = 'Copy URL'; }, 1500);
+    }).catch(function(err) {
+      console.warn('Clipboard API failed:', err);
+      fallbackCopy(url);
+    });
+  } else {
+    fallbackCopy(url);
+  }
 });
+
+function fallbackCopy(url) {
+  var input = document.createElement('input');
+  input.style = 'position:fixed;opacity:0;';
+  input.value = url;
+  document.body.appendChild(input);
+  input.select();
+  document.execCommand('copy');
+  document.body.removeChild(input);
+  var b = document.getElementById('copyBtn');
+  b.textContent = 'Copied!';
+  setTimeout(function() { b.textContent = 'Copy URL'; }, 1500);
+}
+
+function createCSVHeader() {
+  return 'Position,Title,Artist,URL\\n';
+}
+function createCSVRow(idx, t) {
+  return (idx+1) + ',"' + (t.title || '').replace(/"/g,'""') + '","' + (t.artist || '').replace(/"/g,'""') + '","' + (t.sourceURL || '') + '"\\n';
+}
+
 document.getElementById('expBtn').addEventListener('click', function() {
   var btn = document.getElementById('expBtn');
   var raw = document.getElementById('expToken').value.trim();
   var q = document.getElementById('expQuery').value.trim();
   var st = document.getElementById('expStatus');
   var pv = document.getElementById('expPreview');
-  if (!raw) { st.className='status err'; st.textContent='Paste your addon URL first.'; return; }
-  if (!q) { st.className='status err'; st.textContent='Enter a search query.'; return; }
-  var m = raw.match(/\/([a-f0-9]{28})\//i);
-  if (!m) { st.className='status err'; st.textContent='Could not find token in URL.'; return; }
+
+  if (!raw) {
+    st.className = 'status err';
+    st.textContent = 'Paste your addon URL first.';
+    return;
+  }
+  if (!q) {
+    st.className = 'status err';
+    st.textContent = 'Enter a search query.';
+    return;
+  }
+
+  var m = raw.match(/\\/([a-f0-9]{28})\\//i);
+  if (!m) {
+    st.className = 'status err';
+    st.textContent = 'Could not find token in URL.';
+    return;
+  }
   var tok = m[1];
+
   btn.disabled = true;
   btn.textContent = 'Fetching...';
   st.className = 'status spin';
   st.textContent = 'Searching...';
-  fetch('/' + tok + '/search?q=' + encodeURIComponent(q)).then(function(r){
-    if (!r.ok) return r.json().then(function(e){ throw new Error(e.error || ('Server error ' + r.status)); });
+
+  fetch('/' + tok + '/search?q=' + encodeURIComponent(q)).then(function(r) {
+    if (!r.ok) {
+      return r.json().then(function(e) {
+        throw new Error(e.error || 'Server error ' + r.status);
+      });
+    }
     return r.json();
-  }).then(function(data){
-    var tracks = data.tracks || [];
-    if (!tracks.length) throw new Error('No tracks found for that query.');
-    pv.innerHTML = tracks.slice(0, 40).map(function(t, i){
-      return '<div>' + (i+1) + '. ' + t.title + ' \u2014 ' + t.artist + '</div>';
+  }).then(function(data) {
+    var tracks = (data.tracks || []);
+    if (!tracks.length) {
+      throw new Error('No tracks found for that query.');
+    }
+
+    // Show preview (top 20 results)
+    pv.innerHTML = tracks.slice(0, 20).map(function(t, i) {
+      return '<div>' + (i+1) + '. ' + esc(t.title || '') + ' — ' + esc(cleanText(t.artist || '')) + '</div>';
     }).join('');
-    pv.style.display = 'block';
+
+    // Build CSV
+    var csv = createCSVHeader() + tracks.map(function(t, i) {
+      return createCSVRow(i, t);
+    }).join('');
+
+    // Trigger CSV download
+    var blob = new Blob([csv], { type: 'text/csv' });
+    var a = document.createElement('a');
+    a.download = 'ytaddon_search_' + encodeURIComponent(q).replace(/%20/g, '_') + '.csv';
+    a.href = window.URL.createObjectURL(blob);
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(a.href);
+
     st.className = 'status ok';
-    st.textContent = 'Found ' + tracks.length + ' tracks';
-    btn.disabled = false;
-    btn.textContent = 'Fetch & Download CSV';
-  }).catch(function(e){
+    st.textContent = 'Found ' + tracks.length + ' tracks (CSV downloaded)';
+  }).catch(function(e) {
     st.className = 'status err';
     st.textContent = e.message;
+  }).finally(function() {
     btn.disabled = false;
     btn.textContent = 'Fetch & Download CSV';
   });
 });
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/\"/g,'"');
+}
+function cleanText(s) {
+  return String(s || '').replace(/\\s+/g, ' ').trim();
+}
 </script>
 </body>
 </html>`;
 }
+
 
 app.get('/', function(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
