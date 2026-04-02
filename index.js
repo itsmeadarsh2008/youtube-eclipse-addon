@@ -165,25 +165,39 @@ async function resolveAudioViaInvidious(videoId) {
   for (const instance of INVIDIOUS_INSTANCES) {
     try {
       const url = `${instance}/api/v1/videos/${videoId}`;
-      const data = await axios.get(url, { timeout: 10000, headers: { 'User-Agent': UA } });
+      const data = await axios.get(url, {
+        timeout: 10000,
+        headers: { 'User-Agent': UA }
+      });
+
       const formats = data.data?.adaptiveFormats || [];
-      const playable = formats.filter(f =>
+      const playableFormats = formats.filter(f =>
         f.type?.startsWith('audio/') ||
         f.type?.includes('audio/mp4') ||
         f.type?.includes('audio/webm') ||
         f.type?.includes('audio/opus')
       );
-      if (!playable.length) {
+
+      if (!playableFormats.length) {
         console.warn(`[stream] ${instance} has no suitable audio for ${videoId}`);
         continue;
       }
-      const m4a = playable.find(f => f.type?.includes('audio/mp4'));
-      const webm = playable.find(f => f.type?.includes('audio/webm'));
-      const opus = playable.find(f => f.type?.includes('audio/opus'));
-      const best = m4a || webm || opus || playable[0];
+
+      // Prefer m4a, then webm/opus, then any audio
+      const m4a = playableFormats.find(f => f.type?.includes('audio/mp4'));
+      const webm = playableFormats.find(f => f.type?.includes('audio/webm'));
+      const opus = playableFormats.find(f => f.type?.includes('audio/opus'));
+      const any = playableFormats[0];
+
+      const best = m4a || webm || opus || any;
+
       if (best && best.url) {
-        const fmt = best.type?.includes('mp4') ? 'm4a' : best.type?.includes('webm') ? 'webm' : best.type?.includes('opus') ? 'opus' : 'ogg';
+        const fmt = best.type?.includes('mp4') ? 'm4a' :
+                    best.type?.includes('webm') ? 'webm' :
+                    best.type?.includes('opus') ? 'opus' : 'ogg';
+
         console.log(`[stream] ✅ ${videoId} → ${fmt} from ${instance}`);
+
         return {
           url: best.url,
           format: fmt,
