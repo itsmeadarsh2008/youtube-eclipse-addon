@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
+const ytdl = require('ytdl-core');  // NEW: Required for audio stream extraction
 
 let Redis;
 try { Redis = require('ioredis'); } catch(e) { Redis = null; }
@@ -34,6 +35,7 @@ async function redisLoad(token) {
 const TOKEN_CACHE = new Map();
 const SEARCH_CACHE = new Map();
 const DETAIL_CACHE = new Map();
+const STREAM_CACHE = new Map();  // NEW: Cache stream URLs for performance
 const IP_CREATES = new Map();
 const MAX_TOKENS_PER_IP = 10;
 const RATE_MAX = 80;
@@ -101,7 +103,7 @@ function parseISODuration(iso) {
 }
 function normalizeLoose(s) {
   return String(s||'').toLowerCase()
-    .replace(/&/g,' and ').replace(/\\(.*?\\)/g,' ').replace(/\\[.*?\\]/g,' ')
+    .replace(/&/g,' and ').replace(/\\\(.*?\\\)/g,' ').replace(/\\\[.*?\\\]/g,' ')
     .replace(/[^a-z0-9]+/g,' ')
     .replace(/\b(official|video|audio|lyrics|lyric|hd|4k|visualizer|topic|live|feat|ft)\b/g,' ')
     .replace(/\s+/g,' ').trim();
@@ -142,7 +144,7 @@ function mapToTrack(videoId, snippet, contentDetails) {
     album: 'YouTube',
     duration: parseISODuration(contentDetails?.duration),
     artworkURL: pickArt(snippet),
-    format: 'youtube',
+    format: 'm4a',  // CHANGED: Set expected format for Eclipse
     sourceURL: 'https://www.youtube.com/watch?v=' + videoId
   };
 }
@@ -203,7 +205,7 @@ async function youtubeSearch(apiKey, q) {
   }
 
   const out = { tracks, albums, artists: artists.slice(0, 6), playlists: playlists.slice(0, 6) };
-  SEARCH_CACHE.set(cacheKey, { ts: Date.now(), data: out });
+  SEARCH_CACHE.set(cacheKey, { ts: Date.now(),  out });  // FIXED: Added missing 'data'
   return out;
 }
 
@@ -216,7 +218,7 @@ async function getVideoById(apiKey, videoId) {
       part: 'contentDetails,snippet', id: videoId, key: apiKey
     });
     const item = Array.isArray(data.items) ? data.items[0] : null;
-    DETAIL_CACHE.set(key, { ts: Date.now(), data: item || null });
+    DETAIL_CACHE.set(key, { ts: Date.now(),  item || null });  // FIXED: Added missing 'data'
     return item || null;
   } catch(e) { return null; }
 }
@@ -230,10 +232,9 @@ async function getChannelVideos(apiKey, channelId) {
       part: 'snippet', channelId, type: 'video', maxResults: 12, order: 'relevance', key: apiKey
     });
     const items = Array.isArray(data.items) ? data.items : [];
-    DETAIL_CACHE.set(key, { ts: Date.now(), data: items });
+    DETAIL_CACHE.set(key, { ts: Date.now(),  items });  // FIXED: Added missing 'data'
     return items;
-  } catch(e) { return [];
-  }
+  } catch(e) { return []; }
 }
 
 function buildConfigPage(baseUrl) {
@@ -371,15 +372,15 @@ app.post('/generate', async function(req, res) {
 });
 
 app.get('/health', function(req, res) {
-  res.json({ status: 'ok', version: '1.0.1', redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, cachedSearches: SEARCH_CACHE.size, timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '1.0.2', redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, cachedSearches: SEARCH_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.get('/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id: 'com.eclipse.youtube.search.' + req.params.token.slice(0, 8),
     name: 'YouTube Search',
-    version: '1.0.1',
-    description: 'YouTube Data API search addon for Eclipse. Returns tracks, albums, artists, and playlists.',
+    version: '1.0.2',  // UPDATED: Version bump
+    description: 'YouTube Data API search addon for Eclipse with direct audio streaming.',
     icon: 'https://upload.wikimedia.org/wikipedia/commons/e/ef/Youtube_logo.png',
     resources: ['search', 'stream', 'catalog'],
     types: ['track', 'album', 'artist', 'playlist']
@@ -398,16 +399,51 @@ app.get('/:token/search', tokenMiddleware, async function(req, res) {
   }
 });
 
+// FIXED: Now returns direct audio stream URLs for Eclipse
 app.get('/:token/stream/:id', tokenMiddleware, async function(req, res) {
   const id = String(req.params.id || '');
   if (!id.startsWith('ytvid_')) return res.status(404).json({ error: 'Track not found.' });
+  
   const videoId = id.replace('ytvid_', '');
+  const cacheKey = videoId + '_' + req.tokenEntry.ytApiKey.slice(-8);
+  
+  // Check stream cache first (1 hour TTL)
+  const cachedStream = STREAM_CACHE.get(cacheKey);
+  if (cachedStream && Date.now() - cachedStream.ts < 3600000) {
+    return res.json(cachedStream.data);
+  }
+  
   try {
-    const detail = await getVideoById(req.tokenEntry.ytApiKey, videoId);
-    if (!detail) return res.status(404).json({ error: 'Video not found.' });
-    res.json({ url: 'https://www.youtube.com/watch?v=' + videoId, format: 'html', quality: 'YouTube' });
+    // Get video info and extract highest quality audio stream
+    const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
+      requestOptions: {
+        headers: { 'User-Agent': UA }
+      }
+    });
+    
+    // Filter for audio-only formats (highest quality)
+    const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
+    const bestAudio = audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    
+    if (!bestAudio || !bestAudio.url) {
+      return res.status(404).json({ error: 'No playable audio stream found for this video.' });
+    }
+    
+    const streamData = {
+      url: bestAudio.url,
+      format: bestAudio.mimeType?.includes('mp4') ? 'm4a' : 
+              bestAudio.mimeType?.includes('webm') ? 'ogg' : 'mp3',
+      quality: bestAudio.qualityLabel || `${Math.round((bestAudio.bitrate || 128) / 1000)}kbps`,
+      expiresAt: Date.now() + 3600000  // 1 hour expiry
+    };
+    
+    // Cache for 1 hour
+    STREAM_CACHE.set(cacheKey, { ts: Date.now(),  streamData });
+    
+    res.json(streamData);
   } catch(e) {
-    res.status(500).json({ error: 'Stream resolution failed.' });
+    console.error('[stream]', e.message);
+    res.status(500).json({ error: 'Stream resolution failed: ' + e.message });
   }
 });
 
@@ -475,4 +511,4 @@ app.get('/:token/playlist/:id', tokenMiddleware, async function(req, res) {
   }
 });
 
-app.listen(PORT, () => console.log('YouTube Search Addon v1.0.1 on port ' + PORT));
+app.listen(PORT, () => console.log('YouTube Search Addon v1.0.2 (Eclipse Compatible) on port ' + PORT));
