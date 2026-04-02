@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
-const ytdl = require('ytdl-core');  // NEW: Required for audio stream extraction
 
 let Redis;
 try { Redis = require('ioredis'); } catch(e) { Redis = null; }
@@ -35,13 +34,23 @@ async function redisLoad(token) {
 const TOKEN_CACHE = new Map();
 const SEARCH_CACHE = new Map();
 const DETAIL_CACHE = new Map();
-const STREAM_CACHE = new Map();  // NEW: Cache stream URLs for performance
+const STREAM_CACHE = new Map();
 const IP_CREATES = new Map();
 const MAX_TOKENS_PER_IP = 10;
 const RATE_MAX = 80;
 const RATE_WINDOW_MS = 60000;
 const SOURCE_TIMEOUT_MS = 10000;
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+// Invidious public instances — tried in order, falls back if one fails
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.io',
+  'https://vid.puffyan.us',
+  'https://invidious.slipfox.xyz',
+  'https://invidious.nerdvpn.de',
+  'https://yt.cdaut.de'
+];
 
 function generateToken() { return crypto.randomBytes(14).toString('hex'); }
 function cleanText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
@@ -103,7 +112,7 @@ function parseISODuration(iso) {
 }
 function normalizeLoose(s) {
   return String(s||'').toLowerCase()
-    .replace(/&/g,' and ').replace(/\\\(.*?\\\)/g,' ').replace(/\\\[.*?\\\]/g,' ')
+    .replace(/&/g,' and ').replace(/\\(.*?\\)/g,' ').replace(/\\[.*?\\]/g,' ')
     .replace(/[^a-z0-9]+/g,' ')
     .replace(/\b(official|video|audio|lyrics|lyric|hd|4k|visualizer|topic|live|feat|ft)\b/g,' ')
     .replace(/\s+/g,' ').trim();
@@ -144,9 +153,35 @@ function mapToTrack(videoId, snippet, contentDetails) {
     album: 'YouTube',
     duration: parseISODuration(contentDetails?.duration),
     artworkURL: pickArt(snippet),
-    format: 'm4a',  // CHANGED: Set expected format for Eclipse
+    format: 'm4a',
     sourceURL: 'https://www.youtube.com/watch?v=' + videoId
   };
+}
+
+// Tries each Invidious instance in order until one returns a valid audio URL
+async function resolveAudioViaInvidious(videoId) {
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const url = `${instance}/api/v1/videos/${videoId}`;
+      const data = await axios.get(url, { timeout: 8000, headers: { 'User-Agent': UA } });
+      const formats = data.data?.adaptiveFormats || [];
+      // Prefer m4a audio-only, then any audio-only
+      const m4a = formats.find(f => f.type?.includes('audio/mp4'));
+      const any = formats.find(f => f.type?.startsWith('audio/'));
+      const best = m4a || any;
+      if (best && best.url) {
+        return {
+          url: best.url,
+          format: best.type?.includes('mp4') ? 'm4a' : 'ogg',
+          quality: best.bitrate ? `${Math.round(best.bitrate / 1000)}kbps` : 'standard',
+          expiresAt: Date.now() + 3600000
+        };
+      }
+    } catch(e) {
+      console.warn(`[stream] Invidious instance ${instance} failed: ${e.message}`);
+    }
+  }
+  return null;
 }
 
 async function youtubeSearch(apiKey, q) {
@@ -205,7 +240,7 @@ async function youtubeSearch(apiKey, q) {
   }
 
   const out = { tracks, albums, artists: artists.slice(0, 6), playlists: playlists.slice(0, 6) };
-  SEARCH_CACHE.set(cacheKey, { ts: Date.now(),  out });  // FIXED: Added missing 'data'
+  SEARCH_CACHE.set(cacheKey, { ts: Date.now(),  out });  // FIXED
   return out;
 }
 
@@ -218,7 +253,7 @@ async function getVideoById(apiKey, videoId) {
       part: 'contentDetails,snippet', id: videoId, key: apiKey
     });
     const item = Array.isArray(data.items) ? data.items[0] : null;
-    DETAIL_CACHE.set(key, { ts: Date.now(),  item || null });  // FIXED: Added missing 'data'
+    DETAIL_CACHE.set(key, { ts: Date.now(),  item || null });  // FIXED
     return item || null;
   } catch(e) { return null; }
 }
@@ -232,7 +267,7 @@ async function getChannelVideos(apiKey, channelId) {
       part: 'snippet', channelId, type: 'video', maxResults: 12, order: 'relevance', key: apiKey
     });
     const items = Array.isArray(data.items) ? data.items : [];
-    DETAIL_CACHE.set(key, { ts: Date.now(),  items });  // FIXED: Added missing 'data'
+    DETAIL_CACHE.set(key, { ts: Date.now(),  items });  // FIXED
     return items;
   } catch(e) { return []; }
 }
@@ -291,7 +326,7 @@ document.getElementById('genBtn').addEventListener('click', function() {
     document.getElementById('genBox').style.display = 'block';
     document.getElementById('expToken').value = addonUrl;
     st.className = 'status ok';
-    st.textContent = '\\u2713 Your addon URL is ready';
+    st.textContent = '\u2713 Your addon URL is ready';
     btn.disabled = false;
     btn.textContent = 'Regenerate URL';
   }).catch(function(e){
@@ -317,7 +352,7 @@ document.getElementById('expBtn').addEventListener('click', function() {
   var pv = document.getElementById('expPreview');
   if (!raw) { st.className='status err'; st.textContent='Paste your addon URL first.'; return; }
   if (!q) { st.className='status err'; st.textContent='Enter a search query.'; return; }
-  var m = raw.match(/\\/([a-f0-9]{28})\\//i);
+  var m = raw.match(/\/([a-f0-9]{28})\//i);
   if (!m) { st.className='status err'; st.textContent='Could not find token in URL.'; return; }
   var tok = m[1];
   btn.disabled = true;
@@ -331,7 +366,7 @@ document.getElementById('expBtn').addEventListener('click', function() {
     var tracks = data.tracks || [];
     if (!tracks.length) throw new Error('No tracks found for that query.');
     pv.innerHTML = tracks.slice(0, 40).map(function(t, i){
-      return '<div>' + (i+1) + '. ' + t.title + ' — ' + t.artist + '</div>';
+      return '<div>' + (i+1) + '. ' + t.title + ' \u2014 ' + t.artist + '</div>';
     }).join('');
     pv.style.display = 'block';
     st.className = 'status ok';
@@ -379,8 +414,8 @@ app.get('/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id: 'com.eclipse.youtube.search.' + req.params.token.slice(0, 8),
     name: 'YouTube Search',
-    version: '1.0.2',  // UPDATED: Version bump
-    description: 'YouTube Data API search addon for Eclipse with direct audio streaming.',
+    version: '1.0.2',
+    description: 'YouTube Data API search addon for Eclipse. Returns tracks, albums, artists, and playlists.',
     icon: 'https://upload.wikimedia.org/wikipedia/commons/e/ef/Youtube_logo.png',
     resources: ['search', 'stream', 'catalog'],
     types: ['track', 'album', 'artist', 'playlist']
@@ -399,52 +434,26 @@ app.get('/:token/search', tokenMiddleware, async function(req, res) {
   }
 });
 
-// FIXED: Now returns direct audio stream URLs for Eclipse
+// FIXED: Uses Invidious instances to get direct audio URLs — avoids cloud IP blocks
 app.get('/:token/stream/:id', tokenMiddleware, async function(req, res) {
   const id = String(req.params.id || '');
   if (!id.startsWith('ytvid_')) return res.status(404).json({ error: 'Track not found.' });
-  
+
   const videoId = id.replace('ytvid_', '');
-  const cacheKey = videoId + '_' + req.tokenEntry.ytApiKey.slice(-8);
-  
-  // Check stream cache first (1 hour TTL)
-  const cachedStream = STREAM_CACHE.get(cacheKey);
-  if (cachedStream && Date.now() - cachedStream.ts < 3600000) {
-    return res.json(cachedStream.data);
+
+  // Return cached stream URL if still valid
+  const cached = STREAM_CACHE.get(videoId);
+  if (cached && Date.now() < cached.expiresAt - 300000) {
+    return res.json(cached);
   }
-  
-  try {
-    // Get video info and extract highest quality audio stream
-    const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
-      requestOptions: {
-        headers: { 'User-Agent': UA }
-      }
-    });
-    
-    // Filter for audio-only formats (highest quality)
-    const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-    const bestAudio = audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-    
-    if (!bestAudio || !bestAudio.url) {
-      return res.status(404).json({ error: 'No playable audio stream found for this video.' });
-    }
-    
-    const streamData = {
-      url: bestAudio.url,
-      format: bestAudio.mimeType?.includes('mp4') ? 'm4a' : 
-              bestAudio.mimeType?.includes('webm') ? 'ogg' : 'mp3',
-      quality: bestAudio.qualityLabel || `${Math.round((bestAudio.bitrate || 128) / 1000)}kbps`,
-      expiresAt: Date.now() + 3600000  // 1 hour expiry
-    };
-    
-    // Cache for 1 hour
-    STREAM_CACHE.set(cacheKey, { ts: Date.now(),  streamData });
-    
-    res.json(streamData);
-  } catch(e) {
-    console.error('[stream]', e.message);
-    res.status(500).json({ error: 'Stream resolution failed: ' + e.message });
+
+  const result = await resolveAudioViaInvidious(videoId);
+  if (!result) {
+    return res.status(502).json({ error: 'Could not resolve audio stream. All Invidious instances failed.' });
   }
+
+  STREAM_CACHE.set(videoId, result);
+  res.json(result);
 });
 
 app.get('/:token/album/:id', tokenMiddleware, async function(req, res) {
@@ -511,4 +520,4 @@ app.get('/:token/playlist/:id', tokenMiddleware, async function(req, res) {
   }
 });
 
-app.listen(PORT, () => console.log('YouTube Search Addon v1.0.2 (Eclipse Compatible) on port ' + PORT));
+app.listen(PORT, () => console.log('YouTube Search Addon v1.0.2 on port ' + PORT));
