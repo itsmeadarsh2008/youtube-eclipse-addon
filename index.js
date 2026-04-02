@@ -1,4 +1,3 @@
-```js
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -537,5 +536,3 @@ app.get('/:token/playlist/:id', tokenMiddleware, async function(req, res) {
 });
 
 app.listen(PORT, () => console.log('YouTube Search Addon v1.0.2 on port ' + PORT));
-
-```
