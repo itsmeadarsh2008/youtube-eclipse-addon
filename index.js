@@ -44,7 +44,7 @@ const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/6
 function generateToken() { return crypto.randomBytes(14).toString('hex'); }
 function cleanText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 function getBaseUrl(req) { return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host'); }
-function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;'); }
 
 function getOrCreateIpBucket(ip) {
   const now = Date.now();
@@ -101,7 +101,7 @@ function parseISODuration(iso) {
 }
 function normalizeLoose(s) {
   return String(s||'').toLowerCase()
-    .replace(/&/g,' and ').replace(/\(.*?\)/g,' ').replace(/\[.*?\]/g,' ')
+    .replace(/&/g,' and ').replace(/\\(.*?\\)/g,' ').replace(/\\[.*?\\]/g,' ')
     .replace(/[^a-z0-9]+/g,' ')
     .replace(/\b(official|video|audio|lyrics|lyric|hd|4k|visualizer|topic|live|feat|ft)\b/g,' ')
     .replace(/\s+/g,' ').trim();
@@ -232,10 +232,10 @@ async function getChannelVideos(apiKey, channelId) {
     const items = Array.isArray(data.items) ? data.items : [];
     DETAIL_CACHE.set(key, { ts: Date.now(), data: items });
     return items;
-  } catch(e) { return []; }
+  } catch(e) { return [];
+  }
 }
 
-// ─── Config page (clean template literal, no escaping hell) ──────────────────
 function buildConfigPage(baseUrl) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -246,165 +246,60 @@ function buildConfigPage(baseUrl) {
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0c0a08;color:#e8e4de;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}
-.logo-wrap{display:flex;align-items:center;gap:14px;margin-bottom:28px}
-.logo-text{font-size:26px;font-weight:800;color:#c8a53a;letter-spacing:-.02em}
-.logo-sub{font-size:13px;color:#554e3a;margin-top:3px}
 .card{background:#131109;border:1px solid #2a2310;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.6);margin-bottom:20px}
-h2{font-size:16px;font-weight:700;margin-bottom:14px;color:#fff}
-p.sub{font-size:14px;color:#6a6457;margin-bottom:20px;line-height:1.6}
-.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
-.stat{background:#110e06;border:1px solid #2a2000;border-radius:10px;padding:14px;text-align:center}
-.stat-n{font-size:22px;font-weight:800;color:#c8a53a}.stat-l{font-size:11px;color:#554e3a;margin-top:3px}
-.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
-.pill{border-radius:20px;font-size:11px;font-weight:600;padding:4px 10px;background:#1a1400;color:#c8a53a;border:1px solid #3a2e08}
-.pill.g{background:#0a1a0a;color:#6db86d;border-color:#2d422a}
-.lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#554e3a;margin-bottom:8px;margin-top:16px}
-input,textarea{width:100%;background:#0c0a06;border:1px solid #2a2000;border-radius:10px;color:#e8e4de;font-size:14px;padding:12px 14px;margin-bottom:6px;outline:none;transition:border-color .15s}
-input:focus,textarea:focus{border-color:#c8a53a}
-input::placeholder,textarea::placeholder{color:#2a2416}
-.hint{font-size:12px;color:#484030;margin-bottom:12px;line-height:1.7}
-.hint code{background:#1a1400;padding:1px 5px;border-radius:4px;color:#6a5a28}
-button{cursor:pointer;border:none;border-radius:10px;font-size:15px;font-weight:700;padding:13px;width:100%;margin-top:6px;margin-bottom:12px;transition:background .15s}
-.bo{background:#c8a53a;color:#0c0a00}.bo:hover{background:#e0bc50}.bo:disabled{background:#252014;color:#444;cursor:not-allowed}
-.bg{background:#1a2a14;color:#e8e4de;border:1px solid #3a5020}.bg:hover{background:#243a1a}.bg:disabled{background:#1a1a14;color:#444;cursor:not-allowed}
-.bd{background:#1a1a14;color:#aaa;border:1px solid #2a2a18;font-size:13px;padding:10px}.bd:hover{background:#222218;color:#fff}
+button{cursor:pointer;border:none;border-radius:10px;font-size:15px;font-weight:700;padding:13px;width:100%;margin-top:6px;margin-bottom:12px}
+.bo{background:#c8a53a;color:#0c0a00}.bg{background:#1a2a14;color:#e8e4de;border:1px solid #3a5020}.bd{background:#1a1a14;color:#aaa;border:1px solid #2a2a18;font-size:13px;padding:10px}
+input{width:100%;background:#0c0a06;border:1px solid #2a2000;border-radius:10px;color:#e8e4de;font-size:14px;padding:12px 14px;margin-bottom:6px;outline:none}
 .box{display:none;background:#0c0a06;border:1px solid #2a2000;border-radius:12px;padding:18px;margin-bottom:14px}
-.blbl{font-size:10px;color:#554e3a;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
+.status{font-size:13px;color:#6a5a28;margin:8px 0;min-height:18px}.status.ok{color:#6db86d}.status.err{color:#c0392b}.status.spin{color:#c8a53a}
 .burl{font-size:12px;color:#c8a53a;word-break:break-all;font-family:"SF Mono",ui-monospace,monospace;margin-bottom:14px;line-height:1.5}
-.status{font-size:13px;color:#6a5a28;margin:8px 0;min-height:18px}
-.status.ok{color:#6db86d}.status.err{color:#c0392b}.status.spin{color:#c8a53a}
 .preview{background:#0c0a06;border:1px solid #1a1600;border-radius:10px;padding:12px;max-height:220px;overflow-y:auto;margin-bottom:12px;display:none}
-.tr{display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid #181200;font-size:13px}
-.tr:last-child{border-bottom:none}.tn{color:#444;font-size:11px;min-width:22px;text-align:right}
-.ti{flex:1;min-width:0}.tt{color:#e8e4de;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ta{color:#666;font-size:11px}
-hr{border:none;border-top:1px solid #1a1600;margin:24px 0}
-footer{margin-top:32px;font-size:12px;color:#3a3020;text-align:center;line-height:1.8}
-footer a{color:#3a3020;text-decoration:none}
 </style>
 </head>
 <body>
-
-<div class="logo-wrap">
-  <svg width="52" height="52" viewBox="0 0 52 52" fill="none">
-    <circle cx="26" cy="26" r="26" fill="#1a1400"/>
-    <rect x="10" y="32" width="32" height="4" rx="2" fill="#c8a53a"/>
-    <rect x="14" y="26" width="24" height="4" rx="2" fill="#c8a53a" opacity=".7"/>
-    <rect x="18" y="20" width="16" height="4" rx="2" fill="#c8a53a" opacity=".45"/>
-    <rect x="22" y="14" width="8" height="4" rx="2" fill="#c8a53a" opacity=".25"/>
-  </svg>
-  <div>
-    <div class="logo-text">YouTube Search</div>
-    <div class="logo-sub">Eclipse Addon &mdash; Render Ready</div>
-  </div>
-</div>
-
 <div class="card">
-  <div class="stat-grid">
-    <div class="stat"><div class="stat-n">API</div><div class="stat-l">Official only</div></div>
-    <div class="stat"><div class="stat-n">0</div><div class="stat-l">Bot bypasses</div></div>
-    <div class="stat"><div class="stat-n">User key</div><div class="stat-l">Own quota</div></div>
-  </div>
-  <p class="sub">Uses the official YouTube Data API v3 — no scraping, no bot bypass, no datacenter blocks. Each user provides their own free API key.</p>
-  <div class="pills">
-    <span class="pill">Tracks</span>
-    <span class="pill">Albums</span>
-    <span class="pill">Artists</span>
-    <span class="pill">Playlists</span>
-    <span class="pill g">No scraper</span>
-    <span class="pill g">Render-safe</span>
-  </div>
-
-  <div class="lbl">YouTube Data API v3 Key</div>
-  <input type="text" id="ytKey" placeholder="Paste your YouTube API key (AIzaSy...)">
-  <div class="hint">
-    Get a free key at <code>console.cloud.google.com</code> &rarr; Create Project &rarr; Enable <code>YouTube Data API v3</code> &rarr; Credentials &rarr; Create API Key.
-  </div>
-
+  <input id="ytKey" placeholder="Paste your YouTube API key">
   <button class="bo" id="genBtn">Generate My Addon URL</button>
-
-  <div class="box" id="genBox">
-    <div class="blbl">Your addon URL &mdash; paste into Eclipse</div>
-    <div class="burl" id="genUrl"></div>
-    <button class="bd" id="copyBtn">Copy URL</button>
-  </div>
+  <div class="box" id="genBox"><div class="burl" id="genUrl"></div><button class="bd" id="copyBtn">Copy URL</button></div>
   <div class="status" id="genStatus"></div>
-
-  <hr>
-  <h2>Export Search to CSV</h2>
-  <p class="sub">Test what the addon returns for any query and download the results as a CSV.</p>
-
-  <div class="lbl">Your Addon URL</div>
-  <input type="text" id="expToken" placeholder="Paste your generated addon URL here">
-
-  <div class="lbl">Search Query</div>
-  <input type="text" id="expQuery" placeholder="e.g. Drake Gods Plan">
-
+  <input id="expToken" placeholder="Paste your addon URL here">
+  <input id="expQuery" placeholder="Search query">
   <div class="status" id="expStatus"></div>
   <div class="preview" id="expPreview"></div>
   <button class="bg" id="expBtn">Fetch &amp; Download CSV</button>
 </div>
-
-<footer>
-  YouTube Search Addon v1.0.0 &bull; Render-ready &bull;
-  <a href="${baseUrl}/health" target="_blank" rel="noopener noreferrer">Health</a>
-</footer>
-
 <script>
 var addonUrl = '';
-
 document.getElementById('genBtn').addEventListener('click', function() {
   var btn = document.getElementById('genBtn');
   var st = document.getElementById('genStatus');
   var key = document.getElementById('ytKey').value.trim();
-
-  if (!key) {
-    st.className = 'status err';
-    st.textContent = 'Paste your YouTube API key first.';
-    return;
-  }
-  if (!key.startsWith('AIza')) {
-    st.className = 'status err';
-    st.textContent = 'That does not look like a YouTube API key (should start with AIza).';
-    return;
-  }
-
+  if (!key) { st.className='status err'; st.textContent='Paste your YouTube API key first.'; return; }
   btn.disabled = true;
   btn.textContent = 'Validating key...';
   st.className = 'status spin';
   st.textContent = 'Checking your API key with YouTube...';
-
   fetch('/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ytApiKey: key })
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.error) {
-      st.className = 'status err';
-      st.textContent = d.error;
-      btn.disabled = false;
-      btn.textContent = 'Generate My Addon URL';
-      return;
-    }
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (d.error) { st.className='status err'; st.textContent=d.error; btn.disabled=false; btn.textContent='Generate My Addon URL'; return; }
     addonUrl = d.manifestUrl;
     document.getElementById('genUrl').textContent = addonUrl;
     document.getElementById('genBox').style.display = 'block';
     document.getElementById('expToken').value = addonUrl;
     st.className = 'status ok';
-    st.textContent = '\u2713 Your addon URL is ready';
+    st.textContent = '\\u2713 Your addon URL is ready';
     btn.disabled = false;
     btn.textContent = 'Regenerate URL';
-  })
-  .catch(function(e) {
+  }).catch(function(e){
     st.className = 'status err';
     st.textContent = 'Error: ' + e.message;
     btn.disabled = false;
     btn.textContent = 'Generate My Addon URL';
   });
 });
-
 document.getElementById('copyBtn').addEventListener('click', function() {
   if (!addonUrl) return;
   navigator.clipboard.writeText(addonUrl).then(function() {
@@ -413,64 +308,36 @@ document.getElementById('copyBtn').addEventListener('click', function() {
     setTimeout(function() { b.textContent = 'Copy URL'; }, 1500);
   });
 });
-
 document.getElementById('expBtn').addEventListener('click', function() {
   var btn = document.getElementById('expBtn');
   var raw = document.getElementById('expToken').value.trim();
   var q = document.getElementById('expQuery').value.trim();
   var st = document.getElementById('expStatus');
   var pv = document.getElementById('expPreview');
-
-  if (!raw) { st.className = 'status err'; st.textContent = 'Paste your addon URL first.'; return; }
-  if (!q) { st.className = 'status err'; st.textContent = 'Enter a search query.'; return; }
-
-  var tokMatch = raw.match(/\/([a-f0-9]{28})\//i);
-  if (!tokMatch) { st.className = 'status err'; st.textContent = 'Could not find token in your URL.'; return; }
-  var tok = tokMatch[1];
-
+  if (!raw) { st.className='status err'; st.textContent='Paste your addon URL first.'; return; }
+  if (!q) { st.className='status err'; st.textContent='Enter a search query.'; return; }
+  var m = raw.match(/\\/([a-f0-9]{28})\\//i);
+  if (!m) { st.className='status err'; st.textContent='Could not find token in URL.'; return; }
+  var tok = m[1];
   btn.disabled = true;
   btn.textContent = 'Fetching...';
   st.className = 'status spin';
   st.textContent = 'Searching...';
-  pv.style.display = 'none';
-
-  fetch('/' + tok + '/search?q=' + encodeURIComponent(q))
-  .then(function(r) {
-    if (!r.ok) return r.json().then(function(e) { throw new Error(e.error || 'Server error ' + r.status); });
+  fetch('/' + tok + '/search?q=' + encodeURIComponent(q)).then(function(r){
+    if (!r.ok) return r.json().then(function(e){ throw new Error(e.error || ('Server error ' + r.status)); });
     return r.json();
-  })
-  .then(function(data) {
+  }).then(function(data){
     var tracks = data.tracks || [];
     if (!tracks.length) throw new Error('No tracks found for that query.');
-
-    var rows = tracks.slice(0, 60).map(function(t, i) {
-      return '<div class="tr"><span class="tn">' + (i+1) + '</span><div class="ti"><div class="tt">' +
-        t.title.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div><div class="ta">' +
-        t.artist.replace(/</g,'&lt;').replace(/>/g,'&gt;') +
-        (t.duration ? ' \u00b7 ' + Math.floor(t.duration/60) + 'm' : '') + '</div></div></div>';
+    pv.innerHTML = tracks.slice(0, 40).map(function(t, i){
+      return '<div>' + (i+1) + '. ' + t.title + ' — ' + t.artist + '</div>';
     }).join('');
-    if (tracks.length > 60) rows += '<div class="tr" style="text-align:center;color:#555">' + (tracks.length - 60) + ' more rows</div>';
-    pv.innerHTML = rows;
     pv.style.display = 'block';
     st.className = 'status ok';
     st.textContent = 'Found ' + tracks.length + ' tracks';
-
-    var csv = ['Title,Artist,Album,Duration,SourceURL'];
-    tracks.forEach(function(t) {
-      function ce(s) { s = String(s||''); if(s.includes(',') || s.includes('"') || s.includes('\n')) return '"' + s.replace(/"/g,'""') + '"'; return s; }
-      csv.push([ce(t.title), ce(t.artist), ce(t.album), ce(t.duration||''), ce(t.sourceURL||'')].join(','));
-    });
-    var blob = new Blob([csv.join('\n')], { type: 'text/csv' });
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = q.replace(/[^a-zA-Z0-9 -]/g, '').trim() + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
     btn.disabled = false;
     btn.textContent = 'Fetch & Download CSV';
-  })
-  .catch(function(e) {
+  }).catch(function(e){
     st.className = 'status err';
     st.textContent = e.message;
     btn.disabled = false;
@@ -481,8 +348,6 @@ document.getElementById('expBtn').addEventListener('click', function() {
 </body>
 </html>`;
 }
-
-// ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get('/', function(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -506,13 +371,7 @@ app.post('/generate', async function(req, res) {
 });
 
 app.get('/health', function(req, res) {
-  res.json({
-    status: 'ok', version: '1.0.1',
-    redisConnected: !!(redis && redis.status === 'ready'),
-    activeTokens: TOKEN_CACHE.size,
-    cachedSearches: SEARCH_CACHE.size,
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: 'ok', version: '1.0.1', redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, cachedSearches: SEARCH_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.get('/:token/manifest.json', tokenMiddleware, function(req, res) {
@@ -520,7 +379,7 @@ app.get('/:token/manifest.json', tokenMiddleware, function(req, res) {
     id: 'com.eclipse.youtube.search.' + req.params.token.slice(0, 8),
     name: 'YouTube Search',
     version: '1.0.1',
-    description: 'YouTube Data API search addon for Eclipse. Returns tracks, albums, artists and playlists.',
+    description: 'YouTube Data API search addon for Eclipse. Returns tracks, albums, artists, and playlists.',
     icon: 'https://upload.wikimedia.org/wikipedia/commons/e/ef/Youtube_logo.png',
     resources: ['search', 'stream', 'catalog'],
     types: ['track', 'album', 'artist', 'playlist']
@@ -558,7 +417,7 @@ app.get('/:token/album/:id', tokenMiddleware, async function(req, res) {
   const videoId = id.replace('ytalbum_', '');
   try {
     const detail = await getVideoById(req.tokenEntry.ytApiKey, videoId);
-    if (!detail) return res.status(404).json({ error: 'Video not found.' });
+    if (!detail) return res.status(404).json({ error: 'Album not found.' });
     const track = mapToTrack(videoId, detail.snippet || {}, detail.contentDetails);
     res.json({
       id, title: track.title, artist: track.artist, artworkURL: track.artworkURL,
@@ -583,7 +442,9 @@ app.get('/:token/artist/:id', tokenMiddleware, async function(req, res) {
       id: 'ytalbum_' + String(item.id?.videoId || ''),
       title: cleanText(item.snippet?.title || ''),
       artist: cleanText(item.snippet?.channelTitle || ''),
-      artworkURL: pickArt(item.snippet), trackCount: 1, year: null
+      artworkURL: pickArt(item.snippet),
+      trackCount: 1,
+      year: null
     }));
     res.json({
       id, name: cleanText(items[0].snippet?.channelTitle || 'YouTube'),
