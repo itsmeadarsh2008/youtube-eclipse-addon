@@ -11,10 +11,19 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Stream resolver strategy ─────────────────────────────────────────────────
-// 1. Cobalt (api.cobalt.tools) — Cloudflare Worker, never IP-blocked by YouTube
-// 2. Curated Piped instances — raced in parallel
-// 403 instances are added to CLOUD_BLOCKED and permanently skipped this deployment
+// ─── Stream resolvers ─────────────────────────────────────────────────────────
+// api.cobalt.tools uses Cloudflare bot protection and REJECTS automated requests.
+// Only use community instances (instances.cobalt.best).
+// Set COBALT_URL env var in Vercel to add your own self-hosted instance first.
+
+const COBALT_POOL = [
+  process.env.COBALT_URL || null,     // Your own instance — highest priority
+  'https://cobalt.canine.tools',      // Verified working for YT (Apr 2026)
+  'https://cobalt.meowing.de',        // Verified working for YT (Apr 2026)
+  'https://cobalt-api.kwiatekmiki.com',
+  'https://cobalt.synth.zip',
+  'https://cobalt.catvibers.me',
+].filter(Boolean);
 
 const PIPED_POOL = [
   'https://pipedapi.kavin.rocks',
@@ -23,48 +32,56 @@ const PIPED_POOL = [
   'https://pipedapi.tokhmi.xyz',
   'https://pipedapi.rivo.lol',
   'https://piped-api.cfe.re',
-  'https://piped.syncpundit.io/api',
   'https://pipedapi.r4fo.com',
-  'https://piped.smnz.de/api',
   'https://pipedapi.colinslegacy.com',
-  'https://piped.ext.untel.eu/api',
   'https://api.piped.yt'
 ];
 
-// Runtime set — once an instance returns 403 it's never retried
+// Permanently skip instances that block cloud IPs (403/429) within this invocation.
+// For cross-invocation persistence, these are also written to Redis.
 const CLOUD_BLOCKED = new Set();
 
-async function resolveViaCobalt(videoId) {
-  const r = await axios.post('https://api.cobalt.tools/', {
+async function loadBlockedFromRedis(r) {
+  if (!r) return;
+  try {
+    const raw = await r.get('ytm:blocked');
+    if (raw) JSON.parse(raw).forEach(b => CLOUD_BLOCKED.add(b));
+  } catch (_e) {}
+}
+async function saveBlockedToRedis(r) {
+  if (!r) return;
+  try { await r.set('ytm:blocked', JSON.stringify([...CLOUD_BLOCKED]), 'EX', 3600); } catch (_e) {}
+}
+
+async function tryOneCobalt(base, videoId) {
+  const r = await axios.post(base + '/', {
     url:          'https://www.youtube.com/watch?v=' + videoId,
     downloadMode: 'audio',
     audioFormat:  'best'
   }, {
-    headers: {
-      'Accept':       'application/json',
-      'Content-Type': 'application/json'
-    },
-    timeout: 10000
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+    timeout: 9000
   });
   const d = r.data || {};
-  if (d.status === 'error') {
-    throw new Error('cobalt: ' + (d.error && d.error.code ? d.error.code : JSON.stringify(d)));
-  }
-  if (!d.url) throw new Error('cobalt: empty url');
-  console.log('[stream] cobalt OK status=' + d.status + ' for ' + videoId);
-  // tunnel URLs proxy through cobalt CDN (~12h), redirect URLs are direct CDN (~6h)
+  // Cobalt v10 error format: { status: 'error', error: { code: '...' } }
+  if (d.status === 'error') throw new Error('cobalt: ' + (d.error && d.error.code ? d.error.code : JSON.stringify(d.error || d)));
+  let url = d.url;
+  // Picker status means a playlist was returned — audio is in d.audio
+  if (d.status === 'picker' && d.audio) url = d.audio;
+  if (!url) throw new Error('cobalt(' + base + '): empty url');
+  console.log('[stream] cobalt OK via ' + base + ' for ' + videoId);
   return {
-    url:       d.url,
+    url,
     format:    'aac',
     quality:   'unknown',
     expiresAt: Math.floor(Date.now() / 1000) + (d.status === 'tunnel' ? 43200 : 21600)
   };
 }
 
-async function resolveViaPiped(base, videoId) {
-  if (CLOUD_BLOCKED.has(base)) throw new Error('cloud-blocked');
+async function tryOnePiped(base, videoId) {
+  if (CLOUD_BLOCKED.has(base)) throw new Error('blocked:' + base);
   const r = await axios.get(base + '/streams/' + videoId, {
-    timeout: 4000,
+    timeout: 5000,
     headers: { 'Accept': 'application/json' }
   });
   const streams = r.data && r.data.audioStreams;
@@ -72,36 +89,42 @@ async function resolveViaPiped(base, videoId) {
   const m4a  = streams.filter(s => (s.mimeType || '').includes('mp4'));
   const pool = m4a.length ? m4a : streams;
   const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-  if (!best || !best.url) throw new Error('no url');
-  const fmt       = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
-  const expMatch  = best.url.match(/[?&]expire=(\d+)/);
+  if (!best || !best.url) throw new Error('piped: no url');
+  const fmt      = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
+  const expMatch = best.url.match(/[?&]expire=(\d+)/);
   const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
   console.log('[stream] piped OK via ' + base + ' for ' + videoId);
   return { url: best.url, format: fmt, quality: best.quality || 'unknown', expiresAt };
 }
 
-async function resolveFromAny(videoId) {
-  const available = PIPED_POOL.filter(b => !CLOUD_BLOCKED.has(b));
+function wrapBlocking(fn, base, redisRef) {
+  return fn().catch(e => {
+    const status = e.response && e.response.status;
+    if (status === 403 || status === 429 || status === 401) {
+      CLOUD_BLOCKED.add(base);
+      saveBlockedToRedis(redisRef);
+      console.warn('[resolver] cloud-blocked: ' + base + ' (' + status + ')');
+    }
+    throw e;
+  });
+}
 
-  const cobaltP = resolveViaCobalt(videoId);
+async function resolveFromAny(videoId, redisRef) {
+  const availPiped = PIPED_POOL.filter(b => !CLOUD_BLOCKED.has(b));
 
-  const pipedPs = available.map(base =>
-    resolveViaPiped(base, videoId).catch(e => {
-      if (e.response && e.response.status === 403) {
-        CLOUD_BLOCKED.add(base);
-        console.warn('[piped] cloud-blocked: ' + base);
-      }
-      throw e;
-    })
-  );
+  const all = [
+    ...COBALT_POOL.map(b => wrapBlocking(() => tryOneCobalt(b, videoId), b, redisRef)),
+    ...availPiped.map(b  => wrapBlocking(() => tryOnePiped(b, videoId),  b, redisRef))
+  ];
 
   try {
-    return await Promise.any([cobaltP, ...pipedPs]);
+    return await Promise.any(all);
   } catch (err) {
     const msgs = (err.errors || [err]).slice(0, 6).map(e => e.message).join(' | ');
     throw new Error('All resolvers failed — ' + msgs);
   }
 }
+
 
 // ─── YTMusic singleton ────────────────────────────────────────────────────────
 let ytmusic    = null;
@@ -195,12 +218,22 @@ function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
 // ─── Stream cache ─────────────────────────────────────────────────────────────
 const STREAM_MEM = new Map();
+let redisReady = false;
+
+// After Redis is set up, load previously blocked instances
+setTimeout(async () => {
+  if (redis) { await loadBlockedFromRedis(redis); redisReady = true; }
+}, 500);
+
 async function resolveStream(videoId) {
   const mc = STREAM_MEM.get(videoId);
   if (mc && mc.expiresAt > Date.now() / 1000 + 600) return mc;
   const rc = await rGet('ytm:stream:' + videoId);
-  if (rc) { const p = JSON.parse(rc); if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; } }
-  const result = await resolveFromAny(videoId);
+  if (rc) {
+    const p = JSON.parse(rc);
+    if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; }
+  }
+  const result = await resolveFromAny(videoId, redis);  // <-- pass redis
   STREAM_MEM.set(videoId, result);
   await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, result.expiresAt - Math.floor(Date.now() / 1000) - 600));
   return result;
@@ -321,15 +354,15 @@ app.post('/refresh', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status:        'ok',
-    version:       '1.4.0',
-    ytmusicReady:  ytmReady,
-    streamBackend: 'cobalt + piped (Promise.any)',
-    pipedPool:     PIPED_POOL.length,
-    cloudBlocked:  [...CLOUD_BLOCKED],
-    redis:         !!(redis && redis.status === 'ready'),
-    tokens:        TOKEN_CACHE.size,
-    timestamp:     new Date().toISOString()
+    status:       'ok',
+    version:      '1.5.0',
+    ytmusicReady: ytmReady,
+    cobaltPool:   COBALT_POOL,
+    pipedPool:    PIPED_POOL.length,
+    cloudBlocked: [...CLOUD_BLOCKED],
+    redis:        !!(redis && redis.status === 'ready'),
+    tokens:       TOKEN_CACHE.size,
+    timestamp:    new Date().toISOString()
   });
 });
 
