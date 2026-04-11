@@ -11,154 +11,99 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Instance discovery ───────────────────────────────────────────────────────
-// Fetches live instance lists from official sources at startup + every 20 min.
-// Falls back to a hardcoded list if discovery fails.
+// ─── Stream resolver strategy ─────────────────────────────────────────────────
+// 1. Cobalt (api.cobalt.tools) — Cloudflare Worker, never IP-blocked by YouTube
+// 2. Curated Piped instances — raced in parallel
+// 403 instances are added to CLOUD_BLOCKED and permanently skipped this deployment
 
-const FALLBACK_RESOLVERS = [
-  // Piped — CDN-backed, multi-region (from TeamPiped/Piped wiki April 2026)
-  { t: 'piped', b: 'https://pipedapi.kavin.rocks' },
-  { t: 'piped', b: 'https://pipedapi.tokhmi.xyz' },
-  { t: 'piped', b: 'https://pipedapi.moomoo.me' },
-  { t: 'piped', b: 'https://pipedapi.syncpundit.io' },
-  { t: 'piped', b: 'https://api-piped.mha.fi' },
-  { t: 'piped', b: 'https://pipedapi.rivo.lol' },
-  { t: 'piped', b: 'https://pipedapi.leptons.xyz' },
-  { t: 'piped', b: 'https://piped-api.lunar.icu' },
-  { t: 'piped', b: 'https://ytapi.dc09.ru' },
-  { t: 'piped', b: 'https://pipedapi.colinslegacy.com' },
-  { t: 'piped', b: 'https://yapi.vyper.me' },
-  { t: 'piped', b: 'https://api.looleh.xyz' },
-  { t: 'piped', b: 'https://piped-api.cfe.re' },
-  { t: 'piped', b: 'https://pipedapi.r4fo.com' },
-  { t: 'piped', b: 'https://pipedapi-libre.kavin.rocks' },
-  // Invidious — all require rotating IPs per official policy (docs.invidious.io)
-  { t: 'invidious', b: 'https://yewtu.be' },
-  { t: 'invidious', b: 'https://inv.tux.pizza' },
-  { t: 'invidious', b: 'https://invidious.fdn.fr' },
-  { t: 'invidious', b: 'https://iv.datura.network' },
-  { t: 'invidious', b: 'https://invidious.slipfox.xyz' },
-  { t: 'invidious', b: 'https://inv.thepixora.com' }
+const PIPED_POOL = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi-libre.kavin.rocks',
+  'https://pipedapi.moomoo.me',
+  'https://pipedapi.tokhmi.xyz',
+  'https://pipedapi.rivo.lol',
+  'https://piped-api.cfe.re',
+  'https://piped.syncpundit.io/api',
+  'https://pipedapi.r4fo.com',
+  'https://piped.smnz.de/api',
+  'https://pipedapi.colinslegacy.com',
+  'https://piped.ext.untel.eu/api',
+  'https://api.piped.yt'
 ];
 
-let LIVE_RESOLVERS    = null;
-let resolversLoadedAt = 0;
-const RESOLVER_TTL_MS = 20 * 60 * 1000; // refresh every 20 min
+// Runtime set — once an instance returns 403 it's never retried
+const CLOUD_BLOCKED = new Set();
 
-async function loadResolvers() {
-  const results = [];
-
-  // 1) Piped — fetch live list from official kavin.rocks endpoint
-  try {
-    const r = await axios.get('https://piped.kavin.rocks/instances', { timeout: 5000 });
-    if (Array.isArray(r.data)) {
-      for (const inst of r.data) {
-        const api = inst.api_url || inst.apiurl;
-        if (api && typeof api === 'string') results.push({ t: 'piped', b: api.replace(/\/$/, '') });
-      }
-      console.log('[resolvers] Piped: ' + results.length + ' live instances loaded');
-    }
-  } catch (e) {
-    console.warn('[resolvers] Piped discovery failed: ' + e.message);
+async function resolveViaCobalt(videoId) {
+  const r = await axios.post('https://api.cobalt.tools/', {
+    url:          'https://www.youtube.com/watch?v=' + videoId,
+    downloadMode: 'audio',
+    audioFormat:  'best'
+  }, {
+    headers: {
+      'Accept':       'application/json',
+      'Content-Type': 'application/json'
+    },
+    timeout: 10000
+  });
+  const d = r.data || {};
+  if (d.status === 'error') {
+    throw new Error('cobalt: ' + (d.error && d.error.code ? d.error.code : JSON.stringify(d)));
   }
-
-  // 2) Invidious — fetch healthy API-enabled instances from api.invidious.io
-  try {
-    const r = await axios.get('https://api.invidious.io/instances.json?sort_by=health', { timeout: 6000 });
-    if (Array.isArray(r.data)) {
-      for (const entry of r.data) {
-        // entry is [hostname, { uri, api, health }]
-        const info = Array.isArray(entry) ? entry[1] : entry;
-        if (info && info.api === true && info.uri) {
-          results.push({ t: 'invidious', b: info.uri.replace(/\/$/, '') });
-        }
-      }
-      const invCount = results.filter(r => r.t === 'invidious').length;
-      console.log('[resolvers] Invidious: ' + invCount + ' live instances loaded');
-    }
-  } catch (e) {
-    console.warn('[resolvers] Invidious discovery failed: ' + e.message);
-  }
-
-  if (results.length >= 5) {
-    LIVE_RESOLVERS    = results;
-    resolversLoadedAt = Date.now();
-    console.log('[resolvers] total: ' + results.length);
-  } else {
-    console.warn('[resolvers] discovery returned < 5 results, using fallback list');
-    LIVE_RESOLVERS    = FALLBACK_RESOLVERS;
-    resolversLoadedAt = Date.now();
-  }
+  if (!d.url) throw new Error('cobalt: empty url');
+  console.log('[stream] cobalt OK status=' + d.status + ' for ' + videoId);
+  // tunnel URLs proxy through cobalt CDN (~12h), redirect URLs are direct CDN (~6h)
+  return {
+    url:       d.url,
+    format:    'aac',
+    quality:   'unknown',
+    expiresAt: Math.floor(Date.now() / 1000) + (d.status === 'tunnel' ? 43200 : 21600)
+  };
 }
 
-// Load at startup, refresh every 20 min
-loadResolvers();
-setInterval(loadResolvers, RESOLVER_TTL_MS);
-
-function getResolvers() {
-  if (!LIVE_RESOLVERS || Date.now() - resolversLoadedAt > RESOLVER_TTL_MS * 2) {
-    return FALLBACK_RESOLVERS;
-  }
-  return LIVE_RESOLVERS;
-}
-
-// ─── Per-resolver fetch ───────────────────────────────────────────────────────
-async function fetchFromResolver(resolver, videoId) {
-  if (resolver.t === 'piped') {
-    const r = await axios.get(resolver.b + '/streams/' + videoId, {
-      timeout: 4000,
-      headers: { 'Accept': 'application/json' }
-    });
-    const streams = r.data && r.data.audioStreams;
-    if (!Array.isArray(streams) || !streams.length) throw new Error('no audioStreams');
-    const m4a  = streams.filter(s => (s.mimeType || '').includes('mp4'));
-    const pool = m4a.length ? m4a : streams;
-    const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-    if (!best || !best.url) throw new Error('no url');
-    const fmt       = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
-    const expMatch  = best.url.match(/[?&]expire=(\d+)/);
-    const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
-    return { url: best.url, format: fmt, quality: best.quality || 'unknown', expiresAt };
-  } else {
-    const r = await axios.get(resolver.b + '/api/v1/videos/' + videoId, {
-      params:  { fields: 'adaptiveFormats' },
-      timeout: 4000,
-      headers: { 'Accept': 'application/json' }
-    });
-    const formats = (r.data && r.data.adaptiveFormats || [])
-      .filter(f => f.type && f.type.startsWith('audio/') && f.url);
-    if (!formats.length) throw new Error('no audio formats');
-    const m4a  = formats.filter(f => f.type.includes('mp4'));
-    const pool = m4a.length ? m4a : formats;
-    const best = pool.sort((a, b) => parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0))[0];
-    if (!best || !best.url) throw new Error('no url');
-    const fmt       = best.type.includes('mp4') ? 'aac' : best.type.includes('opus') ? 'opus' : 'mp3';
-    const expMatch  = best.url.match(/[?&]expire=(\d+)/);
-    const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
-    return {
-      url:       best.url,
-      format:    fmt,
-      quality:   best.bitrate ? Math.round(parseInt(best.bitrate) / 1000) + 'kbps' : 'unknown',
-      expiresAt
-    };
-  }
+async function resolveViaPiped(base, videoId) {
+  if (CLOUD_BLOCKED.has(base)) throw new Error('cloud-blocked');
+  const r = await axios.get(base + '/streams/' + videoId, {
+    timeout: 4000,
+    headers: { 'Accept': 'application/json' }
+  });
+  const streams = r.data && r.data.audioStreams;
+  if (!Array.isArray(streams) || !streams.length) throw new Error('no audioStreams');
+  const m4a  = streams.filter(s => (s.mimeType || '').includes('mp4'));
+  const pool = m4a.length ? m4a : streams;
+  const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+  if (!best || !best.url) throw new Error('no url');
+  const fmt       = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
+  const expMatch  = best.url.match(/[?&]expire=(\d+)/);
+  const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
+  console.log('[stream] piped OK via ' + base + ' for ' + videoId);
+  return { url: best.url, format: fmt, quality: best.quality || 'unknown', expiresAt };
 }
 
 async function resolveFromAny(videoId) {
-  const resolvers = getResolvers();
-  // Shuffle so we don't always hammer the same first few instances
-  const shuffled = [...resolvers].sort(() => Math.random() - 0.5);
+  const available = PIPED_POOL.filter(b => !CLOUD_BLOCKED.has(b));
+
+  const cobaltP = resolveViaCobalt(videoId);
+
+  const pipedPs = available.map(base =>
+    resolveViaPiped(base, videoId).catch(e => {
+      if (e.response && e.response.status === 403) {
+        CLOUD_BLOCKED.add(base);
+        console.warn('[piped] cloud-blocked: ' + base);
+      }
+      throw e;
+    })
+  );
+
   try {
-    const result = await Promise.any(shuffled.map(r => fetchFromResolver(r, videoId)));
-    console.log('[stream] resolved ' + videoId);
-    return result;
+    return await Promise.any([cobaltP, ...pipedPs]);
   } catch (err) {
-    const msgs = (err.errors || []).slice(0, 5).map(e => e.message).join(' | ');
-    throw new Error('All ' + resolvers.length + ' resolvers failed — ' + msgs);
+    const msgs = (err.errors || [err]).slice(0, 6).map(e => e.message).join(' | ');
+    throw new Error('All resolvers failed — ' + msgs);
   }
 }
 
-// ─── YTMusic singleton (search / catalog) ────────────────────────────────────
+// ─── YTMusic singleton ────────────────────────────────────────────────────────
 let ytmusic    = null;
 let ytmReady   = false;
 let ytmIniting = false;
@@ -192,24 +137,15 @@ async function ensureYTMusic() {
 ensureYTMusic();
 setInterval(() => { if (!ytmReady) ensureYTMusic(); }, 30000);
 
-// ─── Redis helpers ────────────────────────────────────────────────────────────
+// ─── Redis ────────────────────────────────────────────────────────────────────
 let redis = null;
 if (process.env.REDIS_URL) {
   redis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 3, enableReadyCheck: false });
   redis.on('connect', () => console.log('[redis] connected'));
-  redis.on('error',   e  => console.error('[redis] error: ' + e.message));
+  redis.on('error',   e  => console.error('[redis] ' + e.message));
 }
-async function rGet(key) {
-  if (!redis) return null;
-  try { return await redis.get(key); } catch (_e) { return null; }
-}
-async function rSet(key, val, ttl) {
-  if (!redis) return;
-  try {
-    if (ttl) await redis.set(key, val, 'EX', ttl);
-    else     await redis.set(key, val);
-  } catch (_e) {}
-}
+async function rGet(k)        { if (!redis) return null; try { return await redis.get(k); } catch { return null; } }
+async function rSet(k, v, t)  { if (!redis) return; try { t ? await redis.set(k, v, 'EX', t) : await redis.set(k, v); } catch {} }
 
 // ─── Token store ──────────────────────────────────────────────────────────────
 const TOKEN_CACHE       = new Map();
@@ -225,28 +161,21 @@ function ipBucket(ip) {
   if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86_400_000 }; IP_CREATES.set(ip, b); }
   return b;
 }
-async function saveToken(token, entry) {
-  await rSet('ytm:tok:' + token, JSON.stringify({ createdAt: entry.createdAt, lastUsed: entry.lastUsed, reqCount: entry.reqCount }));
+async function saveToken(t, e) { await rSet('ytm:tok:' + t, JSON.stringify({ createdAt: e.createdAt, lastUsed: e.lastUsed, reqCount: e.reqCount })); }
+async function loadToken(t)    { const d = await rGet('ytm:tok:' + t); return d ? JSON.parse(d) : null; }
+async function getEntry(t) {
+  if (TOKEN_CACHE.has(t)) return TOKEN_CACHE.get(t);
+  const s = await loadToken(t);
+  if (!s) return null;
+  const e = { createdAt: s.createdAt, lastUsed: s.lastUsed, reqCount: s.reqCount, rateWin: [] };
+  TOKEN_CACHE.set(t, e);
+  return e;
 }
-async function loadToken(token) {
-  const d = await rGet('ytm:tok:' + token);
-  return d ? JSON.parse(d) : null;
-}
-async function getEntry(token) {
-  if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
-  const saved = await loadToken(token);
-  if (!saved) return null;
-  const entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, rateWin: [] };
-  TOKEN_CACHE.set(token, entry);
-  return entry;
-}
-function rateOk(entry) {
+function rateOk(e) {
   const now = Date.now();
-  entry.rateWin = (entry.rateWin || []).filter(t => now - t < RATE_WINDOW_MS);
-  if (entry.rateWin.length >= RATE_MAX) return false;
-  entry.rateWin.push(now);
-  entry.lastUsed = now;
-  entry.reqCount = (entry.reqCount || 0) + 1;
+  e.rateWin = (e.rateWin || []).filter(t => now - t < RATE_WINDOW_MS);
+  if (e.rateWin.length >= RATE_MAX) return false;
+  e.rateWin.push(now); e.lastUsed = now; e.reqCount = (e.reqCount || 0) + 1;
   return true;
 }
 async function authMw(req, res, next) {
@@ -257,33 +186,23 @@ async function authMw(req, res, next) {
   if (e.reqCount % 20 === 0) saveToken(req.params.token, e);
   next();
 }
-function getBase(req) {
-  return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
-}
+function getBase(req) { return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host'); }
 
-// ─── Misc helpers ─────────────────────────────────────────────────────────────
-function thumb(thumbnails) {
-  if (!thumbnails || !thumbnails.length) return null;
-  return [...thumbnails].sort((a, b) => (b.width || 0) - (a.width || 0))[0].url || null;
-}
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function thumb(t) { if (!t || !t.length) return null; return [...t].sort((a, b) => (b.width || 0) - (a.width || 0))[0].url || null; }
 function dur(s)   { return s ? Math.floor(s) : null; }
 function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
 // ─── Stream cache ─────────────────────────────────────────────────────────────
 const STREAM_MEM = new Map();
-
 async function resolveStream(videoId) {
   const mc = STREAM_MEM.get(videoId);
   if (mc && mc.expiresAt > Date.now() / 1000 + 600) return mc;
   const rc = await rGet('ytm:stream:' + videoId);
-  if (rc) {
-    const p = JSON.parse(rc);
-    if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; }
-  }
+  if (rc) { const p = JSON.parse(rc); if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; } }
   const result = await resolveFromAny(videoId);
   STREAM_MEM.set(videoId, result);
-  const ttl = Math.max(60, result.expiresAt - Math.floor(Date.now() / 1000) - 600);
-  await rSet('ytm:stream:' + videoId, JSON.stringify(result), ttl);
+  await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, result.expiresAt - Math.floor(Date.now() / 1000) - 600));
   return result;
 }
 
@@ -328,8 +247,8 @@ function configPage(base) {
   h += '<svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#ff0000"/><circle cx="26" cy="26" r="10" fill="none" stroke="#fff" stroke-width="2.5"/><polygon points="23,22 23,30 31,26" fill="#fff"/></svg>';
   h += '<div class="card"><h1>YouTube Music for Eclipse</h1>';
   h += '<div class="tip"><b>Save your URL.</b> Copy it to Notes or a bookmark. If the server restarts, paste it below to restore access.</div>';
-  h += '<p class="sub">Full YouTube Music search — tracks, albums, artists, and playlists. All 13 stream resolvers are raced in parallel so the fastest one wins in ~1-3 seconds.</p>';
-  h += '<div class="pills"><span class="pill">Tracks</span><span class="pill">Albums</span><span class="pill">Artists</span><span class="pill">Playlists</span><span class="pill b">13 parallel resolvers</span><span class="pill g">CSV export</span></div>';
+  h += '<p class="sub">Full YouTube Music search — tracks, albums, artists, and playlists. Streams are resolved via Cobalt (Cloudflare Worker) with Piped as fallback — both raced in parallel.</p>';
+  h += '<div class="pills"><span class="pill">Tracks</span><span class="pill">Albums</span><span class="pill">Artists</span><span class="pill">Playlists</span><span class="pill b">Cobalt + Piped parallel</span><span class="pill g">CSV export</span></div>';
   h += '<div class="lbl">Generate a new URL</div>';
   h += '<button class="br" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
   h += '<div class="box" id="genBox"><div class="blbl">Your addon URL — paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
@@ -344,7 +263,7 @@ function configPage(base) {
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
   h += '<div class="step"><div class="sn">4</div><div class="st">Use <b>Playlist Importer</b> below to export a YouTube Music playlist as CSV</div></div>';
   h += '</div>';
-  h += '<div class="warn">Stream URLs are resolved from 13 Piped/Invidious instances in parallel — the first response wins. Audio plays directly from your device. Resolved URLs are cached in Redis for ~6 hours.</div></div>';
+  h += '<div class="warn">Cobalt is a Cloudflare Worker that resolves YouTube audio without IP restrictions. Piped instances that block cloud IPs are automatically skipped. 403 instances are never retried for the lifetime of the deployment.</div></div>';
   h += '<div class="card"><span class="badge">Playlist Importer</span>';
   h += '<h2>Export YouTube Music Playlist → CSV</h2>';
   h += '<p class="sub">Downloads a CSV you can import in Eclipse via Library → Import CSV.</p>';
@@ -356,7 +275,7 @@ function configPage(base) {
   h += '<div class="status" id="impStatus"></div>';
   h += '<div class="preview" id="impPreview"></div>';
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button></div>';
-  h += '<footer>Eclipse YouTube Music Addon v1.3.0 • <a href="' + base + '/health" target="_blank" style="color:#333;text-decoration:none">' + base + '</a></footer>';
+  h += '<footer>Eclipse YouTube Music Addon v1.4.0 • <a href="' + base + '/health" target="_blank" style="color:#333;text-decoration:none">' + base + '</a></footer>';
   h += '<script>';
   h += 'var _gu="",_ru="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}_gu=d.manifestUrl;document.getElementById("genUrl").textContent=_gu;document.getElementById("genBox").style.display="block";document.getElementById("impToken").value=_gu;btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
@@ -402,23 +321,23 @@ app.post('/refresh', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status:         'ok',
-    version:        '1.3.0',
-    ytmusicReady:   ytmReady,
-    streamBackend:  'Promise.any() — 13 parallel Piped+Invidious resolvers',
-    resolvers:      ALL_RESOLVERS.length,
-    redisConnected: !!(redis && redis.status === 'ready'),
-    activeTokens:   TOKEN_CACHE.size,
-    timestamp:      new Date().toISOString()
+    status:        'ok',
+    version:       '1.4.0',
+    ytmusicReady:  ytmReady,
+    streamBackend: 'cobalt + piped (Promise.any)',
+    pipedPool:     PIPED_POOL.length,
+    cloudBlocked:  [...CLOUD_BLOCKED],
+    redis:         !!(redis && redis.status === 'ready'),
+    tokens:        TOKEN_CACHE.size,
+    timestamp:     new Date().toISOString()
   });
 });
 
-// ─── Manifest ─────────────────────────────────────────────────────────────────
 app.get('/u/:token/manifest.json', authMw, (req, res) => {
   res.json({
     id:          'com.eclipse.ytmusic.' + req.params.token.slice(0, 8),
     name:        'YouTube Music',
-    version:     '1.3.0',
+    version:     '1.4.0',
     description: 'Full YouTube Music search and streaming — tracks, albums, artists, and playlists.',
     icon:        'https://music.youtube.com/img/favicon_144.png',
     resources:   ['search', 'stream', 'catalog'],
@@ -426,17 +345,11 @@ app.get('/u/:token/manifest.json', authMw, (req, res) => {
   });
 });
 
-// ─── Search ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/search', authMw, async (req, res) => {
   const q = clean(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
-
   const ready = await ensureYTMusic();
-  if (!ready) return res.status(503).json({
-    error: 'YouTube Music not ready yet. Retry in a few seconds.',
-    tracks: [], albums: [], artists: [], playlists: []
-  });
-
+  if (!ready) return res.status(503).json({ error: 'Not ready', tracks: [], albums: [], artists: [], playlists: [] });
   try {
     const [songs, albums, artists, playlists] = await Promise.all([
       ytmusic.searchSongs(q).catch(() => []),
@@ -444,182 +357,76 @@ app.get('/u/:token/search', authMw, async (req, res) => {
       ytmusic.searchArtists(q).catch(() => []),
       ytmusic.searchPlaylists(q).catch(() => [])
     ]);
-
     res.json({
-      tracks: (songs || []).slice(0, 20).map(s => ({
-        id:         s.videoId,
-        title:      s.name                         || 'Unknown',
-        artist:     (s.artist && s.artist.name)    || 'Unknown',
-        album:      (s.album  && s.album.name)     || null,
-        duration:   dur(s.duration),
-        artworkURL: thumb(s.thumbnails),
-        format:     'aac'
-      })),
-      albums: (albums || []).slice(0, 10).map(a => ({
-        id:         a.albumId,
-        title:      a.name                         || 'Unknown',
-        artist:     (a.artist && a.artist.name)    || 'Unknown',
-        artworkURL: thumb(a.thumbnails),
-        trackCount: a.trackCount                   || null,
-        year:       a.year ? String(a.year)        : null
-      })),
-      artists: (artists || []).slice(0, 5).map(a => ({
-        id:         a.artistId,
-        name:       a.name                         || 'Unknown',
-        artworkURL: thumb(a.thumbnails),
-        genres:     []
-      })),
-      playlists: (playlists || []).slice(0, 10).map(p => ({
-        id:         p.playlistId,
-        title:      p.name                         || 'Unknown',
-        creator:    (p.artist && p.artist.name)    || null,
-        artworkURL: thumb(p.thumbnails),
-        trackCount: p.trackCount                   || null
-      }))
+      tracks:    (songs     || []).slice(0, 20).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })),
+      albums:    (albums    || []).slice(0, 10).map(a => ({ id: a.albumId, title: a.name || 'Unknown', artist: (a.artist && a.artist.name) || 'Unknown', artworkURL: thumb(a.thumbnails), trackCount: a.trackCount || null, year: a.year ? String(a.year) : null })),
+      artists:   (artists   || []).slice(0,  5).map(a => ({ id: a.artistId, name: a.name || 'Unknown', artworkURL: thumb(a.thumbnails), genres: [] })),
+      playlists: (playlists || []).slice(0, 10).map(p => ({ id: p.playlistId, title: p.name || 'Unknown', creator: (p.artist && p.artist.name) || null, artworkURL: thumb(p.thumbnails), trackCount: p.trackCount || null }))
     });
   } catch (e) {
     console.error('[search] ' + e.message);
-    res.status(500).json({ error: 'Search failed: ' + e.message, tracks: [], albums: [], artists: [], playlists: [] });
+    res.status(500).json({ error: e.message, tracks: [], albums: [], artists: [], playlists: [] });
   }
 });
 
-// ─── Stream ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/stream/:id', authMw, async (req, res) => {
   const vid = req.params.id;
   if (!/^[a-zA-Z0-9_-]{11}$/.test(vid)) return res.status(400).json({ error: 'Invalid video ID.' });
   try {
-    const result = await resolveStream(vid);
-    res.json(result);
+    res.json(await resolveStream(vid));
   } catch (e) {
     console.error('[stream] ' + vid + ': ' + e.message);
-    res.status(500).json({ error: 'Stream unavailable: ' + e.message });
-  }
-});
-
-// ─── Album ────────────────────────────────────────────────────────────────────
-app.get('/u/:token/album/:id', authMw, async (req, res) => {
-  const ready = await ensureYTMusic();
-  if (!ready) return res.status(503).json({ error: 'YouTube Music not ready.' });
-  try {
-    const a = await ytmusic.getAlbum(req.params.id);
-    if (!a) return res.status(404).json({ error: 'Album not found.' });
-    res.json({
-      id:          a.albumId,
-      title:       a.name                           || 'Unknown',
-      artist:      (a.artist && a.artist.name)      || 'Unknown',
-      artworkURL:  thumb(a.thumbnails),
-      year:        a.year ? String(a.year)           : null,
-      description: a.description                    || null,
-      trackCount:  (a.songs || []).length            || null,
-      tracks: (a.songs || []).map(s => ({
-        id:         s.videoId,
-        title:      s.name                           || 'Unknown',
-        artist:     (s.artist && s.artist.name) || (a.artist && a.artist.name) || 'Unknown',
-        duration:   dur(s.duration),
-        artworkURL: thumb(s.thumbnails) || thumb(a.thumbnails),
-        format:     'aac'
-      }))
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'Album fetch failed: ' + e.message });
-  }
-});
-
-// ─── Artist ───────────────────────────────────────────────────────────────────
-app.get('/u/:token/artist/:id', authMw, async (req, res) => {
-  const ready = await ensureYTMusic();
-  if (!ready) return res.status(503).json({ error: 'YouTube Music not ready.' });
-  try {
-    const a = await ytmusic.getArtist(req.params.id);
-    if (!a) return res.status(404).json({ error: 'Artist not found.' });
-    res.json({
-      id:         a.artistId,
-      name:       a.name                          || 'Unknown',
-      artworkURL: thumb(a.thumbnails),
-      bio:        a.description                   || null,
-      genres:     [],
-      topTracks: (a.topSongs || []).slice(0, 10).map(s => ({
-        id:         s.videoId,
-        title:      s.name                        || 'Unknown',
-        artist:     (s.artist && s.artist.name)   || a.name || 'Unknown',
-        duration:   dur(s.duration),
-        artworkURL: thumb(s.thumbnails),
-        format:     'aac'
-      })),
-      albums: (a.topAlbums || []).slice(0, 10).map(al => ({
-        id:         al.albumId,
-        title:      al.name                       || 'Unknown',
-        artist:     a.name                        || 'Unknown',
-        artworkURL: thumb(al.thumbnails),
-        trackCount: null,
-        year:       al.year ? String(al.year)     : null
-      }))
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'Artist fetch failed: ' + e.message });
-  }
-});
-
-// ─── Playlist ─────────────────────────────────────────────────────────────────
-app.get('/u/:token/playlist/:id', authMw, async (req, res) => {
-  const ready = await ensureYTMusic();
-  if (!ready) return res.status(503).json({ error: 'YouTube Music not ready.' });
-  try {
-    const p = await ytmusic.getPlaylist(req.params.id);
-    if (!p) return res.status(404).json({ error: 'Playlist not found.' });
-    res.json({
-      id:          p.playlistId,
-      title:       p.name                        || 'Unknown',
-      description: p.description                 || null,
-      artworkURL:  thumb(p.thumbnails),
-      creator:     (p.artist && p.artist.name)   || null,
-      tracks: (p.songs || []).map(s => ({
-        id:         s.videoId,
-        title:      s.name                        || 'Unknown',
-        artist:     (s.artist && s.artist.name)   || 'Unknown',
-        duration:   dur(s.duration),
-        artworkURL: thumb(s.thumbnails),
-        format:     'aac'
-      }))
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'Playlist fetch failed: ' + e.message });
-  }
-});
-
-// ─── Import → JSON (CSV built client-side) ────────────────────────────────────
-app.get('/u/:token/import', authMw, async (req, res) => {
-  const rawUrl = String(req.query.url || '').trim();
-  if (!rawUrl) return res.status(400).json({ error: 'Missing ?url= parameter.' });
-
-  const ready = await ensureYTMusic();
-  if (!ready) return res.status(503).json({ error: 'YouTube Music not ready.' });
-
-  let playlistId = null;
-  const vm = rawUrl.match(/browse\/VL([a-zA-Z0-9_-]+)/);
-  const lm = rawUrl.match(/[?&]list=([a-zA-Z0-9_-]+)/);
-  if (vm) playlistId = vm[1];
-  else if (lm) playlistId = lm[1];
-  if (!playlistId) return res.status(400).json({ error: 'Could not extract playlist ID from URL.' });
-
-  try {
-    const p = await ytmusic.getPlaylist(playlistId);
-    if (!p) throw new Error('Playlist not found.');
-    res.json({
-      id:     p.playlistId,
-      title:  p.name || 'YouTube Music Playlist',
-      tracks: (p.songs || []).map(s => ({
-        id:       s.videoId,
-        title:    s.name                       || 'Unknown',
-        artist:   (s.artist && s.artist.name) || 'Unknown',
-        duration: dur(s.duration)
-      }))
-    });
-  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log('[server] v1.3.0 listening on port ' + PORT));
+app.get('/u/:token/album/:id', authMw, async (req, res) => {
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  try {
+    const a = await ytmusic.getAlbum(req.params.id);
+    if (!a) return res.status(404).json({ error: 'Not found.' });
+    res.json({ id: a.albumId, title: a.name || 'Unknown', artist: (a.artist && a.artist.name) || 'Unknown', artworkURL: thumb(a.thumbnails), year: a.year ? String(a.year) : null, description: a.description || null, trackCount: (a.songs || []).length || null,
+      tracks: (a.songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || (a.artist && a.artist.name) || 'Unknown', duration: dur(s.duration), artworkURL: thumb(s.thumbnails) || thumb(a.thumbnails), format: 'aac' })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/u/:token/artist/:id', authMw, async (req, res) => {
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  try {
+    const a = await ytmusic.getArtist(req.params.id);
+    if (!a) return res.status(404).json({ error: 'Not found.' });
+    res.json({ id: a.artistId, name: a.name || 'Unknown', artworkURL: thumb(a.thumbnails), bio: a.description || null, genres: [],
+      topTracks: (a.topSongs  || []).slice(0, 10).map(s  => ({ id: s.videoId,  title: s.name  || 'Unknown', artist: (s.artist  && s.artist.name)  || a.name || 'Unknown', duration: dur(s.duration),  artworkURL: thumb(s.thumbnails),  format: 'aac' })),
+      albums:    (a.topAlbums || []).slice(0, 10).map(al => ({ id: al.albumId, title: al.name || 'Unknown', artist: a.name || 'Unknown', artworkURL: thumb(al.thumbnails), trackCount: null, year: al.year ? String(al.year) : null })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/u/:token/playlist/:id', authMw, async (req, res) => {
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  try {
+    const p = await ytmusic.getPlaylist(req.params.id);
+    if (!p) return res.status(404).json({ error: 'Not found.' });
+    res.json({ id: p.playlistId, title: p.name || 'Unknown', description: p.description || null, artworkURL: thumb(p.thumbnails), creator: (p.artist && p.artist.name) || null,
+      tracks: (p.songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/u/:token/import', authMw, async (req, res) => {
+  const rawUrl = String(req.query.url || '').trim();
+  if (!rawUrl) return res.status(400).json({ error: 'Missing ?url= parameter.' });
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  let playlistId = null;
+  const vm = rawUrl.match(/browse\/VL([a-zA-Z0-9_-]+)/);
+  const lm = rawUrl.match(/[?&]list=([a-zA-Z0-9_-]+)/);
+  if (vm) playlistId = vm[1]; else if (lm) playlistId = lm[1];
+  if (!playlistId) return res.status(400).json({ error: 'Could not extract playlist ID.' });
+  try {
+    const p = await ytmusic.getPlaylist(playlistId);
+    if (!p) throw new Error('Playlist not found.');
+    res.json({ id: p.playlistId, title: p.name || 'YouTube Music Playlist',
+      tracks: (p.songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', duration: dur(s.duration) })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.listen(PORT, () => console.log('[server] v1.4.0 port ' + PORT));
 module.exports = app;
