@@ -11,104 +11,77 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Piped instances (stream URL resolution — avoids Vercel IP bot-detection) ─
-// Piped is a FOSS YouTube frontend whose servers are not blocked by YouTube.
-// Our server fetches the CDN URL from Piped, then returns it to Eclipse.
-// Eclipse (user's iPhone) plays the URL directly — audio never passes through Vercel.
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.tokhmi.xyz',
-  'https://pipedapi.moomoo.me',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.privateger.me',
-  'https://pipedapi.adminforge.de',
-  'https://piped.in.projectsegfau.lt/api',
-  'https://watchapi.whatever.social'
+// ─── Stream resolvers — all fired in parallel via Promise.any() ───────────────
+// Serial fallback was taking 40-60s and hitting Vercel's function timeout.
+// Promise.any() returns the FIRST success in ~1-3s regardless of dead instances.
+const ALL_RESOLVERS = [
+  { t: 'piped',     b: 'https://pipedapi.kavin.rocks' },
+  { t: 'piped',     b: 'https://pipedapi.tokhmi.xyz' },
+  { t: 'piped',     b: 'https://pipedapi.moomoo.me' },
+  { t: 'piped',     b: 'https://piped-api.garudalinux.org' },
+  { t: 'piped',     b: 'https://api.piped.privateger.me' },
+  { t: 'piped',     b: 'https://pa.il.sceptique.eu' },
+  { t: 'piped',     b: 'https://pipedapi.leptons.xyz' },
+  { t: 'piped',     b: 'https://piped.lunar.icu/api' },
+  { t: 'invidious', b: 'https://inv.tux.pizza' },
+  { t: 'invidious', b: 'https://invidious.fdn.fr' },
+  { t: 'invidious', b: 'https://invidious.slipfox.xyz' },
+  { t: 'invidious', b: 'https://iv.datura.network' },
+  { t: 'invidious', b: 'https://invidious.perennialte.ch' }
 ];
 
-// Invidious instances as secondary fallback (returns direct googlevideo.com URLs)
-const INVIDIOUS_INSTANCES = [
-  'https://inv.tux.pizza',
-  'https://invidious.fdn.fr',
-  'https://invidious.privacydev.net',
-  'https://yt.artemislena.eu',
-  'https://invidious.slipfox.xyz'
-];
-
-async function resolveViaPiped(videoId) {
-  const errors = [];
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const r = await axios.get(base + '/streams/' + videoId, {
-        timeout: 8000,
-        headers: { 'Accept': 'application/json' }
-      });
-      const streams = r.data && r.data.audioStreams;
-      if (!Array.isArray(streams) || !streams.length) continue;
-
-      // Prefer m4a/aac for Eclipse compatibility
-      const m4a  = streams.filter(s => (s.mimeType || '').includes('mp4'));
-      const pool = m4a.length ? m4a : streams;
-      const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-      if (!best || !best.url) continue;
-
-      const fmt = (best.mimeType || '').includes('mp4') ? 'aac'
-                : (best.mimeType || '').includes('opus') ? 'opus'
-                : 'mp3';
-
-      // Piped proxy URLs don't embed expiry; default 6h
-      const expMatch = best.url.match(/[?&]expire=(\d+)/);
-      const expiresAt = expMatch
-        ? parseInt(expMatch[1], 10)
-        : Math.floor(Date.now() / 1000) + 21600;
-
-      console.log('[stream] Piped OK via ' + base + ' for ' + videoId);
-      return { url: best.url, format: fmt, quality: best.quality || 'unknown', expiresAt };
-    } catch (e) {
-      errors.push(base.replace('https://', '') + ': ' + e.message.slice(0, 60));
-    }
+async function fetchFromResolver(resolver, videoId) {
+  if (resolver.t === 'piped') {
+    const r = await axios.get(resolver.b + '/streams/' + videoId, {
+      timeout: 4500,
+      headers: { 'Accept': 'application/json' }
+    });
+    const streams = r.data && r.data.audioStreams;
+    if (!Array.isArray(streams) || !streams.length) throw new Error('no audioStreams');
+    const m4a  = streams.filter(s => (s.mimeType || '').includes('mp4'));
+    const pool = m4a.length ? m4a : streams;
+    const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    if (!best || !best.url) throw new Error('no url in response');
+    const fmt       = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
+    const expMatch  = best.url.match(/[?&]expire=(\d+)/);
+    const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
+    return { url: best.url, format: fmt, quality: best.quality || 'unknown', expiresAt };
+  } else {
+    const r = await axios.get(resolver.b + '/api/v1/videos/' + videoId, {
+      params:  { fields: 'adaptiveFormats' },
+      timeout: 4500,
+      headers: { 'Accept': 'application/json' }
+    });
+    const formats = (r.data && r.data.adaptiveFormats || [])
+      .filter(f => f.type && f.type.startsWith('audio/') && f.url);
+    if (!formats.length) throw new Error('no audio adaptiveFormats');
+    const m4a  = formats.filter(f => f.type.includes('mp4'));
+    const pool = m4a.length ? m4a : formats;
+    const best = pool.sort((a, b) => parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0))[0];
+    if (!best || !best.url) throw new Error('no url in response');
+    const fmt       = best.type.includes('mp4') ? 'aac' : best.type.includes('opus') ? 'opus' : 'mp3';
+    const expMatch  = best.url.match(/[?&]expire=(\d+)/);
+    const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
+    return {
+      url:       best.url,
+      format:    fmt,
+      quality:   best.bitrate ? Math.round(parseInt(best.bitrate) / 1000) + 'kbps' : 'unknown',
+      expiresAt
+    };
   }
-  throw new Error('Piped: ' + errors.slice(-2).join(' | '));
 }
 
-async function resolveViaInvidious(videoId) {
-  const errors = [];
-  for (const base of INVIDIOUS_INSTANCES) {
-    try {
-      const r = await axios.get(base + '/api/v1/videos/' + videoId, {
-        params: { fields: 'adaptiveFormats' },
-        timeout: 8000,
-        headers: { 'Accept': 'application/json' }
-      });
-      const formats = (r.data && r.data.adaptiveFormats || [])
-        .filter(f => f.type && f.type.startsWith('audio/') && f.url);
-      if (!formats.length) continue;
-
-      const m4a  = formats.filter(f => f.type.includes('mp4'));
-      const pool = m4a.length ? m4a : formats;
-      const best = pool.sort((a, b) => parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0))[0];
-      if (!best || !best.url) continue;
-
-      const fmt = best.type.includes('mp4') ? 'aac'
-                : best.type.includes('opus') ? 'opus'
-                : 'mp3';
-      const expMatch  = best.url.match(/[?&]expire=(\d+)/);
-      const expiresAt = expMatch
-        ? parseInt(expMatch[1], 10)
-        : Math.floor(Date.now() / 1000) + 21600;
-
-      console.log('[stream] Invidious OK via ' + base + ' for ' + videoId);
-      return {
-        url:       best.url,
-        format:    fmt,
-        quality:   best.bitrate ? Math.round(parseInt(best.bitrate) / 1000) + 'kbps' : 'unknown',
-        expiresAt
-      };
-    } catch (e) {
-      errors.push(base.replace('https://', '') + ': ' + e.message.slice(0, 60));
-    }
+async function resolveFromAny(videoId) {
+  try {
+    const result = await Promise.any(
+      ALL_RESOLVERS.map(r => fetchFromResolver(r, videoId))
+    );
+    console.log('[stream] resolved ' + videoId);
+    return result;
+  } catch (err) {
+    const msgs = (err.errors || []).slice(0, 4).map(e => e.message).join(' | ');
+    throw new Error('All resolvers failed — ' + msgs);
   }
-  throw new Error('Invidious: ' + errors.slice(-2).join(' | '));
 }
 
 // ─── YTMusic singleton (search / catalog) ────────────────────────────────────
@@ -232,35 +205,21 @@ function thumb(thumbnails) {
 function dur(s)   { return s ? Math.floor(s) : null; }
 function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
-// ─── Stream resolution (Piped → Invidious, fully cached) ─────────────────────
+// ─── Stream cache ─────────────────────────────────────────────────────────────
 const STREAM_MEM = new Map();
 
 async function resolveStream(videoId) {
-  // 1) memory cache
   const mc = STREAM_MEM.get(videoId);
   if (mc && mc.expiresAt > Date.now() / 1000 + 600) return mc;
 
-  // 2) Redis cache
   const rc = await rGet('ytm:stream:' + videoId);
   if (rc) {
     const p = JSON.parse(rc);
     if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; }
   }
 
-  // 3) Piped first, Invidious fallback
-  let result;
-  try {
-    result = await resolveViaPiped(videoId);
-  } catch (pErr) {
-    console.warn('[stream] Piped failed for ' + videoId + ': ' + pErr.message);
-    try {
-      result = await resolveViaInvidious(videoId);
-    } catch (iErr) {
-      throw new Error('All resolvers failed — ' + pErr.message + ' / ' + iErr.message);
-    }
-  }
+  const result = await resolveFromAny(videoId);
 
-  // 4) cache
   STREAM_MEM.set(videoId, result);
   const ttl = Math.max(60, result.expiresAt - Math.floor(Date.now() / 1000) - 600);
   await rSet('ytm:stream:' + videoId, JSON.stringify(result), ttl);
@@ -307,9 +266,9 @@ function configPage(base) {
   h += 'footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1.8}</style></head><body>';
   h += '<svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#ff0000"/><circle cx="26" cy="26" r="10" fill="none" stroke="#fff" stroke-width="2.5"/><polygon points="23,22 23,30 31,26" fill="#fff"/></svg>';
   h += '<div class="card"><h1>YouTube Music for Eclipse</h1>';
-  h += '<div class="tip"><b>Save your URL.</b> Copy it to Notes or a bookmark. If the server restarts, paste it below to restore access to all your playlists.</div>';
-  h += '<p class="sub">Full YouTube Music search — tracks, albums, artists, and playlists. Stream URLs are resolved via Piped (open-source YouTube frontend) so audio plays directly from your device, not through the server.</p>';
-  h += '<div class="pills"><span class="pill">Tracks</span><span class="pill">Albums</span><span class="pill">Artists</span><span class="pill">Playlists</span><span class="pill b">Piped stream routing</span><span class="pill g">CSV export</span></div>';
+  h += '<div class="tip"><b>Save your URL.</b> Copy it to Notes or a bookmark. If the server restarts, paste it below to restore access.</div>';
+  h += '<p class="sub">Full YouTube Music search — tracks, albums, artists, and playlists. All 13 stream resolvers are raced in parallel so the fastest one wins in ~1-3 seconds.</p>';
+  h += '<div class="pills"><span class="pill">Tracks</span><span class="pill">Albums</span><span class="pill">Artists</span><span class="pill">Playlists</span><span class="pill b">13 parallel resolvers</span><span class="pill g">CSV export</span></div>';
   h += '<div class="lbl">Generate a new URL</div>';
   h += '<button class="br" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
   h += '<div class="box" id="genBox"><div class="blbl">Your addon URL — paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
@@ -324,7 +283,7 @@ function configPage(base) {
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
   h += '<div class="step"><div class="sn">4</div><div class="st">Use <b>Playlist Importer</b> below to export a YouTube Music playlist as CSV</div></div>';
   h += '</div>';
-  h += '<div class="warn">Stream URLs are fetched from Piped community instances and cached for ~6 hours. Audio plays directly from your device — zero bandwidth through this server. If a track fails, the next Piped instance is tried automatically.</div></div>';
+  h += '<div class="warn">Stream URLs are resolved from 13 Piped/Invidious instances in parallel — the first response wins. Audio plays directly from your device. Resolved URLs are cached in Redis for ~6 hours.</div></div>';
   h += '<div class="card"><span class="badge">Playlist Importer</span>';
   h += '<h2>Export YouTube Music Playlist → CSV</h2>';
   h += '<p class="sub">Downloads a CSV you can import in Eclipse via Library → Import CSV.</p>';
@@ -336,7 +295,7 @@ function configPage(base) {
   h += '<div class="status" id="impStatus"></div>';
   h += '<div class="preview" id="impPreview"></div>';
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button></div>';
-  h += '<footer>Eclipse YouTube Music Addon v1.2.0 • <a href="' + base + '/health" target="_blank" style="color:#333;text-decoration:none">' + base + '</a></footer>';
+  h += '<footer>Eclipse YouTube Music Addon v1.3.0 • <a href="' + base + '/health" target="_blank" style="color:#333;text-decoration:none">' + base + '</a></footer>';
   h += '<script>';
   h += 'var _gu="",_ru="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}_gu=d.manifestUrl;document.getElementById("genUrl").textContent=_gu;document.getElementById("genBox").style.display="block";document.getElementById("impToken").value=_gu;btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
@@ -383,9 +342,10 @@ app.post('/refresh', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status:         'ok',
-    version:        '1.2.0',
+    version:        '1.3.0',
     ytmusicReady:   ytmReady,
-    streamBackend:  'Piped → Invidious',
+    streamBackend:  'Promise.any() — 13 parallel Piped+Invidious resolvers',
+    resolvers:      ALL_RESOLVERS.length,
     redisConnected: !!(redis && redis.status === 'ready'),
     activeTokens:   TOKEN_CACHE.size,
     timestamp:      new Date().toISOString()
@@ -397,7 +357,7 @@ app.get('/u/:token/manifest.json', authMw, (req, res) => {
   res.json({
     id:          'com.eclipse.ytmusic.' + req.params.token.slice(0, 8),
     name:        'YouTube Music',
-    version:     '1.2.0',
+    version:     '1.3.0',
     description: 'Full YouTube Music search and streaming — tracks, albums, artists, and playlists.',
     icon:        'https://music.youtube.com/img/favicon_144.png',
     resources:   ['search', 'stream', 'catalog'],
@@ -600,5 +560,5 @@ app.get('/u/:token/import', authMw, async (req, res) => {
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log('[server] listening on port ' + PORT));
+app.listen(PORT, () => console.log('[server] v1.3.0 listening on port ' + PORT));
 module.exports = app;
