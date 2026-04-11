@@ -11,77 +11,94 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Stream resolver ──────────────────────────────────────────────────────────
-// Calls your own Cloudflare Worker (WORKER_URL env var) — CF edge IPs, never
-// blocked by YouTube. Piped instances are kept as fallback only.
-// Set WORKER_URL in Vercel environment variables.
+// ─── Stream resolver — youtubei.js (handles PO token + session locally) ───────
+let _yt = null;
+let _ytInit = false;
 
-const WORKER_URL = (process.env.WORKER_URL || '').replace(/\/$/, '');
-
-const PIPED_FALLBACK = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi-libre.kavin.rocks',
-  'https://pipedapi.moomoo.me',
-  'https://pipedapi.rivo.lol',
-  'https://piped-api.cfe.re',
-  'https://pipedapi.r4fo.com',
-  'https://api.piped.yt'
-];
-
-const CLOUD_BLOCKED = new Set();
-
-async function resolveViaWorker(videoId) {
-  if (!WORKER_URL) throw new Error('WORKER_URL not set');
-  const r = await axios.get(WORKER_URL + '/' + videoId, {
-    timeout: 10000,
-    headers: { 'Accept': 'application/json' }
-  });
-  const d = r.data;
-  if (!d || !d.url) throw new Error('worker: empty url');
-  console.log('[stream] worker OK client=' + (d.client || '?') + ' for ' + videoId);
-  return d;
-}
-
-async function resolveViaPiped(base, videoId) {
-  if (CLOUD_BLOCKED.has(base)) throw new Error('blocked');
-  const r = await axios.get(base + '/streams/' + videoId, {
-    timeout: 5000,
-    headers: { 'Accept': 'application/json' }
-  });
-  const streams = r.data && r.data.audioStreams;
-  if (!Array.isArray(streams) || !streams.length) throw new Error('no audioStreams');
-  const m4a  = streams.filter(s => (s.mimeType || '').includes('mp4'));
-  const pool = m4a.length ? m4a : streams;
-  const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-  if (!best || !best.url) throw new Error('piped: no url');
-  const fmt      = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
-  const expMatch = best.url.match(/[?&]expire=(\d+)/);
-  console.log('[stream] piped OK via ' + base + ' for ' + videoId);
-  return { url: best.url, format: fmt, quality: best.quality || 'unknown',
-    expiresAt: expMatch ? parseInt(expMatch[1]) : Math.floor(Date.now() / 1000) + 21600 };
-}
-
-async function resolveFromAny(videoId) {
-  const available = PIPED_FALLBACK.filter(b => !CLOUD_BLOCKED.has(b));
-
-  // Worker is primary — start it immediately. Race Piped in parallel as fallback.
-  const workerP = resolveViaWorker(videoId);
-  const pipedPs = available.map(base =>
-    resolveViaPiped(base, videoId).catch(e => {
-      if (e.response && (e.response.status === 403 || e.response.status === 429)) {
-        CLOUD_BLOCKED.add(base);
-        console.warn('[piped] cloud-blocked: ' + base + ' (' + e.response.status + ')');
-      }
-      throw e;
-    })
-  );
-
-  try {
-    return await Promise.any([workerP, ...pipedPs]);
-  } catch (err) {
-    const msgs = (err.errors || [err]).slice(0, 5).map(e => e.message).join(' | ');
-    throw new Error('All resolvers failed — ' + msgs);
+async function getYT() {
+  if (_yt) return _yt;
+  if (_ytInit) {
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 300));
+      if (_yt) return _yt;
+    }
+    throw new Error('YT init timeout');
   }
+  _ytInit = true;
+  try {
+    const { Innertube } = require('youtubei.js');
+    _yt = await Innertube.create({
+      cache:                    new Map(),
+      generate_session_locally: true,
+      fetch:                    (url, opts) => fetch(url, opts)
+    });
+    console.log('[yt] innertube ready');
+    return _yt;
+  } catch (e) {
+    _ytInit = false;
+    throw e;
+  }
+}
+
+// Boot it immediately on cold start
+getYT().catch(e => console.error('[yt] boot error: ' + e.message));
+setInterval(() => { if (!_yt) getYT().catch(() => {}); }, 30000);
+
+const STREAM_MEM = new Map();
+
+async function resolveStream(videoId) {
+  const mc = STREAM_MEM.get(videoId);
+  if (mc && mc.expiresAt > Date.now() / 1000 + 600) return mc;
+
+  const rc = await rGet('ytm:stream:' + videoId);
+  if (rc) {
+    const p = JSON.parse(rc);
+    if (p.expiresAt > Date.now() / 1000 + 600) {
+      STREAM_MEM.set(videoId, p);
+      return p;
+    }
+  }
+
+  const yt = await getYT();
+
+  // Try ANDROID client first — returns direct (non-ciphered) URLs
+  let info;
+  try {
+    info = await yt.getBasicInfo(videoId, 'ANDROID');
+  } catch (_e) {
+    info = await yt.getBasicInfo(videoId, 'IOS');
+  }
+
+  const ps = info.playability_status;
+  if (ps && ps.status === 'LOGIN_REQUIRED') throw new Error('login_required');
+  if (ps && ps.status !== 'OK')            throw new Error('not_playable: ' + ps.status);
+
+  const formats = (info.streaming_data?.adaptive_formats || [])
+    .filter(f => f.mime_type?.startsWith('audio/') && (f.url || f.decipher));
+
+  if (!formats.length) throw new Error('no audio formats');
+
+  const m4a  = formats.filter(f => f.mime_type?.includes('mp4a'));
+  const pool = m4a.length ? m4a : formats;
+  const best = pool.sort((a, b) => (b.average_bitrate || 0) - (a.average_bitrate || 0))[0];
+
+  // decipher() decodes the URL if it came back cipher-encoded (web client)
+  const url       = best.url || await best.decipher(yt.actions.session.player);
+  const expMatch  = url.match(/[?&]expire=(\d+)/);
+  const expiresAt = expMatch ? parseInt(expMatch[1]) : Math.floor(Date.now() / 1000) + 21600;
+
+  const result = {
+    url,
+    format:    best.mime_type?.includes('mp4a') ? 'aac' : 'opus',
+    quality:   best.average_bitrate ? Math.round(best.average_bitrate / 1000) + 'kbps' : 'unknown',
+    expiresAt
+  };
+
+  STREAM_MEM.set(videoId, result);
+  await rSet('ytm:stream:' + videoId, JSON.stringify(result),
+    Math.max(60, expiresAt - Math.floor(Date.now() / 1000) - 600));
+
+  return result;
 }
 
 
