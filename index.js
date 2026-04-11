@@ -11,75 +11,39 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Stream resolvers ─────────────────────────────────────────────────────────
-// api.cobalt.tools uses Cloudflare bot protection and REJECTS automated requests.
-// Only use community instances (instances.cobalt.best).
-// Set COBALT_URL env var in Vercel to add your own self-hosted instance first.
+// ─── Stream resolver ──────────────────────────────────────────────────────────
+// Calls your own Cloudflare Worker (WORKER_URL env var) — CF edge IPs, never
+// blocked by YouTube. Piped instances are kept as fallback only.
+// Set WORKER_URL in Vercel environment variables.
 
-const COBALT_POOL = [
-  process.env.COBALT_URL || null,     // Your own instance — highest priority
-  'https://cobalt.canine.tools',      // Verified working for YT (Apr 2026)
-  'https://cobalt.meowing.de',        // Verified working for YT (Apr 2026)
-  'https://cobalt-api.kwiatekmiki.com',
-  'https://cobalt.synth.zip',
-  'https://cobalt.catvibers.me',
-].filter(Boolean);
+const WORKER_URL = (process.env.WORKER_URL || '').replace(/\/$/, '');
 
-const PIPED_POOL = [
+const PIPED_FALLBACK = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi-libre.kavin.rocks',
   'https://pipedapi.moomoo.me',
-  'https://pipedapi.tokhmi.xyz',
   'https://pipedapi.rivo.lol',
   'https://piped-api.cfe.re',
   'https://pipedapi.r4fo.com',
-  'https://pipedapi.colinslegacy.com',
   'https://api.piped.yt'
 ];
 
-// Permanently skip instances that block cloud IPs (403/429) within this invocation.
-// For cross-invocation persistence, these are also written to Redis.
 const CLOUD_BLOCKED = new Set();
 
-async function loadBlockedFromRedis(r) {
-  if (!r) return;
-  try {
-    const raw = await r.get('ytm:blocked');
-    if (raw) JSON.parse(raw).forEach(b => CLOUD_BLOCKED.add(b));
-  } catch (_e) {}
-}
-async function saveBlockedToRedis(r) {
-  if (!r) return;
-  try { await r.set('ytm:blocked', JSON.stringify([...CLOUD_BLOCKED]), 'EX', 3600); } catch (_e) {}
-}
-
-async function tryOneCobalt(base, videoId) {
-  const r = await axios.post(base + '/', {
-    url:          'https://www.youtube.com/watch?v=' + videoId,
-    downloadMode: 'audio',
-    audioFormat:  'best'
-  }, {
-    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-    timeout: 9000
+async function resolveViaWorker(videoId) {
+  if (!WORKER_URL) throw new Error('WORKER_URL not set');
+  const r = await axios.get(WORKER_URL + '/' + videoId, {
+    timeout: 10000,
+    headers: { 'Accept': 'application/json' }
   });
-  const d = r.data || {};
-  // Cobalt v10 error format: { status: 'error', error: { code: '...' } }
-  if (d.status === 'error') throw new Error('cobalt: ' + (d.error && d.error.code ? d.error.code : JSON.stringify(d.error || d)));
-  let url = d.url;
-  // Picker status means a playlist was returned — audio is in d.audio
-  if (d.status === 'picker' && d.audio) url = d.audio;
-  if (!url) throw new Error('cobalt(' + base + '): empty url');
-  console.log('[stream] cobalt OK via ' + base + ' for ' + videoId);
-  return {
-    url,
-    format:    'aac',
-    quality:   'unknown',
-    expiresAt: Math.floor(Date.now() / 1000) + (d.status === 'tunnel' ? 43200 : 21600)
-  };
+  const d = r.data;
+  if (!d || !d.url) throw new Error('worker: empty url');
+  console.log('[stream] worker OK client=' + (d.client || '?') + ' for ' + videoId);
+  return d;
 }
 
-async function tryOnePiped(base, videoId) {
-  if (CLOUD_BLOCKED.has(base)) throw new Error('blocked:' + base);
+async function resolveViaPiped(base, videoId) {
+  if (CLOUD_BLOCKED.has(base)) throw new Error('blocked');
   const r = await axios.get(base + '/streams/' + videoId, {
     timeout: 5000,
     headers: { 'Accept': 'application/json' }
@@ -92,35 +56,30 @@ async function tryOnePiped(base, videoId) {
   if (!best || !best.url) throw new Error('piped: no url');
   const fmt      = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
   const expMatch = best.url.match(/[?&]expire=(\d+)/);
-  const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
   console.log('[stream] piped OK via ' + base + ' for ' + videoId);
-  return { url: best.url, format: fmt, quality: best.quality || 'unknown', expiresAt };
+  return { url: best.url, format: fmt, quality: best.quality || 'unknown',
+    expiresAt: expMatch ? parseInt(expMatch[1]) : Math.floor(Date.now() / 1000) + 21600 };
 }
 
-function wrapBlocking(fn, base, redisRef) {
-  return fn().catch(e => {
-    const status = e.response && e.response.status;
-    if (status === 403 || status === 429 || status === 401) {
-      CLOUD_BLOCKED.add(base);
-      saveBlockedToRedis(redisRef);
-      console.warn('[resolver] cloud-blocked: ' + base + ' (' + status + ')');
-    }
-    throw e;
-  });
-}
+async function resolveFromAny(videoId) {
+  const available = PIPED_FALLBACK.filter(b => !CLOUD_BLOCKED.has(b));
 
-async function resolveFromAny(videoId, redisRef) {
-  const availPiped = PIPED_POOL.filter(b => !CLOUD_BLOCKED.has(b));
-
-  const all = [
-    ...COBALT_POOL.map(b => wrapBlocking(() => tryOneCobalt(b, videoId), b, redisRef)),
-    ...availPiped.map(b  => wrapBlocking(() => tryOnePiped(b, videoId),  b, redisRef))
-  ];
+  // Worker is primary — start it immediately. Race Piped in parallel as fallback.
+  const workerP = resolveViaWorker(videoId);
+  const pipedPs = available.map(base =>
+    resolveViaPiped(base, videoId).catch(e => {
+      if (e.response && (e.response.status === 403 || e.response.status === 429)) {
+        CLOUD_BLOCKED.add(base);
+        console.warn('[piped] cloud-blocked: ' + base + ' (' + e.response.status + ')');
+      }
+      throw e;
+    })
+  );
 
   try {
-    return await Promise.any(all);
+    return await Promise.any([workerP, ...pipedPs]);
   } catch (err) {
-    const msgs = (err.errors || [err]).slice(0, 6).map(e => e.message).join(' | ');
+    const msgs = (err.errors || [err]).slice(0, 5).map(e => e.message).join(' | ');
     throw new Error('All resolvers failed — ' + msgs);
   }
 }
