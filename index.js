@@ -11,29 +11,102 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Stream resolvers — all fired in parallel via Promise.any() ───────────────
-// Serial fallback was taking 40-60s and hitting Vercel's function timeout.
-// Promise.any() returns the FIRST success in ~1-3s regardless of dead instances.
-const ALL_RESOLVERS = [
-  { t: 'piped',     b: 'https://pipedapi.kavin.rocks' },
-  { t: 'piped',     b: 'https://pipedapi.tokhmi.xyz' },
-  { t: 'piped',     b: 'https://pipedapi.moomoo.me' },
-  { t: 'piped',     b: 'https://piped-api.garudalinux.org' },
-  { t: 'piped',     b: 'https://api.piped.privateger.me' },
-  { t: 'piped',     b: 'https://pa.il.sceptique.eu' },
-  { t: 'piped',     b: 'https://pipedapi.leptons.xyz' },
-  { t: 'piped',     b: 'https://piped.lunar.icu/api' },
+// ─── Instance discovery ───────────────────────────────────────────────────────
+// Fetches live instance lists from official sources at startup + every 20 min.
+// Falls back to a hardcoded list if discovery fails.
+
+const FALLBACK_RESOLVERS = [
+  // Piped — CDN-backed, multi-region (from TeamPiped/Piped wiki April 2026)
+  { t: 'piped', b: 'https://pipedapi.kavin.rocks' },
+  { t: 'piped', b: 'https://pipedapi.tokhmi.xyz' },
+  { t: 'piped', b: 'https://pipedapi.moomoo.me' },
+  { t: 'piped', b: 'https://pipedapi.syncpundit.io' },
+  { t: 'piped', b: 'https://api-piped.mha.fi' },
+  { t: 'piped', b: 'https://pipedapi.rivo.lol' },
+  { t: 'piped', b: 'https://pipedapi.leptons.xyz' },
+  { t: 'piped', b: 'https://piped-api.lunar.icu' },
+  { t: 'piped', b: 'https://ytapi.dc09.ru' },
+  { t: 'piped', b: 'https://pipedapi.colinslegacy.com' },
+  { t: 'piped', b: 'https://yapi.vyper.me' },
+  { t: 'piped', b: 'https://api.looleh.xyz' },
+  { t: 'piped', b: 'https://piped-api.cfe.re' },
+  { t: 'piped', b: 'https://pipedapi.r4fo.com' },
+  { t: 'piped', b: 'https://pipedapi-libre.kavin.rocks' },
+  // Invidious — all require rotating IPs per official policy (docs.invidious.io)
+  { t: 'invidious', b: 'https://yewtu.be' },
   { t: 'invidious', b: 'https://inv.tux.pizza' },
   { t: 'invidious', b: 'https://invidious.fdn.fr' },
-  { t: 'invidious', b: 'https://invidious.slipfox.xyz' },
   { t: 'invidious', b: 'https://iv.datura.network' },
-  { t: 'invidious', b: 'https://invidious.perennialte.ch' }
+  { t: 'invidious', b: 'https://invidious.slipfox.xyz' },
+  { t: 'invidious', b: 'https://inv.thepixora.com' }
 ];
 
+let LIVE_RESOLVERS    = null;
+let resolversLoadedAt = 0;
+const RESOLVER_TTL_MS = 20 * 60 * 1000; // refresh every 20 min
+
+async function loadResolvers() {
+  const results = [];
+
+  // 1) Piped — fetch live list from official kavin.rocks endpoint
+  try {
+    const r = await axios.get('https://piped.kavin.rocks/instances', { timeout: 5000 });
+    if (Array.isArray(r.data)) {
+      for (const inst of r.data) {
+        const api = inst.api_url || inst.apiurl;
+        if (api && typeof api === 'string') results.push({ t: 'piped', b: api.replace(/\/$/, '') });
+      }
+      console.log('[resolvers] Piped: ' + results.length + ' live instances loaded');
+    }
+  } catch (e) {
+    console.warn('[resolvers] Piped discovery failed: ' + e.message);
+  }
+
+  // 2) Invidious — fetch healthy API-enabled instances from api.invidious.io
+  try {
+    const r = await axios.get('https://api.invidious.io/instances.json?sort_by=health', { timeout: 6000 });
+    if (Array.isArray(r.data)) {
+      for (const entry of r.data) {
+        // entry is [hostname, { uri, api, health }]
+        const info = Array.isArray(entry) ? entry[1] : entry;
+        if (info && info.api === true && info.uri) {
+          results.push({ t: 'invidious', b: info.uri.replace(/\/$/, '') });
+        }
+      }
+      const invCount = results.filter(r => r.t === 'invidious').length;
+      console.log('[resolvers] Invidious: ' + invCount + ' live instances loaded');
+    }
+  } catch (e) {
+    console.warn('[resolvers] Invidious discovery failed: ' + e.message);
+  }
+
+  if (results.length >= 5) {
+    LIVE_RESOLVERS    = results;
+    resolversLoadedAt = Date.now();
+    console.log('[resolvers] total: ' + results.length);
+  } else {
+    console.warn('[resolvers] discovery returned < 5 results, using fallback list');
+    LIVE_RESOLVERS    = FALLBACK_RESOLVERS;
+    resolversLoadedAt = Date.now();
+  }
+}
+
+// Load at startup, refresh every 20 min
+loadResolvers();
+setInterval(loadResolvers, RESOLVER_TTL_MS);
+
+function getResolvers() {
+  if (!LIVE_RESOLVERS || Date.now() - resolversLoadedAt > RESOLVER_TTL_MS * 2) {
+    return FALLBACK_RESOLVERS;
+  }
+  return LIVE_RESOLVERS;
+}
+
+// ─── Per-resolver fetch ───────────────────────────────────────────────────────
 async function fetchFromResolver(resolver, videoId) {
   if (resolver.t === 'piped') {
     const r = await axios.get(resolver.b + '/streams/' + videoId, {
-      timeout: 4500,
+      timeout: 4000,
       headers: { 'Accept': 'application/json' }
     });
     const streams = r.data && r.data.audioStreams;
@@ -41,7 +114,7 @@ async function fetchFromResolver(resolver, videoId) {
     const m4a  = streams.filter(s => (s.mimeType || '').includes('mp4'));
     const pool = m4a.length ? m4a : streams;
     const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-    if (!best || !best.url) throw new Error('no url in response');
+    if (!best || !best.url) throw new Error('no url');
     const fmt       = (best.mimeType || '').includes('mp4') ? 'aac' : 'opus';
     const expMatch  = best.url.match(/[?&]expire=(\d+)/);
     const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
@@ -49,16 +122,16 @@ async function fetchFromResolver(resolver, videoId) {
   } else {
     const r = await axios.get(resolver.b + '/api/v1/videos/' + videoId, {
       params:  { fields: 'adaptiveFormats' },
-      timeout: 4500,
+      timeout: 4000,
       headers: { 'Accept': 'application/json' }
     });
     const formats = (r.data && r.data.adaptiveFormats || [])
       .filter(f => f.type && f.type.startsWith('audio/') && f.url);
-    if (!formats.length) throw new Error('no audio adaptiveFormats');
+    if (!formats.length) throw new Error('no audio formats');
     const m4a  = formats.filter(f => f.type.includes('mp4'));
     const pool = m4a.length ? m4a : formats;
     const best = pool.sort((a, b) => parseInt(b.bitrate || 0) - parseInt(a.bitrate || 0))[0];
-    if (!best || !best.url) throw new Error('no url in response');
+    if (!best || !best.url) throw new Error('no url');
     const fmt       = best.type.includes('mp4') ? 'aac' : best.type.includes('opus') ? 'opus' : 'mp3';
     const expMatch  = best.url.match(/[?&]expire=(\d+)/);
     const expiresAt = expMatch ? parseInt(expMatch[1], 10) : Math.floor(Date.now() / 1000) + 21600;
@@ -72,15 +145,16 @@ async function fetchFromResolver(resolver, videoId) {
 }
 
 async function resolveFromAny(videoId) {
+  const resolvers = getResolvers();
+  // Shuffle so we don't always hammer the same first few instances
+  const shuffled = [...resolvers].sort(() => Math.random() - 0.5);
   try {
-    const result = await Promise.any(
-      ALL_RESOLVERS.map(r => fetchFromResolver(r, videoId))
-    );
+    const result = await Promise.any(shuffled.map(r => fetchFromResolver(r, videoId)));
     console.log('[stream] resolved ' + videoId);
     return result;
   } catch (err) {
-    const msgs = (err.errors || []).slice(0, 4).map(e => e.message).join(' | ');
-    throw new Error('All resolvers failed — ' + msgs);
+    const msgs = (err.errors || []).slice(0, 5).map(e => e.message).join(' | ');
+    throw new Error('All ' + resolvers.length + ' resolvers failed — ' + msgs);
   }
 }
 
@@ -125,7 +199,6 @@ if (process.env.REDIS_URL) {
   redis.on('connect', () => console.log('[redis] connected'));
   redis.on('error',   e  => console.error('[redis] error: ' + e.message));
 }
-
 async function rGet(key) {
   if (!redis) return null;
   try { return await redis.get(key); } catch (_e) { return null; }
@@ -146,25 +219,19 @@ const RATE_MAX          = 60;
 const RATE_WINDOW_MS    = 60_000;
 
 function genToken() { return crypto.randomBytes(14).toString('hex'); }
-
 function ipBucket(ip) {
   const now = Date.now();
   let b = IP_CREATES.get(ip);
   if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86_400_000 }; IP_CREATES.set(ip, b); }
   return b;
 }
-
 async function saveToken(token, entry) {
-  await rSet('ytm:tok:' + token, JSON.stringify({
-    createdAt: entry.createdAt, lastUsed: entry.lastUsed, reqCount: entry.reqCount
-  }));
+  await rSet('ytm:tok:' + token, JSON.stringify({ createdAt: entry.createdAt, lastUsed: entry.lastUsed, reqCount: entry.reqCount }));
 }
-
 async function loadToken(token) {
   const d = await rGet('ytm:tok:' + token);
   return d ? JSON.parse(d) : null;
 }
-
 async function getEntry(token) {
   if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
   const saved = await loadToken(token);
@@ -173,7 +240,6 @@ async function getEntry(token) {
   TOKEN_CACHE.set(token, entry);
   return entry;
 }
-
 function rateOk(entry) {
   const now = Date.now();
   entry.rateWin = (entry.rateWin || []).filter(t => now - t < RATE_WINDOW_MS);
@@ -183,7 +249,6 @@ function rateOk(entry) {
   entry.reqCount = (entry.reqCount || 0) + 1;
   return true;
 }
-
 async function authMw(req, res, next) {
   const e = await getEntry(req.params.token);
   if (!e) return res.status(404).json({ error: 'Invalid token.' });
@@ -192,12 +257,11 @@ async function authMw(req, res, next) {
   if (e.reqCount % 20 === 0) saveToken(req.params.token, e);
   next();
 }
-
 function getBase(req) {
   return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Misc helpers ─────────────────────────────────────────────────────────────
 function thumb(thumbnails) {
   if (!thumbnails || !thumbnails.length) return null;
   return [...thumbnails].sort((a, b) => (b.width || 0) - (a.width || 0))[0].url || null;
@@ -211,15 +275,12 @@ const STREAM_MEM = new Map();
 async function resolveStream(videoId) {
   const mc = STREAM_MEM.get(videoId);
   if (mc && mc.expiresAt > Date.now() / 1000 + 600) return mc;
-
   const rc = await rGet('ytm:stream:' + videoId);
   if (rc) {
     const p = JSON.parse(rc);
     if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; }
   }
-
   const result = await resolveFromAny(videoId);
-
   STREAM_MEM.set(videoId, result);
   const ttl = Math.max(60, result.expiresAt - Math.floor(Date.now() / 1000) - 600);
   await rSet('ytm:stream:' + videoId, JSON.stringify(result), ttl);
