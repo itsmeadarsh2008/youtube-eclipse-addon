@@ -3,15 +3,52 @@
 const express = require('express');
 const cors    = require('cors');
 const crypto  = require('crypto');
+const axios   = require('axios');
 const Redis   = require('ioredis');
-const ytdl    = require('@distube/ytdl-core');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── YTMusic singleton ────────────────────────────────────────────────────────
+// ─── InnerTube ANDROID_MUSIC client ──────────────────────────────────────────
+// Uses the official YouTube Music Android app client identity.
+// This bypasses YouTube's bot detection that blocks generic cloud IPs.
+// ANDROID_MUSIC returns direct (unencrypted) CDN URLs — no cipher/n-param needed.
+const INNERTUBE_UA  = 'com.google.android.apps.youtube.music/6.42.52 (Linux; U; Android 11) gzip';
+const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+
+async function innertubePlayer(videoId) {
+  const r = await axios.post(
+    'https://music.youtube.com/youtubei/v1/player?key=' + INNERTUBE_KEY + '&prettyPrint=false',
+    {
+      videoId,
+      context: {
+        client: {
+          clientName:        'ANDROID_MUSIC',
+          clientVersion:     '6.42.52',
+          androidSdkVersion: 30,
+          userAgent:         INNERTUBE_UA,
+          hl:                'en',
+          gl:                'US',
+          utcOffsetMinutes:  0
+        }
+      }
+    },
+    {
+      headers: {
+        'Content-Type':              'application/json; charset=UTF-8',
+        'User-Agent':                INNERTUBE_UA,
+        'X-YouTube-Client-Name':    '21',
+        'X-YouTube-Client-Version': '6.42.52'
+      },
+      timeout: 12000
+    }
+  );
+  return r.data;
+}
+
+// ─── YTMusic singleton (search/catalog) ──────────────────────────────────────
 let ytmusic    = null;
 let ytmReady   = false;
 let ytmIniting = false;
@@ -120,7 +157,7 @@ async function authMw(req, res, next) {
   next();
 }
 
-function burl(req) {
+function getBase(req) {
   return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
 }
 
@@ -129,12 +166,10 @@ function thumb(thumbnails) {
   if (!thumbnails || !thumbnails.length) return null;
   return [...thumbnails].sort((a, b) => (b.width || 0) - (a.width || 0))[0].url || null;
 }
-
-function dur(s) { return s ? Math.floor(s) : null; }
-
+function dur(s)   { return s ? Math.floor(s) : null; }
 function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
-// ─── Stream URL resolution with dual cache ────────────────────────────────────
+// ─── Stream resolution via InnerTube (no ytdl-core) ──────────────────────────
 const STREAM_MEM = new Map();
 
 async function resolveStream(videoId) {
@@ -149,17 +184,32 @@ async function resolveStream(videoId) {
     if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; }
   }
 
-  // 3) fetch via ytdl-core
-  const info    = await ytdl.getInfo('https://www.youtube.com/watch?v=' + videoId);
-  const formats = ytdl.filterFormats(info.formats, 'audioonly');
-  if (!formats.length) throw new Error('No audio formats available');
+  // 3) InnerTube ANDROID_MUSIC — direct CDN URLs, no bot check
+  const data   = await innertubePlayer(videoId);
+  const status = data?.playabilityStatus?.status;
 
-  const m4a  = formats.filter(f => f.container === 'm4a' || (f.mimeType || '').includes('mp4a'));
-  const pool = m4a.length ? m4a : formats;
-  const best = pool.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+  if (status === 'LOGIN_REQUIRED' || status === 'UNPLAYABLE') {
+    throw new Error(data?.playabilityStatus?.reason || 'Track not available (' + status + ')');
+  }
 
-  const fmt = (best.container === 'm4a' || (best.mimeType || '').includes('mp4a')) ? 'aac'
-            : (best.mimeType || '').includes('opus') ? 'opus'
+  const streamingData = data?.streamingData;
+  if (!streamingData) throw new Error('No streamingData in InnerTube response');
+
+  // Collect audio-only formats that have a direct URL
+  const all = [
+    ...(streamingData.formats         || []),
+    ...(streamingData.adaptiveFormats || [])
+  ].filter(f => f.mimeType && f.mimeType.startsWith('audio/') && f.url);
+
+  if (!all.length) throw new Error('No playable audio formats');
+
+  // Prefer m4a/aac (itag 140 = 128kbps, 141 = 256kbps) for Eclipse compatibility
+  const m4a  = all.filter(f => f.mimeType.includes('mp4a'));
+  const pool = m4a.length ? m4a : all;
+  const best = pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+  const fmt = best.mimeType.includes('mp4a') ? 'aac'
+            : best.mimeType.includes('opus')  ? 'opus'
             : 'mp3';
 
   const expMatch  = best.url.match(/[?&]expire=(\d+)/);
@@ -168,7 +218,7 @@ async function resolveStream(videoId) {
   const result = {
     url:       best.url,
     format:    fmt,
-    quality:   (best.audioBitrate || 0) + 'kbps',
+    quality:   best.bitrate ? Math.round(best.bitrate / 1000) + 'kbps' : 'unknown',
     expiresAt
   };
 
@@ -216,35 +266,26 @@ function configPage(base) {
   h += '.tr{display:flex;gap:10px;align-items:center;padding:5px 0;border-bottom:1px solid #181818;font-size:13px}.tr:last-child{border-bottom:none}';
   h += '.tn{color:#444;font-size:11px;min-width:22px;text-align:right}.ti{flex:1;min-width:0}.tt{color:#e8e8e8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ta{color:#666;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}';
   h += 'footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1.8}</style></head><body>';
-
-  // YTM logo SVG
-  h += '<svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#ff0000"/>';
-  h += '<circle cx="26" cy="26" r="10" fill="none" stroke="#fff" stroke-width="2.5"/>';
-  h += '<polygon points="23,22 23,30 31,26" fill="#fff"/></svg>';
-
+  h += '<svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#ff0000"/><circle cx="26" cy="26" r="10" fill="none" stroke="#fff" stroke-width="2.5"/><polygon points="23,22 23,30 31,26" fill="#fff"/></svg>';
   h += '<div class="card"><h1>YouTube Music for Eclipse</h1>';
   h += '<div class="tip"><b>Save your URL.</b> Copy it to Notes or a bookmark. If the server restarts, paste it below to restore access to all your playlists.</div>';
-  h += '<p class="sub">Full YouTube Music search with tracks, albums, artists, and playlists. Stream URLs are resolved on demand and cached for speed.</p>';
-  h += '<div class="pills"><span class="pill">Tracks</span><span class="pill">Albums</span><span class="pill">Artists</span><span class="pill">Playlists</span><span class="pill b">Stream caching</span><span class="pill g">CSV export</span></div>';
-
+  h += '<p class="sub">Full YouTube Music search — tracks, albums, artists, and playlists. Streams use the YouTube Music Android InnerTube API for reliable playback on serverless.</p>';
+  h += '<div class="pills"><span class="pill">Tracks</span><span class="pill">Albums</span><span class="pill">Artists</span><span class="pill">Playlists</span><span class="pill b">InnerTube streaming</span><span class="pill g">CSV export</span></div>';
   h += '<div class="lbl">Generate a new URL</div>';
   h += '<button class="br" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
   h += '<div class="box" id="genBox"><div class="blbl">Your addon URL — paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
-
   h += '<hr><div class="lbl">Refresh existing URL</div>';
   h += '<input type="text" id="existingUrl" placeholder="Paste your existing addon URL here">';
   h += '<div class="hint">Same URL, same playlists — nothing breaks.</div>';
   h += '<button class="bg" id="refBtn" onclick="doRefresh()">Refresh Existing URL</button>';
   h += '<div class="box" id="refBox"><div class="blbl">Refreshed — same URL still works in Eclipse</div><div class="burl" id="refUrl"></div><button class="bd" id="copyRefBtn" onclick="copyRef()">Copy URL</button></div>';
-
   h += '<hr><div class="steps">';
   h += '<div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>';
   h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> → Settings → Connections → Add Connection → Addon</div></div>';
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
   h += '<div class="step"><div class="sn">4</div><div class="st">Use <b>Playlist Importer</b> below to export a YouTube Music playlist as CSV</div></div>';
   h += '</div>';
-  h += '<div class="warn">Your URL is saved to Redis and survives server restarts. Stream URLs from YouTube expire in ~6 hours — cached results are refreshed automatically on the next play.</div></div>';
-
+  h += '<div class="warn">Your URL is saved to Redis and survives server restarts. Stream URLs from YouTube expire in ~6 hours and are refreshed automatically on the next play request.</div></div>';
   h += '<div class="card"><span class="badge">Playlist Importer</span>';
   h += '<h2>Export YouTube Music Playlist → CSV</h2>';
   h += '<p class="sub">Downloads a CSV you can import in Eclipse via Library → Import CSV.</p>';
@@ -252,49 +293,20 @@ function configPage(base) {
   h += '<input type="text" id="impToken" placeholder="Paste your addon URL (auto-fills after generating)">';
   h += '<div class="lbl">YouTube Music Playlist URL</div>';
   h += '<input type="text" id="impUrl" placeholder="music.youtube.com/playlist?list=... or music.youtube.com/browse/VL...">';
-  h += '<div class="hint">Paste any public YouTube Music playlist URL. Both <code>?list=</code> and <code>browse/VL</code> formats are supported.</div>';
+  h += '<div class="hint">Paste any public YouTube Music playlist URL. Both <code>?list=</code> and <code>browse/VL</code> formats work.</div>';
   h += '<div class="status" id="impStatus"></div>';
   h += '<div class="preview" id="impPreview"></div>';
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button></div>';
-
-  h += '<footer>Eclipse YouTube Music Addon v1.0.0 • <a href="' + base + '/health" target="_blank" style="color:#333;text-decoration:none">' + base + '</a></footer>';
-
+  h += '<footer>Eclipse YouTube Music Addon v1.1.0 • <a href="' + base + '/health" target="_blank" style="color:#333;text-decoration:none">' + base + '</a></footer>';
   h += '<script>';
   h += 'var _gu="",_ru="";';
-
-  // generate
-  h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
-  h += 'fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}';
-  h += '_gu=d.manifestUrl;document.getElementById("genUrl").textContent=_gu;document.getElementById("genBox").style.display="block";document.getElementById("impToken").value=_gu;btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
-
-  // copyGen
+  h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}_gu=d.manifestUrl;document.getElementById("genUrl").textContent=_gu;document.getElementById("genBox").style.display="block";document.getElementById("impToken").value=_gu;btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
   h += 'function copyGen(){if(!_gu)return;navigator.clipboard.writeText(_gu).then(function(){var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
-
-  // doRefresh
-  h += 'function doRefresh(){var btn=document.getElementById("refBtn"),eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";';
-  h += 'fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(r=>r.json()).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}';
-  h += '_ru=d.manifestUrl;document.getElementById("refUrl").textContent=_ru;document.getElementById("refBox").style.display="block";document.getElementById("impToken").value=_ru;btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
-
-  // copyRef
+  h += 'function doRefresh(){var btn=document.getElementById("refBtn"),eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(r=>r.json()).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}_ru=d.manifestUrl;document.getElementById("refUrl").textContent=_ru;document.getElementById("refBox").style.display="block";document.getElementById("impToken").value=_ru;btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
   h += 'function copyRef(){if(!_ru)return;navigator.clipboard.writeText(_ru).then(function(){var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
-
-  // getTok
   h += 'function getTok(s){var m=s.match(/\\/u\\/([a-f0-9]{28})\\//);return m?m[1]:null;}';
-
-  // hesc
   h += 'function hesc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}';
-
-  // doImport
-  h += 'function doImport(){var btn=document.getElementById("impBtn"),raw=document.getElementById("impToken").value.trim(),purl=document.getElementById("impUrl").value.trim(),st=document.getElementById("impStatus"),pv=document.getElementById("impPreview");';
-  h += 'if(!raw){st.className="status err";st.textContent="Paste your addon URL first.";return;}if(!purl){st.className="status err";st.textContent="Paste a YouTube Music playlist URL.";return;}';
-  h += 'var tok=getTok(raw);if(!tok){st.className="status err";st.textContent="Could not find your token in the URL.";return;}btn.disabled=true;btn.textContent="Fetching...";st.className="status";st.textContent="Fetching tracks...";pv.style.display="none";';
-  h += 'fetch("/u/"+tok+"/import?url="+encodeURIComponent(purl)).then(function(r){if(!r.ok){return r.json().then(function(e){throw new Error(e.error||("Server error "+r.status));});}return r.json();}).then(function(data){var tracks=data.tracks||[];if(!tracks.length)throw new Error("No tracks found.");';
-  h += 'var rows=tracks.slice(0,50).map(function(t,i){return\'<div class="tr"><span class="tn">\'+(i+1)+\'</span><div class="ti"><div class="tt">\'+hesc(t.title)+\'</div><div class="ta">\'+hesc(t.artist||"")+\'</div></div></div>\';});';
-  h += 'if(tracks.length>50)rows.push(\'<div class="tr" style="text-align:center;color:#555"><span class="tn"></span><div class="ti"><div class="tt">\'+hesc((tracks.length-50)+\' more...\')+\'</div></div></div>\');';
-  h += 'pv.innerHTML=rows.join("");pv.style.display="block";st.className="status ok";st.textContent="Found "+tracks.length+" tracks in \\""+hesc(data.title||"playlist")+"\\". Downloading CSV...";';
-  h += 'var lines=["Title,Artist,Album,Duration"];tracks.forEach(function(t){function ce(s){var x=String(s||"");if(x.indexOf(\',\')!==-1||x.indexOf(\'"\')!==-1){x=\'"\'+x.replace(/"/g,\'""\')+\'"\';}return x;}lines.push(ce(t.title)+","+ce(t.artist)+","+ce(data.title)+","+ce(t.duration||""));});';
-  h += 'var blob=new Blob([lines.join("\\n")],{type:"text/csv"});var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=(data.title||"playlist").replace(/[^a-zA-Z0-9 \\-_\\.]/g,"").trim()+".csv";document.body.appendChild(a);a.click();document.body.removeChild(a);';
-  h += 'btn.disabled=false;btn.textContent="Fetch & Download CSV";}).catch(function(e){st.className="status err";st.textContent=e.message;btn.disabled=false;btn.textContent="Fetch & Download CSV";});}';
+  h += 'function doImport(){var btn=document.getElementById("impBtn"),raw=document.getElementById("impToken").value.trim(),purl=document.getElementById("impUrl").value.trim(),st=document.getElementById("impStatus"),pv=document.getElementById("impPreview");if(!raw){st.className="status err";st.textContent="Paste your addon URL first.";return;}if(!purl){st.className="status err";st.textContent="Paste a YouTube Music playlist URL.";return;}var tok=getTok(raw);if(!tok){st.className="status err";st.textContent="Could not find your token in the URL.";return;}btn.disabled=true;btn.textContent="Fetching...";st.className="status";st.textContent="Fetching tracks...";pv.style.display="none";fetch("/u/"+tok+"/import?url="+encodeURIComponent(purl)).then(function(r){if(!r.ok){return r.json().then(function(e){throw new Error(e.error||("Server error "+r.status));});}return r.json();}).then(function(data){var tracks=data.tracks||[];if(!tracks.length)throw new Error("No tracks found.");var rows=tracks.slice(0,50).map(function(t,i){return\'<div class="tr"><span class="tn">\'+(i+1)+\'</span><div class="ti"><div class="tt">\'+hesc(t.title)+\'</div><div class="ta">\'+hesc(t.artist||"")+\'</div></div></div>\';});if(tracks.length>50)rows.push(\'<div class="tr" style="text-align:center;color:#555"><span class="tn"></span><div class="ti"><div class="tt">\'+hesc((tracks.length-50)+\' more...\')+\'</div></div></div>\');pv.innerHTML=rows.join("");pv.style.display="block";st.className="status ok";st.textContent="Found "+tracks.length+" tracks in \\""+hesc(data.title||"playlist")+"\\". Downloading CSV...";var lines=["Title,Artist,Album,Duration"];tracks.forEach(function(t){function ce(s){var x=String(s||"");if(x.indexOf(\',\')!==-1||x.indexOf(\'"\')!==-1){x=\'"\'+x.replace(/"/g,\'""\')+\'"\';}return x;}lines.push(ce(t.title)+","+ce(t.artist)+","+ce(data.title)+","+ce(t.duration||""));});var blob=new Blob([lines.join("\\n")],{type:"text/csv"});var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=(data.title||"playlist").replace(/[^a-zA-Z0-9 \\-_\\.]/g,"").trim()+".csv";document.body.appendChild(a);a.click();document.body.removeChild(a);btn.disabled=false;btn.textContent="Fetch & Download CSV";}).catch(function(e){st.className="status err";st.textContent=e.message;btn.disabled=false;btn.textContent="Fetch & Download CSV";});}';
   h += '</script></body></html>';
   return h;
 }
@@ -303,7 +315,7 @@ function configPage(base) {
 
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(configPage(burl(req)));
+  res.send(configPage(getBase(req)));
 });
 
 app.post('/generate', async (req, res) => {
@@ -315,7 +327,7 @@ app.post('/generate', async (req, res) => {
   TOKEN_CACHE.set(token, entry);
   await saveToken(token, entry);
   bucket.count++;
-  res.json({ token, manifestUrl: burl(req) + '/u/' + token + '/manifest.json' });
+  res.json({ token, manifestUrl: getBase(req) + '/u/' + token + '/manifest.json' });
 });
 
 app.post('/refresh', async (req, res) => {
@@ -326,17 +338,18 @@ app.post('/refresh', async (req, res) => {
   if (!token || !/^[a-f0-9]{28}$/.test(token)) return res.status(400).json({ error: 'Paste your full addon URL.' });
   const entry = await getEntry(token);
   if (!entry) return res.status(404).json({ error: 'URL not found. Generate a new one.' });
-  res.json({ token, manifestUrl: burl(req) + '/u/' + token + '/manifest.json', refreshed: true });
+  res.json({ token, manifestUrl: getBase(req) + '/u/' + token + '/manifest.json', refreshed: true });
 });
 
 app.get('/health', (req, res) => {
   res.json({
-    status:        'ok',
-    version:       '1.0.0',
-    ytmusicReady:  ytmReady,
+    status:         'ok',
+    version:        '1.1.0',
+    ytmusicReady:   ytmReady,
+    streamBackend:  'InnerTube ANDROID_MUSIC',
     redisConnected: !!(redis && redis.status === 'ready'),
-    activeTokens:  TOKEN_CACHE.size,
-    timestamp:     new Date().toISOString()
+    activeTokens:   TOKEN_CACHE.size,
+    timestamp:      new Date().toISOString()
   });
 });
 
@@ -345,7 +358,7 @@ app.get('/u/:token/manifest.json', authMw, (req, res) => {
   res.json({
     id:          'com.eclipse.ytmusic.' + req.params.token.slice(0, 8),
     name:        'YouTube Music',
-    version:     '1.0.0',
+    version:     '1.1.0',
     description: 'Full YouTube Music search and streaming — tracks, albums, artists, and playlists.',
     icon:        'https://music.youtube.com/img/favicon_144.png',
     resources:   ['search', 'stream', 'catalog'],
@@ -372,36 +385,33 @@ app.get('/u/:token/search', authMw, async (req, res) => {
     res.json({
       tracks: (songs || []).slice(0, 20).map(s => ({
         id:         s.videoId,
-        title:      s.name         || 'Unknown',
-        artist:     (s.artist  && s.artist.name)  || 'Unknown',
-        album:      (s.album   && s.album.name)   || null,
+        title:      s.name                         || 'Unknown',
+        artist:     (s.artist && s.artist.name)    || 'Unknown',
+        album:      (s.album  && s.album.name)     || null,
         duration:   dur(s.duration),
         artworkURL: thumb(s.thumbnails),
         format:     'aac'
       })),
-
       albums: (albums || []).slice(0, 10).map(a => ({
         id:         a.albumId,
-        title:      a.name         || 'Unknown',
-        artist:     (a.artist  && a.artist.name)  || 'Unknown',
+        title:      a.name                         || 'Unknown',
+        artist:     (a.artist && a.artist.name)    || 'Unknown',
         artworkURL: thumb(a.thumbnails),
-        trackCount: a.trackCount   || null,
-        year:       a.year ? String(a.year) : null
+        trackCount: a.trackCount                   || null,
+        year:       a.year ? String(a.year)        : null
       })),
-
       artists: (artists || []).slice(0, 5).map(a => ({
         id:         a.artistId,
-        name:       a.name         || 'Unknown',
+        name:       a.name                         || 'Unknown',
         artworkURL: thumb(a.thumbnails),
         genres:     []
       })),
-
       playlists: (playlists || []).slice(0, 10).map(p => ({
         id:         p.playlistId,
-        title:      p.name         || 'Unknown',
-        creator:    (p.artist  && p.artist.name)  || null,
+        title:      p.name                         || 'Unknown',
+        creator:    (p.artist && p.artist.name)    || null,
         artworkURL: thumb(p.thumbnails),
-        trackCount: p.trackCount   || null
+        trackCount: p.trackCount                   || null
       }))
     });
   } catch (e) {
@@ -432,15 +442,15 @@ app.get('/u/:token/album/:id', authMw, async (req, res) => {
     if (!a) return res.status(404).json({ error: 'Album not found.' });
     res.json({
       id:          a.albumId,
-      title:       a.name                          || 'Unknown',
-      artist:      (a.artist && a.artist.name)     || 'Unknown',
+      title:       a.name                           || 'Unknown',
+      artist:      (a.artist && a.artist.name)      || 'Unknown',
       artworkURL:  thumb(a.thumbnails),
-      year:        a.year ? String(a.year)          : null,
-      description: a.description                   || null,
-      trackCount:  (a.songs || []).length           || null,
+      year:        a.year ? String(a.year)           : null,
+      description: a.description                    || null,
+      trackCount:  (a.songs || []).length            || null,
       tracks: (a.songs || []).map(s => ({
         id:         s.videoId,
-        title:      s.name                          || 'Unknown',
+        title:      s.name                           || 'Unknown',
         artist:     (s.artist && s.artist.name) || (a.artist && a.artist.name) || 'Unknown',
         duration:   dur(s.duration),
         artworkURL: thumb(s.thumbnails) || thumb(a.thumbnails),
@@ -514,7 +524,7 @@ app.get('/u/:token/playlist/:id', authMw, async (req, res) => {
   }
 });
 
-// ─── Import → JSON (CSV download handled client-side) ─────────────────────────
+// ─── Import → JSON (CSV built client-side) ────────────────────────────────────
 app.get('/u/:token/import', authMw, async (req, res) => {
   const rawUrl = String(req.query.url || '').trim();
   if (!rawUrl) return res.status(400).json({ error: 'Missing ?url= parameter.' });
@@ -522,7 +532,6 @@ app.get('/u/:token/import', authMw, async (req, res) => {
   const ready = await ensureYTMusic();
   if (!ready) return res.status(503).json({ error: 'YouTube Music not ready.' });
 
-  // Extract playlist ID from URL
   let playlistId = null;
   const vm = rawUrl.match(/browse\/VL([a-zA-Z0-9_-]+)/);
   const lm = rawUrl.match(/[?&]list=([a-zA-Z0-9_-]+)/);
