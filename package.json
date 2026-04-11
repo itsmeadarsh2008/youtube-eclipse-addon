@@ -1,14 +1,14 @@
 {
   "name": "eclipse-ytmusic-addon",
-  "version": "1.0.0",
-  "description": "YouTube Music addon for Eclipse Music — search, stream, albums, artists, playlists, CSV export",
+  "version": "1.1.0",
+  "description": "YouTube Music addon for Eclipse Music",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@distube/ytdl-core": "^4.14.4",
+    "axios": "^1.6.0",
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "ioredis": "^5.3.2",
