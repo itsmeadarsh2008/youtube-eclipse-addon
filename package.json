@@ -1,16 +1,20 @@
 {
-  "name": "youtube-render-addon",
+  "name": "eclipse-ytmusic-addon",
   "version": "1.0.0",
-  "description": "Render-ready Eclipse addon using the official YouTube Data API with tokenized URLs and a config page.",
+  "description": "YouTube Music addon for Eclipse Music — search, stream, albums, artists, playlists, CSV export",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "axios": "^1.8.2",
+    "@distube/ytdl-core": "^4.14.4",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "ioredis": "^5.5.0"
+    "express": "^4.18.2",
+    "ioredis": "^5.3.2",
+    "ytmusic-api": "^5.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
