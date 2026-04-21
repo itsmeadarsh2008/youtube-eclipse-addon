@@ -838,14 +838,23 @@ app.get('/u/:token/search', authMw, async (req, res) => {
   const ready = await ensureYTMusic();
   if (!ready) return res.status(503).json({ error: 'Not ready', tracks: [], albums: [], artists: [], playlists: [] });
   try {
-    const [songs, albums, artists, playlists] = await Promise.all([
+    const [songs, videos, albums, artists, playlists] = await Promise.all([
       ytmusic.searchSongs(q).catch(() => []),
+      ytmusic.searchVideos(q).catch(() => []),
       ytmusic.searchAlbums(q).catch(() => []),
       ytmusic.searchArtists(q).catch(() => []),
       ytmusic.searchPlaylists(q).catch(() => [])
     ]);
+    const seenTrackIds = new Set();
     const payload = {
-      tracks:    (songs     || []).slice(0, 20).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })),
+      tracks: [
+        ...(songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })),
+        ...(videos || []).map(v => ({ id: v.videoId, title: v.name || 'Unknown', artist: (v.artist && v.artist.name) || 'Unknown', album: null, duration: dur(v.duration), artworkURL: thumb(v.thumbnails), format: 'aac' }))
+      ].filter(t => {
+        if (!t.id || seenTrackIds.has(t.id)) return false;
+        seenTrackIds.add(t.id);
+        return true;
+      }).slice(0, 30),
       albums:    (albums    || []).slice(0, 10).map(a => ({ id: a.albumId, title: a.name || 'Unknown', artist: (a.artist && a.artist.name) || 'Unknown', artworkURL: thumb(a.thumbnails), trackCount: a.trackCount || null, year: a.year ? String(a.year) : null })),
       artists:   (artists   || []).slice(0,  5).map(a => ({ id: a.artistId, name: a.name || 'Unknown', artworkURL: thumb(a.thumbnails), genres: [] })),
       playlists: (playlists || []).slice(0, 10).map(p => ({ id: p.playlistId, title: p.name || 'Unknown', creator: (p.artist && p.artist.name) || null, artworkURL: thumb(p.thumbnails), trackCount: p.trackCount || null }))
