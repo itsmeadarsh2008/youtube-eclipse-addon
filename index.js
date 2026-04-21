@@ -21,6 +21,10 @@ const PROXY_URL = (
   : null;
 
 const PROXY_AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
+const YT_COOKIE = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE || null;
+const YT_VISITOR_DATA = process.env.YT_VISITOR_DATA || null;
+const YT_PO_TOKEN = process.env.YT_PO_TOKEN || null;
+const STREAM_CLIENTS = ['YTMUSIC_ANDROID', 'ANDROID', 'YTMUSIC', 'TV_EMBEDDED', 'TV', 'MWEB', 'IOS'];
 
 if (PROXY_URL) {
   process.env.HTTP_PROXY  = process.env.HTTP_PROXY  || PROXY_URL;
@@ -35,6 +39,42 @@ if (PROXY_URL) {
 async function proxyFetch(url, opts = {}) {
   if (!PROXY_AGENT) return fetch(url, opts);
   return fetch(url, { ...opts, agent: PROXY_AGENT });
+}
+
+
+async function validateStreamUrl(url) {
+  try {
+    const res = await proxyFetch(url, { method: 'HEAD', redirect: 'follow' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function pickBestFormat(formats = []) {
+  const audio = (formats || []).filter(f => f.mime_type?.startsWith('audio/') && (f.url || f.decipher || f.signature_cipher || f.cipher));
+  if (!audio.length) return null;
+  const m4a = audio.filter(f => f.mime_type?.includes('mp4a'));
+  const opus = audio.filter(f => f.mime_type?.includes('opus') || f.mime_type?.includes('webm'));
+  const pool = m4a.length ? m4a : (opus.length ? opus : audio);
+  return pool.sort((a, b) => (b.average_bitrate || b.bitrate || 0) - (a.average_bitrate || a.bitrate || 0))[0] || null;
+}
+
+async function extractUrlFromFormat(format, yt, info) {
+  if (!format) return null;
+  if (format.url) return format.url;
+  if (typeof format.decipher === 'function') {
+    try {
+      return await format.decipher(yt?.actions?.session?.player);
+    } catch {}
+  }
+  if (info && typeof info.decipher === 'function') {
+    try {
+      const d = await info.decipher(format);
+      if (d?.url) return d.url;
+    } catch {}
+  }
+  return null;
 }
 
 // ─── Stream resolver — youtubei.js ───────────────────────────────────────────
@@ -53,11 +93,18 @@ async function getYT() {
   _ytInit = true;
   try {
     const { Innertube } = await import('youtubei.js');
-_yt = await Innertube.create({
-  cache: new Map(),
-  generate_session_locally: true,
-  fetch: (url, opts) => proxyFetch(url, opts)
-});
+    _yt = await Innertube.create({
+      cache: new Map(),
+      generate_session_locally: true,
+      enable_session_cache: true,
+      device_category: 'MOBILE',
+      client_type: 'ANDROID',
+      location: 'US',
+      cookie: YT_COOKIE || undefined,
+      visitor_data: YT_VISITOR_DATA || undefined,
+      po_token: YT_PO_TOKEN || undefined,
+      fetch: (url, opts) => proxyFetch(url, opts)
+    });
     console.log('[yt] innertube ready');
     return _yt;
   } catch (e) {
@@ -83,56 +130,92 @@ async function rSet(k, v, t) { if (!redis) return; try { t ? await redis.set(k, 
 const STREAM_MEM = new Map();
 
 async function resolveStream(videoId) {
+  const now = Math.floor(Date.now() / 1000);
   const mc = STREAM_MEM.get(videoId);
-  if (mc && mc.expiresAt > Date.now() / 1000 + 600) return mc;
+  if (mc && mc.expiresAt > now + 600) return mc;
 
   const rc = await rGet('ytm:stream:' + videoId);
   if (rc) {
     const p = JSON.parse(rc);
-    if (p.expiresAt > Date.now() / 1000 + 600) {
+    if (p.expiresAt > now + 600) {
       STREAM_MEM.set(videoId, p);
       return p;
     }
   }
 
   const yt = await getYT();
+  let lastPlayableError = null;
+  let lastInfoError = null;
 
-  let info;
-  try {
-    info = await yt.getBasicInfo(videoId, 'ANDROID');
-  } catch (_e) {
-    info = await yt.getBasicInfo(videoId, 'IOS');
+  for (const client of STREAM_CLIENTS) {
+    let info = null;
+    try {
+      info = await yt.getBasicInfo(videoId, client);
+    } catch (e) {
+      lastInfoError = e;
+      continue;
+    }
+
+    const ps = info?.playability_status;
+    if (ps && ps.status === 'LOGIN_REQUIRED') {
+      lastPlayableError = new Error(YT_PO_TOKEN || YT_COOKIE ? 'login_required' : 'login_required_missing_auth');
+      continue;
+    }
+    if (ps && ps.status && ps.status !== 'OK') {
+      lastPlayableError = new Error('not_playable: ' + ps.status);
+      continue;
+    }
+
+    const directBest = pickBestFormat(info?.streaming_data?.adaptive_formats || []);
+    let directUrl = await extractUrlFromFormat(directBest, yt, info);
+
+    if (!directUrl && typeof yt.getStreamingData === 'function') {
+      try {
+        const sd = await yt.getStreamingData(videoId, { client });
+        const streamBest = pickBestFormat(sd?.adaptive_formats || sd?.formats || []);
+        directUrl = await extractUrlFromFormat(streamBest, yt, sd);
+        if (directUrl && await validateStreamUrl(directUrl)) {
+          const expMatch = directUrl.match(/[?&]expire=(\d+)/);
+          const expiresAt = expMatch ? parseInt(expMatch[1]) : now + 21600;
+          const mime = streamBest?.mime_type || '';
+          const bitrate = streamBest?.average_bitrate || streamBest?.bitrate || 0;
+          const result = {
+            url: directUrl,
+            format: mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown'),
+            quality: bitrate ? Math.round(bitrate / 1000) + 'kbps' : 'unknown',
+            expiresAt,
+            client
+          };
+          STREAM_MEM.set(videoId, result);
+          await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, expiresAt - now - 600));
+          return result;
+        }
+      } catch (e) {
+        lastInfoError = e;
+      }
+    }
+
+    if (directUrl && await validateStreamUrl(directUrl)) {
+      const expMatch = directUrl.match(/[?&]expire=(\d+)/);
+      const expiresAt = expMatch ? parseInt(expMatch[1]) : now + 21600;
+      const mime = directBest?.mime_type || '';
+      const bitrate = directBest?.average_bitrate || directBest?.bitrate || 0;
+      const result = {
+        url: directUrl,
+        format: mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown'),
+        quality: bitrate ? Math.round(bitrate / 1000) + 'kbps' : 'unknown',
+        expiresAt,
+        client
+      };
+      STREAM_MEM.set(videoId, result);
+      await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, expiresAt - now - 600));
+      return result;
+    }
   }
 
-  const ps = info.playability_status;
-  if (ps && ps.status === 'LOGIN_REQUIRED') throw new Error('login_required');
-  if (ps && ps.status !== 'OK')            throw new Error('not_playable: ' + ps.status);
-
-  const formats = (info.streaming_data?.adaptive_formats || [])
-    .filter(f => f.mime_type?.startsWith('audio/') && (f.url || f.decipher));
-
-  if (!formats.length) throw new Error('no audio formats');
-
-  const m4a  = formats.filter(f => f.mime_type?.includes('mp4a'));
-  const pool = m4a.length ? m4a : formats;
-  const best = pool.sort((a, b) => (b.average_bitrate || 0) - (a.average_bitrate || 0))[0];
-
-  const url       = best.url || await best.decipher(yt.actions.session.player);
-  const expMatch  = url.match(/[?&]expire=(\d+)/);
-  const expiresAt = expMatch ? parseInt(expMatch[1]) : Math.floor(Date.now() / 1000) + 21600;
-
-  const result = {
-    url,
-    format:    best.mime_type?.includes('mp4a') ? 'aac' : 'opus',
-    quality:   best.average_bitrate ? Math.round(best.average_bitrate / 1000) + 'kbps' : 'unknown',
-    expiresAt
-  };
-
-  STREAM_MEM.set(videoId, result);
-  await rSet('ytm:stream:' + videoId, JSON.stringify(result),
-    Math.max(60, expiresAt - Math.floor(Date.now() / 1000) - 600));
-
-  return result;
+  if (lastPlayableError) throw lastPlayableError;
+  if (lastInfoError) throw lastInfoError;
+  throw new Error('no_working_audio_stream');
 }
 
 // ─── YTMusic singleton ────────────────────────────────────────────────────────
@@ -715,6 +798,9 @@ app.get('/health', (req, res) => {
     streamCache:  STREAM_MEM.size,
     proxyEnabled: !!PROXY_URL,
     proxyHost:    process.env.PROXY_HOST || null,
+    hasVisitorData: !!YT_VISITOR_DATA,
+    hasPoToken:   !!YT_PO_TOKEN,
+    hasCookie:    !!YT_COOKIE,
     timestamp:    new Date().toISOString()
   });
 });
@@ -761,6 +847,15 @@ app.get('/u/:token/stream/:id', authMw, async (req, res) => {
   try {
     res.json(await resolveStream(vid));
   } catch (e) {
+    if (e.message === 'login_required' || e.message === 'login_required_missing_auth') {
+      console.error('[stream] ' + vid + ': ' + e.message);
+      return res.status(403).json({
+        error: e.message,
+        needsPoToken: !YT_PO_TOKEN,
+        needsCookie: !YT_COOKIE,
+        needsVisitorData: !YT_VISITOR_DATA
+      });
+    }
     console.error('[stream] ' + vid + ': ' + e.message);
     res.status(500).json({ error: e.message });
   }
