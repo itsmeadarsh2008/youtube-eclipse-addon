@@ -4,6 +4,7 @@ const express = require('express');
 const cors    = require('cors');
 const crypto  = require('crypto');
 const axios   = require('axios');
+const https   = require('https');
 const Redis   = require('ioredis');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
@@ -21,6 +22,13 @@ const PROXY_URL = (
   : null;
 
 const PROXY_AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
+const AXIOS_HTTP = axios.create({
+  timeout: 20000,
+  httpsAgent: PROXY_AGENT || new https.Agent({ keepAlive: true }),
+  httpAgent: PROXY_AGENT || undefined,
+  proxy: false,
+  headers: YT_COOKIE ? { Cookie: YT_COOKIE } : undefined
+});
 const YT_COOKIE = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE || null;
 const YT_VISITOR_DATA = process.env.YT_VISITOR_DATA || null;
 const YT_PO_TOKEN = process.env.YT_PO_TOKEN || null;
@@ -181,8 +189,11 @@ async function resolveStream(videoId) {
           const bitrate = streamBest?.average_bitrate || streamBest?.bitrate || 0;
           const result = {
             url: directUrl,
-            format: mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown'),
+            format: mime.includes('flac') ? 'flac' : (mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown')),
             quality: bitrate ? Math.round(bitrate / 1000) + 'kbps' : 'unknown',
+            sampleRate: streamBest?.audio_sample_rate || streamBest?.audioSampleRate || null,
+            channels: streamBest?.audio_channels || streamBest?.audioChannels || null,
+            mimeType: mime || null,
             expiresAt,
             client
           };
@@ -202,13 +213,17 @@ async function resolveStream(videoId) {
       const bitrate = directBest?.average_bitrate || directBest?.bitrate || 0;
       const result = {
         url: directUrl,
-        format: mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown'),
+        format: mime.includes('flac') ? 'flac' : (mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown')),
         quality: bitrate ? Math.round(bitrate / 1000) + 'kbps' : 'unknown',
+        sampleRate: directBest?.audio_sample_rate || directBest?.audioSampleRate || null,
+        channels: directBest?.audio_channels || directBest?.audioChannels || null,
+        mimeType: mime || null,
         expiresAt,
         client
       };
       STREAM_MEM.set(videoId, result);
       await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, expiresAt - now - 600));
+      console.log('[stream:ok] ' + videoId + ' client=' + client + ' mime=' + (result.mimeType || 'unknown') + ' quality=' + result.quality + ' rate=' + (result.sampleRate || 'na'));
       return result;
     }
   }
@@ -297,6 +312,80 @@ function getBase(req) { return (req.headers['x-forwarded-proto'] || req.protocol
 function thumb(t) { if (!t || !t.length) return null; return [...t].sort((a, b) => (b.width || 0) - (a.width || 0))[0].url || null; }
 function dur(s)   { return s ? Math.floor(s) : null; }
 function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+
+async function searchFallback(q) {
+  const url = 'https://music.youtube.com/youtubei/v1/search?prettyPrint=false';
+  const body = {
+    context: {
+      client: {
+        clientName: 'WEB_REMIX',
+        clientVersion: '1.20250418.01.00',
+        hl: 'en',
+        gl: 'US'
+      }
+    },
+    query: q
+  };
+  const headers = {
+    'Content-Type': 'application/json',
+    'Origin': 'https://music.youtube.com',
+    'Referer': 'https://music.youtube.com/',
+    'User-Agent': 'Mozilla/5.0',
+    'X-YouTube-Client-Name': '67',
+    'X-YouTube-Client-Version': '1.20250418.01.00'
+  };
+  if (YT_COOKIE) headers.Cookie = YT_COOKIE;
+  const r = await AXIOS_HTTP.post(url, body, { headers });
+  return r.data;
+}
+
+function collectRunsText(runs) {
+  return (runs || []).map(r => r.text || '').join('').trim();
+}
+
+function parseSearchFallback(data) {
+  const out = { tracks: [], albums: [], artists: [], playlists: [] };
+  const sections = data?.contents?.tabbedSearchResultsRenderer?.tabs || data?.contents?.singleColumnBrowseResultsRenderer?.tabs || [];
+  const blobs = JSON.stringify(sections);
+  const musicRows = [];
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.musicResponsiveListItemRenderer) musicRows.push(node.musicResponsiveListItemRenderer);
+    for (const v of Object.values(node)) {
+      if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object') walk(v);
+    }
+  };
+  walk(data);
+  for (const row of musicRows) {
+    const title = collectRunsText(row.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs) ||
+                  row.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.simpleText || 'Unknown';
+    const runs2 = row.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+    const meta = runs2.map(r => r.text || '').filter(Boolean);
+    const browseId = row.navigationEndpoint?.browseEndpoint?.browseId;
+    const videoId = row.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId ||
+                    row.navigationEndpoint?.watchEndpoint?.videoId;
+    const playlistId = row.navigationEndpoint?.watchPlaylistEndpoint?.playlistId || row.navigationEndpoint?.browseEndpoint?.browseId;
+    const thumbUrl = row.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url || null;
+    const metaStr = meta.join(' • ').toLowerCase();
+    if (videoId && out.tracks.length < 20) {
+      out.tracks.push({ id: videoId, title, artist: meta[0] || 'Unknown', album: meta[2] || null, duration: null, artworkURL: thumbUrl, format: 'aac' });
+      continue;
+    }
+    if (browseId?.startsWith('MPRE') && out.albums.length < 10) {
+      out.albums.push({ id: browseId, title, artist: meta[0] || 'Unknown', artworkURL: thumbUrl, trackCount: null, year: meta.find(x => /^\d{4}$/.test(x)) || null });
+      continue;
+    }
+    if ((browseId?.startsWith('UC') || browseId?.startsWith('FEmusic_library_privately_owned_artist')) && out.artists.length < 5) {
+      out.artists.push({ id: browseId, name: title, artworkURL: thumbUrl, genres: [] });
+      continue;
+    }
+    if ((playlistId || metaStr.includes('playlist')) && out.playlists.length < 10) {
+      out.playlists.push({ id: playlistId || browseId || title, title, creator: meta[0] || null, artworkURL: thumbUrl, trackCount: null });
+      continue;
+    }
+  }
+  return out;
+}
 
 // ─── Config page ──────────────────────────────────────────────────────────────
 function configPage(base) {
@@ -820,24 +909,38 @@ app.get('/u/:token/manifest.json', authMw, (req, res) => {
 app.get('/u/:token/search', authMw, async (req, res) => {
   const q = clean(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
+  const baseEmpty = { tracks: [], albums: [], artists: [], playlists: [] };
   const ready = await ensureYTMusic();
-  if (!ready) return res.status(503).json({ error: 'Not ready', tracks: [], albums: [], artists: [], playlists: [] });
   try {
-    const [songs, albums, artists, playlists] = await Promise.all([
-      ytmusic.searchSongs(q).catch(() => []),
-      ytmusic.searchAlbums(q).catch(() => []),
-      ytmusic.searchArtists(q).catch(() => []),
-      ytmusic.searchPlaylists(q).catch(() => [])
-    ]);
-    res.json({
-      tracks:    (songs     || []).slice(0, 20).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })),
-      albums:    (albums    || []).slice(0, 10).map(a => ({ id: a.albumId, title: a.name || 'Unknown', artist: (a.artist && a.artist.name) || 'Unknown', artworkURL: thumb(a.thumbnails), trackCount: a.trackCount || null, year: a.year ? String(a.year) : null })),
-      artists:   (artists   || []).slice(0,  5).map(a => ({ id: a.artistId, name: a.name || 'Unknown', artworkURL: thumb(a.thumbnails), genres: [] })),
-      playlists: (playlists || []).slice(0, 10).map(p => ({ id: p.playlistId, title: p.name || 'Unknown', creator: (p.artist && p.artist.name) || null, artworkURL: thumb(p.thumbnails), trackCount: p.trackCount || null }))
-    });
+    if (ready) {
+      const [songs, albums, artists, playlists] = await Promise.all([
+        ytmusic.searchSongs(q).catch(() => []),
+        ytmusic.searchAlbums(q).catch(() => []),
+        ytmusic.searchArtists(q).catch(() => []),
+        ytmusic.searchPlaylists(q).catch(() => [])
+      ]);
+      const result = {
+        tracks:    (songs     || []).slice(0, 20).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })),
+        albums:    (albums    || []).slice(0, 10).map(a => ({ id: a.albumId, title: a.name || 'Unknown', artist: (a.artist && a.artist.name) || 'Unknown', artworkURL: thumb(a.thumbnails), trackCount: a.trackCount || null, year: a.year ? String(a.year) : null })),
+        artists:   (artists   || []).slice(0,  5).map(a => ({ id: a.artistId, name: a.name || 'Unknown', artworkURL: thumb(a.thumbnails), genres: [] })),
+        playlists: (playlists || []).slice(0, 10).map(p => ({ id: p.playlistId, title: p.name || 'Unknown', creator: (p.artist && p.artist.name) || null, artworkURL: thumb(p.thumbnails), trackCount: p.trackCount || null }))
+      };
+      if (result.tracks.length || result.albums.length || result.artists.length || result.playlists.length) {
+        return res.json(result);
+      }
+      console.error('[search] empty primary results for query: ' + q);
+    }
+    const fb = parseSearchFallback(await searchFallback(q));
+    return res.json(fb);
   } catch (e) {
     console.error('[search] ' + e.message);
-    res.status(500).json({ error: e.message, tracks: [], albums: [], artists: [], playlists: [] });
+    try {
+      const fb = parseSearchFallback(await searchFallback(q));
+      return res.json(fb);
+    } catch (e2) {
+      console.error('[search:fallback] ' + e2.message);
+      return res.status(500).json({ error: e.message, ...baseEmpty });
+    }
   }
 });
 
