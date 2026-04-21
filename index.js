@@ -1,19 +1,25 @@
 'use strict';
+
 const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const axios = require('axios');
-const Redis = require('ioredis');
+const cors    = require('cors');
+const crypto  = require('crypto');
+const axios   = require('axios');
+const Redis   = require('ioredis');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
 const PROXY_URL = (
-  process.env.PROXY_HOST && process.env.PROXY_USER && process.env.PROXY_PASS
-) ? `http://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}:${process.env.PROXY_PORT || 80}` : null;
+  process.env.PROXY_HOST &&
+  process.env.PROXY_USER &&
+  process.env.PROXY_PASS
+)
+  ? `http://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}:${process.env.PROXY_PORT || 80}`
+  : null;
+
 const PROXY_AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
 const YT_COOKIE = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE || null;
 const YT_VISITOR_DATA = process.env.YT_VISITOR_DATA || null;
@@ -21,9 +27,9 @@ const YT_PO_TOKEN = process.env.YT_PO_TOKEN || null;
 const STREAM_CLIENTS = ['YTMUSIC_ANDROID', 'ANDROID', 'YTMUSIC', 'TV_EMBEDDED', 'TV', 'MWEB', 'IOS'];
 
 if (PROXY_URL) {
-  process.env.HTTP_PROXY = process.env.HTTP_PROXY || PROXY_URL;
+  process.env.HTTP_PROXY  = process.env.HTTP_PROXY  || PROXY_URL;
   process.env.HTTPS_PROXY = process.env.HTTPS_PROXY || PROXY_URL;
-  process.env.http_proxy = process.env.http_proxy || PROXY_URL;
+  process.env.http_proxy  = process.env.http_proxy  || PROXY_URL;
   process.env.https_proxy = process.env.https_proxy || PROXY_URL;
   console.log('[proxy] enabled: ' + process.env.PROXY_HOST + ':' + (process.env.PROXY_PORT || 80));
 } else {
@@ -34,6 +40,7 @@ async function proxyFetch(url, opts = {}) {
   if (!PROXY_AGENT) return fetch(url, opts);
   return fetch(url, { ...opts, agent: PROXY_AGENT });
 }
+
 
 async function validateStreamUrl(url) {
   try {
@@ -72,7 +79,9 @@ async function extractUrlFromFormat(format, yt, info) {
   if (!format) return null;
   if (format.url) return format.url;
   if (typeof format.decipher === 'function') {
-    try { return await format.decipher(yt?.actions?.session?.player); } catch {}
+    try {
+      return await format.decipher(yt?.actions?.session?.player);
+    } catch {}
   }
   if (info && typeof info.decipher === 'function') {
     try {
@@ -86,6 +95,7 @@ async function extractUrlFromFormat(format, yt, info) {
 // ─── Stream resolver — youtubei.js ───────────────────────────────────────────
 let _yt = null;
 let _ytInit = false;
+
 async function getYT() {
   if (_yt) return _yt;
   if (_ytInit) {
@@ -117,6 +127,7 @@ async function getYT() {
     throw e;
   }
 }
+
 getYT().catch(e => console.error('[yt] boot error: ' + e.message));
 setInterval(() => { if (!_yt) getYT().catch(() => {}); }, 30000);
 
@@ -125,13 +136,14 @@ let redis = null;
 if (process.env.REDIS_URL) {
   redis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 3, enableReadyCheck: false });
   redis.on('connect', () => console.log('[redis] connected'));
-  redis.on('error', e => console.error('[redis] ' + e.message));
+  redis.on('error',   e  => console.error('[redis] ' + e.message));
 }
-async function rGet(k) { if (!redis) return null; try { return await redis.get(k); } catch { return null; } }
+async function rGet(k)       { if (!redis) return null; try { return await redis.get(k); } catch { return null; } }
 async function rSet(k, v, t) { if (!redis) return; try { t ? await redis.set(k, v, 'EX', t) : await redis.set(k, v); } catch {} }
 
 // ─── Stream cache ─────────────────────────────────────────────────────────────
 const STREAM_MEM = new Map();
+
 async function resolveStream(videoId) {
   const now = Math.floor(Date.now() / 1000);
   const mc = STREAM_MEM.get(videoId);
@@ -182,21 +194,15 @@ async function resolveStream(videoId) {
           const expiresAt = expMatch ? parseInt(expMatch[1]) : now + 21600;
           const mime = streamBest?.mime_type || '';
           const bitrate = streamBest?.average_bitrate || streamBest?.bitrate || 0;
-          const sampleRate = streamBest?.audio_sample_rate || streamBest?.audioSampleRate || null;
           const result = {
             url: directUrl,
-            format: detectFormatFromMime(mime),
+            format: mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown'),
             quality: bitrate ? Math.round(bitrate / 1000) + 'kbps' : 'unknown',
-            sampleRate,
-            sampleRateLabel: sampleRateLabel(sampleRate),
-            channels: streamBest?.audio_channels || streamBest?.audioChannels || null,
-            mimeType: mime || null,
             expiresAt,
             client
           };
           STREAM_MEM.set(videoId, result);
           await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, expiresAt - now - 600));
-          console.log('[stream:ok] ' + videoId + ' client=' + client + ' mime=' + (result.mimeType || 'unknown') + ' quality=' + result.quality + ' rate=' + (result.sampleRateLabel || 'na'));
           return result;
         }
       } catch (e) {
@@ -209,21 +215,15 @@ async function resolveStream(videoId) {
       const expiresAt = expMatch ? parseInt(expMatch[1]) : now + 21600;
       const mime = directBest?.mime_type || '';
       const bitrate = directBest?.average_bitrate || directBest?.bitrate || 0;
-      const sampleRate = directBest?.audio_sample_rate || directBest?.audioSampleRate || null;
       const result = {
         url: directUrl,
-        format: detectFormatFromMime(mime),
+        format: mime.includes('mp4a') ? 'aac' : (mime.includes('opus') || mime.includes('webm') ? 'opus' : 'unknown'),
         quality: bitrate ? Math.round(bitrate / 1000) + 'kbps' : 'unknown',
-        sampleRate,
-        sampleRateLabel: sampleRateLabel(sampleRate),
-        channels: directBest?.audio_channels || directBest?.audioChannels || null,
-        mimeType: mime || null,
         expiresAt,
         client
       };
       STREAM_MEM.set(videoId, result);
       await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, expiresAt - now - 600));
-      console.log('[stream:ok] ' + videoId + ' client=' + client + ' mime=' + (result.mimeType || 'unknown') + ' quality=' + result.quality + ' rate=' + (result.sampleRateLabel || 'na'));
       return result;
     }
   }
@@ -234,9 +234,10 @@ async function resolveStream(videoId) {
 }
 
 // ─── YTMusic singleton ────────────────────────────────────────────────────────
-let ytmusic = null;
-let ytmReady = false;
+let ytmusic    = null;
+let ytmReady   = false;
 let ytmIniting = false;
+
 async function ensureYTMusic() {
   if (ytmReady && ytmusic) return true;
   if (ytmIniting) {
@@ -252,7 +253,7 @@ async function ensureYTMusic() {
     if (YTM && typeof YTM !== 'function' && YTM.default) YTM = YTM.default;
     ytmusic = new YTM();
     await ytmusic.initialize();
-    ytmReady = true;
+    ytmReady   = true;
     ytmIniting = false;
     console.log('[ytm] ready');
     return true;
@@ -267,23 +268,21 @@ ensureYTMusic();
 setInterval(() => { if (!ytmReady) ensureYTMusic(); }, 30000);
 
 // ─── Token store ──────────────────────────────────────────────────────────────
-const TOKEN_CACHE = new Map();
-const IP_CREATES = new Map();
+const TOKEN_CACHE       = new Map();
+const IP_CREATES        = new Map();
 const MAX_TOKENS_PER_IP = 10;
-const RATE_MAX = 60;
-const RATE_WINDOW_MS = 60_000;
+const RATE_MAX          = 60;
+const RATE_WINDOW_MS    = 60_000;
+
 function genToken() { return crypto.randomBytes(14).toString('hex'); }
 function ipBucket(ip) {
   const now = Date.now();
   let b = IP_CREATES.get(ip);
-  if (!b || now > b.resetAt) {
-    b = { count: 0, resetAt: now + 86_400_000 };
-    IP_CREATES.set(ip, b);
-  }
+  if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86_400_000 }; IP_CREATES.set(ip, b); }
   return b;
 }
 async function saveToken(t, e) { await rSet('ytm:tok:' + t, JSON.stringify({ createdAt: e.createdAt, lastUsed: e.lastUsed, reqCount: e.reqCount })); }
-async function loadToken(t) { const d = await rGet('ytm:tok:' + t); return d ? JSON.parse(d) : null; }
+async function loadToken(t)    { const d = await rGet('ytm:tok:' + t); return d ? JSON.parse(d) : null; }
 async function getEntry(t) {
   if (TOKEN_CACHE.has(t)) return TOKEN_CACHE.get(t);
   const s = await loadToken(t);
@@ -296,9 +295,7 @@ function rateOk(e) {
   const now = Date.now();
   e.rateWin = (e.rateWin || []).filter(t => now - t < RATE_WINDOW_MS);
   if (e.rateWin.length >= RATE_MAX) return false;
-  e.rateWin.push(now);
-  e.lastUsed = now;
-  e.reqCount = (e.reqCount || 0) + 1;
+  e.rateWin.push(now); e.lastUsed = now; e.reqCount = (e.reqCount || 0) + 1;
   return true;
 }
 async function authMw(req, res, next) {
@@ -313,7 +310,7 @@ function getBase(req) { return (req.headers['x-forwarded-proto'] || req.protocol
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function thumb(t) { if (!t || !t.length) return null; return [...t].sort((a, b) => (b.width || 0) - (a.width || 0))[0].url || null; }
-function dur(s) { return s ? Math.floor(s) : null; }
+function dur(s)   { return s ? Math.floor(s) : null; }
 function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
 // ─── Config page ──────────────────────────────────────────────────────────────
@@ -323,7 +320,7 @@ function configPage(base) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YouTube Music Â· Eclipse Addon</title>
+<title>YouTube Music · Eclipse Addon</title>
 <style>
   :root {
     --red: #ff2020;
@@ -412,7 +409,7 @@ function configPage(base) {
     color: #ff6060; border-radius: 20px; font-size: 11px; font-weight: 700;
     padding: 4px 12px; margin-top: 12px; letter-spacing: 0.05em;
   }
-  .version-badge::before { content: 'â'; font-size: 8px; animation: pulse 2s ease-in-out infinite; }
+  .version-badge::before { content: '●'; font-size: 8px; animation: pulse 2s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
   .card {
@@ -597,14 +594,14 @@ function configPage(base) {
       </svg>
     </div>
     <h1>YouTube <span>Music</span> for Eclipse</h1>
-    <p>Full YouTube Music search â tracks, albums, artists, and playlists. Streams resolved via youtubei.js with PO token support.</p>
+    <p>Full YouTube Music search — tracks, albums, artists, and playlists. Streams resolved via youtubei.js with PO token support.</p>
     <span class="version-badge">v1.5.0 LIVE</span>
   </div>
 
   <div class="card">
     <div class="card-title">Access URL</div>
 
-    <div class="alert"><b>Save your URL.</b> Copy it to Notes or a bookmark â it's your persistent key. If the server restarts, paste it in the Refresh field below to restore access instantly.</div>
+    <div class="alert"><b>Save your URL.</b> Copy it to Notes or a bookmark — it's your persistent key. If the server restarts, paste it in the Refresh field below to restore access instantly.</div>
 
     <div class="pills">
       <span class="pill pill-red">Tracks</span>
@@ -620,7 +617,7 @@ function configPage(base) {
     <span class="lbl">Generate a new URL</span>
     <button class="btn-red" id="genBtn" onclick="generate()">Generate My Addon URL</button>
     <div class="result-box" id="genBox">
-      <div class="result-label">Your addon URL â paste into Eclipse</div>
+      <div class="result-label">Your addon URL — paste into Eclipse</div>
       <div class="result-url" id="genUrl"></div>
       <button class="btn-ghost" id="copyGenBtn" onclick="copyGen()">Copy URL</button>
     </div>
@@ -629,10 +626,10 @@ function configPage(base) {
 
     <span class="lbl">Refresh existing URL</span>
     <input type="text" id="existingUrl" placeholder="Paste your existing addon URL here">
-    <div class="hint">Refreshing keeps the same URL â nothing in Eclipse breaks.</div>
+    <div class="hint">Refreshing keeps the same URL — nothing in Eclipse breaks.</div>
     <button class="btn-green" id="refBtn" onclick="doRefresh()">Refresh Existing URL</button>
     <div class="result-box" id="refBox">
-      <div class="result-label">Refreshed â same URL still works in Eclipse</div>
+      <div class="result-label">Refreshed — same URL still works in Eclipse</div>
       <div class="result-url" id="refUrl"></div>
       <button class="btn-ghost" id="copyRefBtn" onclick="copyRef()">Copy URL</button>
     </div>
@@ -641,17 +638,17 @@ function configPage(base) {
 
     <div class="steps">
       <div class="step"><div class="step-num">1</div><div class="step-text">Generate and copy your URL above</div></div>
-      <div class="step"><div class="step-num">2</div><div class="step-text">Open <b>Eclipse</b> â Settings â Connections â Add Connection â Addon</div></div>
+      <div class="step"><div class="step-num">2</div><div class="step-text">Open <b>Eclipse</b> → Settings → Connections → Add Connection → Addon</div></div>
       <div class="step"><div class="step-num">3</div><div class="step-text">Paste your URL and tap <b>Install</b></div></div>
       <div class="step"><div class="step-num">4</div><div class="step-text">Use <b>Playlist Importer</b> below to export a YouTube Music playlist as CSV</div></div>
     </div>
   </div>
 
   <div class="card">
-    <span class="section-badge">â¬ Playlist Importer</span>
-    <div class="card-title">Export Playlist â CSV</div>
+    <span class="section-badge">⬇ Playlist Importer</span>
+    <div class="card-title">Export Playlist → CSV</div>
 
-    <p style="font-size:13px;color:#666;line-height:1.7;margin-bottom:20px;">Downloads a CSV you can import in Eclipse via <b style="color:#888">Library â Import CSV</b>.</p>
+    <p style="font-size:13px;color:#666;line-height:1.7;margin-bottom:20px;">Downloads a CSV you can import in Eclipse via <b style="color:#888">Library → Import CSV</b>.</p>
 
     <span class="lbl">Your Addon URL</span>
     <input type="text" id="impToken" placeholder="Paste your addon URL (auto-fills after generating)">
@@ -668,7 +665,7 @@ function configPage(base) {
 </div>
 
 <footer>
-  Eclipse YouTube Music Addon v1.5.0 &nbsp;Â·&nbsp;
+  Eclipse YouTube Music Addon v1.5.0 &nbsp;·&nbsp;
   <a href="${base}/health" target="_blank">${base}/health</a>
 </footer>
 
@@ -677,7 +674,7 @@ var _gu="",_ru="";
 
 function generate(){
   var btn=document.getElementById("genBtn");
-  btn.disabled=true; btn.textContent="Generatingâ¦";
+  btn.disabled=true; btn.textContent="Generating…";
   fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})
     .then(r=>r.json())
     .then(function(d){
@@ -702,7 +699,7 @@ function copyGen(){
 function doRefresh(){
   var btn=document.getElementById("refBtn"),eu=document.getElementById("existingUrl").value.trim();
   if(!eu){alert("Paste your existing addon URL first.");return;}
-  btn.disabled=true; btn.textContent="Refreshingâ¦";
+  btn.disabled=true; btn.textContent="Refreshing…";
   fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})})
     .then(r=>r.json())
     .then(function(d){
@@ -737,8 +734,8 @@ function doImport(){
   if(!purl){st.className="status err";st.textContent="Paste a YouTube Music playlist URL.";return;}
   var tok=getTok(raw);
   if(!tok){st.className="status err";st.textContent="Could not find your token in the URL.";return;}
-  btn.disabled=true; btn.textContent="Fetchingâ¦";
-  st.className="status loading"; st.textContent="Fetching tracksâ¦"; pv.style.display="none";
+  btn.disabled=true; btn.textContent="Fetching…";
+  st.className="status loading"; st.textContent="Fetching tracks…"; pv.style.display="none";
   fetch("/u/"+tok+"/import?url="+encodeURIComponent(purl))
     .then(function(r){
       if(!r.ok){return r.json().then(function(e){throw new Error(e.error||("Server error "+r.status));});}
@@ -750,9 +747,9 @@ function doImport(){
       var rows=tracks.slice(0,50).map(function(t,i){
         return '<div class="track-row"><span class="track-num">'+(i+1)+'</span><div class="track-info"><div class="track-title">'+hesc(t.title)+'</div><div class="track-artist">'+hesc(t.artist||"")+'</div></div></div>';
       });
-      if(tracks.length>50)rows.push('<div class="track-row" style="justify-content:center;color:#444"><span class="track-num"></span><div class="track-info"><div class="track-title">'+hesc((tracks.length-50)+' moreâ¦')+'</div></div></div>');
+      if(tracks.length>50)rows.push('<div class="track-row" style="justify-content:center;color:#444"><span class="track-num"></span><div class="track-info"><div class="track-title">'+hesc((tracks.length-50)+' more…')+'</div></div></div>');
       pv.innerHTML=rows.join(""); pv.style.display="block";
-      st.className="status ok"; st.textContent="Found "+tracks.length+' tracks in "'+hesc(data.title||"playlist")+'". Downloading CSVâ¦';
+      st.className="status ok"; st.textContent="Found "+tracks.length+' tracks in "'+hesc(data.title||"playlist")+'". Downloading CSV…';
       var lines=["Title,Artist,Album,Duration"];
       tracks.forEach(function(t){
         function ce(s){var x=String(s||"");if(x.indexOf(",")!==-1||x.indexOf('"')!==-1){x='"'+x.replace(/"/g,'""')+'"';}return x;}
@@ -776,53 +773,62 @@ function doImport(){
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.status(200).send(configPage(getBase(req)));
-});
 
-app.get('/health', async (req, res) => {
-  res.json({
-    ok: true,
-    ytmReady,
-    ytReady: !!_yt,
-    hasCookie: !!YT_COOKIE,
-    hasVisitorData: !!YT_VISITOR_DATA,
-    hasPoToken: !!YT_PO_TOKEN,
-    proxyEnabled: !!PROXY_URL
-  });
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(configPage(getBase(req)));
 });
 
 app.post('/generate', async (req, res) => {
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  const ip     = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
   const bucket = ipBucket(ip);
-  if (bucket.count >= MAX_TOKENS_PER_IP) return res.status(429).json({ error: 'Too many tokens created from this IP.' });
-  bucket.count += 1;
+  if (bucket.count >= MAX_TOKENS_PER_IP) return res.status(429).json({ error: 'Too many tokens today from this IP.' });
   const token = genToken();
   const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [] };
   TOKEN_CACHE.set(token, entry);
   await saveToken(token, entry);
-  const base = getBase(req);
+  bucket.count++;
+  res.json({ token, manifestUrl: getBase(req) + '/u/' + token + '/manifest.json' });
+});
+
+app.post('/refresh', async (req, res) => {
+  const raw = (req.body && req.body.existingUrl) ? String(req.body.existingUrl).trim() : '';
+  let token = raw;
+  const m = raw.match(/\/u\/([a-f0-9]{28})\//);
+  if (m) token = m[1];
+  if (!token || !/^[a-f0-9]{28}$/.test(token)) return res.status(400).json({ error: 'Paste your full addon URL.' });
+  const entry = await getEntry(token);
+  if (!entry) return res.status(404).json({ error: 'URL not found. Generate a new one.' });
+  res.json({ token, manifestUrl: getBase(req) + '/u/' + token + '/manifest.json', refreshed: true });
+});
+
+app.get('/health', (req, res) => {
   res.json({
-    token,
-    manifestUrl: `${base}/u/${token}/manifest.json`,
-    baseUrl: `${base}/u/${token}`
+    status:       'ok',
+    version:      '1.5.0',
+    ytmusicReady: ytmReady,
+    ytReady:      !!_yt,
+    redis:        !!(redis && redis.status === 'ready'),
+    tokens:       TOKEN_CACHE.size,
+    streamCache:  STREAM_MEM.size,
+    proxyEnabled: !!PROXY_URL,
+    proxyHost:    process.env.PROXY_HOST || null,
+    hasVisitorData: !!YT_VISITOR_DATA,
+    hasPoToken:   !!YT_PO_TOKEN,
+    hasCookie:    !!YT_COOKIE,
+    timestamp:    new Date().toISOString()
   });
 });
 
-app.get('/u/:token/manifest.json', authMw, async (req, res) => {
-  const base = `${getBase(req)}/u/${req.params.token}`;
+app.get('/u/:token/manifest.json', authMw, (req, res) => {
   res.json({
-    id: 'youtube-music',
-    name: 'YouTube Music',
-    version: '1.5.0',
-    baseUrl: base,
-    endpoints: {
-      search: `${base}/search`,
-      album: `${base}/album/:id`,
-      artist: `${base}/artist/:id`,
-      playlist: `${base}/playlist/:id`,
-      stream: `${base}/stream/:videoId`
-    }
+    id:          'com.eclipse.ytmusic.' + req.params.token.slice(0, 8),
+    name:        'YouTube Music',
+    version:     '1.5.0',
+    description: 'Full YouTube Music search and streaming — tracks, albums, artists, and playlists.',
+    icon:        'https://music.youtube.com/img/favicon_144.png',
+    resources:   ['search', 'stream', 'catalog'],
+    types:       ['track', 'album', 'artist', 'playlist']
   });
 });
 
@@ -830,10 +836,7 @@ app.get('/u/:token/search', authMw, async (req, res) => {
   const q = clean(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
   const ready = await ensureYTMusic();
-  if (!ready || !ytmusic) {
-    console.error('[search] ytm not ready');
-    return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
-  }
+  if (!ready) return res.status(503).json({ error: 'Not ready', tracks: [], albums: [], artists: [], playlists: [] });
   try {
     const [songs, albums, artists, playlists] = await Promise.all([
       ytmusic.searchSongs(q).catch(() => []),
@@ -841,66 +844,100 @@ app.get('/u/:token/search', authMw, async (req, res) => {
       ytmusic.searchArtists(q).catch(() => []),
       ytmusic.searchPlaylists(q).catch(() => [])
     ]);
-    return res.json({
-      tracks: (songs || []).slice(0, 20).map(s => ({
-        id: s.videoId,
-        title: s.name || 'Unknown',
-        artist: (s.artist && s.artist.name) || 'Unknown',
-        album: (s.album && s.album.name) || null,
-        duration: dur(s.duration),
-        artworkURL: thumb(s.thumbnails),
-        format: 'aac'
-      })),
-      albums: (albums || []).slice(0, 10).map(a => ({
-        id: a.albumId,
-        title: a.name || 'Unknown',
-        artist: (a.artist && a.artist.name) || 'Unknown',
-        artworkURL: thumb(a.thumbnails),
-        trackCount: a.trackCount || null,
-        year: a.year ? String(a.year) : null
-      })),
-      artists: (artists || []).slice(0, 5).map(a => ({
-        id: a.artistId,
-        name: a.name || 'Unknown',
-        artworkURL: thumb(a.thumbnails),
-        genres: []
-      })),
-      playlists: (playlists || []).slice(0, 10).map(p => ({
-        id: p.playlistId,
-        title: p.name || 'Unknown',
-        creator: (p.artist && p.artist.name) || null,
-        artworkURL: thumb(p.thumbnails),
-        trackCount: p.trackCount || null
-      }))
-    });
+    const payload = {
+      tracks:    (songs     || []).slice(0, 20).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })),
+      albums:    (albums    || []).slice(0, 10).map(a => ({ id: a.albumId, title: a.name || 'Unknown', artist: (a.artist && a.artist.name) || 'Unknown', artworkURL: thumb(a.thumbnails), trackCount: a.trackCount || null, year: a.year ? String(a.year) : null })),
+      artists:   (artists   || []).slice(0,  5).map(a => ({ id: a.artistId, name: a.name || 'Unknown', artworkURL: thumb(a.thumbnails), genres: [] })),
+      playlists: (playlists || []).slice(0, 10).map(p => ({ id: p.playlistId, title: p.name || 'Unknown', creator: (p.artist && p.artist.name) || null, artworkURL: thumb(p.thumbnails), trackCount: p.trackCount || null }))
+    };
+    const allEmpty = !payload.tracks.length && !payload.albums.length && !payload.artists.length && !payload.playlists.length;
+    if (allEmpty) console.error('[search] empty results for query: ' + q);
+    res.json(payload);
   } catch (e) {
     console.error('[search] ' + e.message);
-    return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
+    res.json({ error: e.message, tracks: [], albums: [], artists: [], playlists: [] });
   }
 });
 
-app.get('/u/:token/stream/:videoId', authMw, async (req, res) => {
+app.get('/u/:token/stream/:id', authMw, async (req, res) => {
+  const vid = req.params.id;
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(vid)) return res.status(400).json({ error: 'Invalid video ID.' });
   try {
-    const out = await resolveStream(req.params.videoId);
-    return res.json(out);
+    res.json(await resolveStream(vid));
   } catch (e) {
-    console.error('[stream] ' + req.params.videoId + ': ' + e.message);
-    return res.status(403).json({ error: e.message });
+    if (e.message === 'login_required' || e.message === 'login_required_missing_auth') {
+      console.error('[stream] ' + vid + ': ' + e.message);
+      return res.status(403).json({
+        error: e.message,
+        needsPoToken: !YT_PO_TOKEN,
+        needsCookie: !YT_COOKIE,
+        needsVisitorData: !YT_VISITOR_DATA
+      });
+    }
+    console.error('[stream] ' + vid + ': ' + e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
 app.get('/u/:token/album/:id', authMw, async (req, res) => {
-  return res.json({ id: req.params.id, tracks: [] });
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  try {
+    const a = await ytmusic.getAlbum(req.params.id);
+    if (!a) return res.status(404).json({ error: 'Not found.' });
+    res.json({
+      id: a.albumId, title: a.name || 'Unknown', artist: (a.artist && a.artist.name) || 'Unknown',
+      artworkURL: thumb(a.thumbnails), year: a.year ? String(a.year) : null,
+      description: a.description || null, trackCount: (a.songs || []).length || null,
+      tracks: (a.songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || (a.artist && a.artist.name) || 'Unknown', duration: dur(s.duration), artworkURL: thumb(s.thumbnails) || thumb(a.thumbnails), format: 'aac' }))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/u/:token/artist/:id', authMw, async (req, res) => {
-  return res.json({ id: req.params.id, tracks: [], albums: [] });
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  try {
+    const a = await ytmusic.getArtist(req.params.id);
+    if (!a) return res.status(404).json({ error: 'Not found.' });
+    res.json({
+      id: a.artistId, name: a.name || 'Unknown', artworkURL: thumb(a.thumbnails),
+      bio: a.description || null, genres: [],
+      topTracks: (a.topSongs  || []).slice(0, 10).map(s  => ({ id: s.videoId,  title: s.name  || 'Unknown', artist: (s.artist  && s.artist.name)  || a.name || 'Unknown', duration: dur(s.duration),  artworkURL: thumb(s.thumbnails),  format: 'aac' })),
+      albums:    (a.topAlbums || []).slice(0, 10).map(al => ({ id: al.albumId, title: al.name || 'Unknown', artist: a.name || 'Unknown', artworkURL: thumb(al.thumbnails), trackCount: null, year: al.year ? String(al.year) : null }))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/u/:token/playlist/:id', authMw, async (req, res) => {
-  return res.json({ id: req.params.id, tracks: [] });
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  try {
+    const p = await ytmusic.getPlaylist(req.params.id);
+    if (!p) return res.status(404).json({ error: 'Not found.' });
+    res.json({
+      id: p.playlistId, title: p.name || 'Unknown', description: p.description || null,
+      artworkURL: thumb(p.thumbnails), creator: (p.artist && p.artist.name) || null,
+      tracks: (p.songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' }))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => {
-  console.log('[server] listening on :' + PORT);
+app.get('/u/:token/import', authMw, async (req, res) => {
+  const rawUrl = String(req.query.url || '').trim();
+  if (!rawUrl) return res.status(400).json({ error: 'Missing ?url= parameter.' });
+  if (!await ensureYTMusic()) return res.status(503).json({ error: 'Not ready.' });
+  let playlistId = null;
+  const vm = rawUrl.match(/browse\/VL([a-zA-Z0-9_-]+)/);
+  const lm = rawUrl.match(/[?&]list=([a-zA-Z0-9_-]+)/);
+  if (vm) playlistId = vm[1]; else if (lm) playlistId = lm[1];
+  if (!playlistId) return res.status(400).json({ error: 'Could not extract playlist ID.' });
+  try {
+    const p = await ytmusic.getPlaylist(playlistId);
+    if (!p) throw new Error('Playlist not found.');
+    res.json({
+      id: p.playlistId, title: p.name || 'YouTube Music Playlist',
+      tracks: (p.songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', duration: dur(s.duration) }))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.listen(PORT, () => console.log('[server] v1.5.0 port ' + PORT));
+module.exports = app;
