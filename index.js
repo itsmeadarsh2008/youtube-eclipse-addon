@@ -836,20 +836,26 @@ app.get('/u/:token/search', authMw, async (req, res) => {
   const q = clean(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
   const ready = await ensureYTMusic();
-  if (!ready) return res.status(503).json({ error: 'Not ready', tracks: [], albums: [], artists: [], playlists: [] });
+  if (!ready) {
+    console.error('[ytm] init unavailable; returning fallback empty search for ' + q);
+    return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
+  }
   try {
-    const [songs, videos, albums, artists, playlists] = await Promise.all([
+    let videos = [];
+    const [songs, albums, artists, playlists] = await Promise.all([
       ytmusic.searchSongs(q).catch(() => []),
-      ytmusic.searchVideos(q).catch(() => []),
       ytmusic.searchAlbums(q).catch(() => []),
       ytmusic.searchArtists(q).catch(() => []),
       ytmusic.searchPlaylists(q).catch(() => [])
     ]);
+    if (typeof ytmusic.searchVideos === 'function') {
+      videos = await ytmusic.searchVideos(q).catch(() => []);
+    }
     const seenTrackIds = new Set();
     const payload = {
       tracks: [
-        ...(songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac' })),
-        ...(videos || []).map(v => ({ id: v.videoId, title: v.name || 'Unknown', artist: (v.artist && v.artist.name) || 'Unknown', album: null, duration: dur(v.duration), artworkURL: thumb(v.thumbnails), format: 'aac' }))
+        ...(songs || []).map(s => ({ id: s.videoId, title: s.name || 'Unknown', artist: (s.artist && s.artist.name) || 'Unknown', album: (s.album && s.album.name) || null, duration: dur(s.duration), artworkURL: thumb(s.thumbnails), format: 'aac', source: 'song' })),
+        ...(videos || []).map(v => ({ id: v.videoId, title: v.name || 'Unknown', artist: (v.artist && v.artist.name) || 'Unknown', album: null, duration: dur(v.duration), artworkURL: thumb(v.thumbnails), format: 'aac', source: 'video' }))
       ].filter(t => {
         if (!t.id || seenTrackIds.has(t.id)) return false;
         seenTrackIds.add(t.id);
