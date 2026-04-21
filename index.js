@@ -57,55 +57,62 @@ async function rSet(k, v, t) { if (!redis) return; try { t ? await redis.set(k, 
 const STREAM_MEM = new Map();
 
 async function resolveStream(videoId) {
-  // Check memory cache first
   const mc = STREAM_MEM.get(videoId);
   if (mc && mc.expiresAt > Date.now() / 1000 + 600) return mc;
+
   const rc = await rGet('ytm:stream:' + videoId);
   if (rc) {
     const p = JSON.parse(rc);
-    if (p.expiresAt > Date.now() / 1000 + 600) { STREAM_MEM.set(videoId, p); return p; }
-  }
-
-  // Use home proxy if available (bypasses YouTube datacenter IP block on Vercel)
-  const proxyBase = (process.env.YTM_PROXY_URL || process.env.DAB_PROXY_URL || '').replace(/\/$/, '');
-  if (proxyBase) {
-    try {
-      const r = await axios.get(proxyBase + '/ytm-stream/' + videoId, { timeout: 20000 });
-      const result = r.data;
-      if (result && result.url) {
-        STREAM_MEM.set(videoId, result);
-        await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, (result.expiresAt || 0) - Math.floor(Date.now() / 1000) - 600));
-        console.log('[YTM] stream via home proxy OK:', videoId);
-        return result;
-      }
-    } catch (e) {
-      console.warn('[YTM] proxy stream failed, trying local:', e.message);
+    if (p.expiresAt > Date.now() / 1000 + 600) {
+      STREAM_MEM.set(videoId, p);
+      return p;
     }
   }
 
-  // Fallback: local resolve (may be blocked by YouTube on datacenter IPs)
   const yt = await getYT();
+
   let info;
-  try { info = await yt.getBasicInfo(videoId, 'ANDROID'); }
-  catch (e) { info = await yt.getBasicInfo(videoId, 'IOS'); }
+  try {
+    info = await yt.getBasicInfo(videoId, 'ANDROID');
+  } catch (_e) {
+    info = await yt.getBasicInfo(videoId, 'IOS');
+  }
+
   const ps = info.playability_status;
   if (ps && ps.status === 'LOGIN_REQUIRED') throw new Error('login_required');
-  if (ps && ps.status !== 'OK') throw new Error('not_playable: ' + ps.status);
-  const formats = (info.streaming_data && info.streaming_data.adaptive_formats || [])
-    .filter(f => f.mime_type && f.mime_type.startsWith('audio') && (f.url || f.decipher));
+  if (ps && ps.status !== 'OK')            throw new Error('not_playable: ' + ps.status);
+
+  const formats = (info.streaming_data?.adaptive_formats || [])
+    .filter(f => f.mime_type?.startsWith('audio/') && (f.url || f.decipher));
+
   if (!formats.length) throw new Error('no audio formats');
-  const m4a = formats.filter(f => f.mime_type && f.mime_type.includes('mp4a'));
+
+  const m4a  = formats.filter(f => f.mime_type?.includes('mp4a'));
   const pool = m4a.length ? m4a : formats;
   const best = pool.sort((a, b) => (b.average_bitrate || 0) - (a.average_bitrate || 0))[0];
-  const url = best.url || await best.decipher(yt.actions.session.player);
-  const expMatch = url.match(/[?&]expire=([0-9]+)/);
-  const expiresAt = expMatch ? parseInt(expMatch[1]) : Math.floor(Date.now() / 1000 + 21600);
-  const result = { url, format: best.mime_type && best.mime_type.includes('mp4a') ? 'aac' : 'opus', quality: best.average_bitrate ? Math.round(best.average_bitrate / 1000) + 'kbps' : 'unknown', expiresAt };
+
+  const url       = best.url || await best.decipher(yt.actions.session.player);
+  const expMatch  = url.match(/[?&]expire=(\d+)/);
+  const expiresAt = expMatch ? parseInt(expMatch[1]) : Math.floor(Date.now() / 1000) + 21600;
+
+  const result = {
+    url,
+    format:    best.mime_type?.includes('mp4a') ? 'aac' : 'opus',
+    quality:   best.average_bitrate ? Math.round(best.average_bitrate / 1000) + 'kbps' : 'unknown',
+    expiresAt
+  };
+
   STREAM_MEM.set(videoId, result);
-  await rSet('ytm:stream:' + videoId, JSON.stringify(result), Math.max(60, expiresAt - Math.floor(Date.now() / 1000) - 600));
+  await rSet('ytm:stream:' + videoId, JSON.stringify(result),
+    Math.max(60, expiresAt - Math.floor(Date.now() / 1000) - 600));
+
   return result;
 }
 
+// ─── YTMusic singleton ────────────────────────────────────────────────────────
+let ytmusic    = null;
+let ytmReady   = false;
+let ytmIniting = false;
 
 async function ensureYTMusic() {
   if (ytmReady && ytmusic) return true;
