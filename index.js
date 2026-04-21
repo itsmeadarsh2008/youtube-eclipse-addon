@@ -5,11 +5,37 @@ const cors    = require('cors');
 const crypto  = require('crypto');
 const axios   = require('axios');
 const Redis   = require('ioredis');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
+
+const PROXY_URL = (
+  process.env.PROXY_HOST &&
+  process.env.PROXY_USER &&
+  process.env.PROXY_PASS
+)
+  ? `http://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}:${process.env.PROXY_PORT || 80}`
+  : null;
+
+const PROXY_AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
+
+if (PROXY_URL) {
+  process.env.HTTP_PROXY  = process.env.HTTP_PROXY  || PROXY_URL;
+  process.env.HTTPS_PROXY = process.env.HTTPS_PROXY || PROXY_URL;
+  process.env.http_proxy  = process.env.http_proxy  || PROXY_URL;
+  process.env.https_proxy = process.env.https_proxy || PROXY_URL;
+  console.log('[proxy] enabled: ' + process.env.PROXY_HOST + ':' + (process.env.PROXY_PORT || 80));
+} else {
+  console.log('[proxy] disabled');
+}
+
+async function proxyFetch(url, opts = {}) {
+  if (!PROXY_AGENT) return fetch(url, opts);
+  return fetch(url, { ...opts, agent: PROXY_AGENT });
+}
 
 // ─── Stream resolver — youtubei.js ───────────────────────────────────────────
 let _yt = null;
@@ -30,7 +56,7 @@ async function getYT() {
     _yt = await Innertube.create({
       cache:                    new Map(),
       generate_session_locally: true,
-      fetch:                    (url, opts) => fetch(url, opts)
+      fetch:                    (url, opts) => proxyFetch(url, opts)
     });
     console.log('[yt] innertube ready');
     return _yt;
@@ -226,7 +252,6 @@ function configPage(base) {
     overflow-x: hidden;
   }
 
-  /* animated background blobs */
   body::before, body::after {
     content: '';
     position: fixed;
@@ -250,10 +275,8 @@ function configPage(base) {
   @keyframes drift1 { from { transform: translate(0,0); } to { transform: translate(80px,60px); } }
   @keyframes drift2 { from { transform: translate(0,0); } to { transform: translate(-60px,-80px); } }
 
-  /* all real content above blobs */
   .wrap { position: relative; z-index: 1; width: 100%; max-width: 560px; }
 
-  /* ── Header ── */
   .header {
     display: flex;
     flex-direction: column;
@@ -291,7 +314,6 @@ function configPage(base) {
   .version-badge::before { content: '●'; font-size: 8px; animation: pulse 2s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
-  /* ── Cards ── */
   .card {
     background: var(--surface);
     border: 1px solid var(--surface-border);
@@ -312,7 +334,6 @@ function configPage(base) {
   }
   .card-title::after { content: ''; flex: 1; height: 1px; background: var(--surface-border); }
 
-  /* ── Alert banner ── */
   .alert {
     background: rgba(255,32,32,0.06);
     border: 1px solid rgba(255,32,32,0.2);
@@ -323,7 +344,6 @@ function configPage(base) {
   }
   .alert b { color: #ff9090; }
 
-  /* ── Feature pills ── */
   .pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 28px; }
   .pill {
     border-radius: 20px; font-size: 11px; font-weight: 600;
@@ -334,14 +354,12 @@ function configPage(base) {
   .pill-green { background: rgba(34,197,94,0.1); color: #4ade80; border: 1px solid rgba(34,197,94,0.2); }
   .pill-purple { background: rgba(168,85,247,0.1); color: #c084fc; border: 1px solid rgba(168,85,247,0.2); }
 
-  /* ── Labels ── */
   .lbl {
     font-size: 11px; font-weight: 700; text-transform: uppercase;
     letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; margin-top: 20px;
     display: block;
   }
 
-  /* ── Inputs ── */
   input {
     width: 100%; background: rgba(255,255,255,0.03);
     border: 1px solid var(--surface-border);
@@ -359,7 +377,6 @@ function configPage(base) {
   .hint { font-size: 12px; color: #444; margin-bottom: 4px; line-height: 1.7; }
   .hint code { background: rgba(255,255,255,0.06); padding: 1px 6px; border-radius: 4px; color: #777; font-size: 11px; }
 
-  /* ── Buttons ── */
   button {
     cursor: pointer; border: none; border-radius: 10px;
     font-size: 14px; font-weight: 700; padding: 13px 20px;
@@ -398,7 +415,6 @@ function configPage(base) {
   }
   .btn-ghost:hover { background: rgba(255,255,255,0.08); color: #ccc; }
 
-  /* ── Result box ── */
   .result-box {
     display: none;
     background: rgba(255,32,32,0.05);
@@ -415,10 +431,8 @@ function configPage(base) {
     font-family: 'SF Mono', 'Fira Code', monospace; line-height: 1.6; margin-bottom: 14px;
   }
 
-  /* ── Divider ── */
   .divider { border: none; border-top: 1px solid var(--surface-border); margin: 24px 0; }
 
-  /* ── Steps ── */
   .steps { display: flex; flex-direction: column; gap: 14px; }
   .step { display: flex; gap: 14px; align-items: flex-start; }
   .step-num {
@@ -430,13 +444,11 @@ function configPage(base) {
   .step-text { font-size: 13px; color: #888; line-height: 1.65; padding-top: 4px; }
   .step-text b { color: #bbb; }
 
-  /* ── Status ── */
   .status { font-size: 13px; color: var(--muted); margin: 10px 0; min-height: 20px; line-height: 1.5; }
   .status.ok { color: var(--green); }
   .status.err { color: #f87171; }
   .status.loading { color: #60a5fa; }
 
-  /* ── Preview list ── */
   .preview {
     background: rgba(255,255,255,0.02); border: 1px solid var(--surface-border);
     border-radius: 10px; padding: 10px; max-height: 210px; overflow-y: auto;
@@ -456,7 +468,6 @@ function configPage(base) {
   .track-title { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
   .track-artist { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
 
-  /* ── Section badge ── */
   .section-badge {
     display: inline-flex; align-items: center; gap: 6px;
     background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.2);
@@ -464,7 +475,6 @@ function configPage(base) {
     padding: 4px 12px; margin-bottom: 16px; letter-spacing: 0.04em;
   }
 
-  /* ── Footer ── */
   footer {
     position: relative; z-index: 1;
     margin-top: 36px; font-size: 12px; color: #2a2a2a;
@@ -477,7 +487,6 @@ function configPage(base) {
 <body>
 <div class="wrap">
 
-  <!-- Header -->
   <div class="header">
     <div class="logo-ring">
       <svg viewBox="0 0 72 72" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -491,7 +500,6 @@ function configPage(base) {
     <span class="version-badge">v1.5.0 LIVE</span>
   </div>
 
-  <!-- Generate / Refresh card -->
   <div class="card">
     <div class="card-title">Access URL</div>
 
@@ -538,7 +546,6 @@ function configPage(base) {
     </div>
   </div>
 
-  <!-- Playlist importer card -->
   <div class="card">
     <span class="section-badge">⬇ Playlist Importer</span>
     <div class="card-title">Export Playlist → CSV</div>
@@ -706,6 +713,8 @@ app.get('/health', (req, res) => {
     redis:        !!(redis && redis.status === 'ready'),
     tokens:       TOKEN_CACHE.size,
     streamCache:  STREAM_MEM.size,
+    proxyEnabled: !!PROXY_URL,
+    proxyHost:    process.env.PROXY_HOST || null,
     timestamp:    new Date().toISOString()
   });
 });
