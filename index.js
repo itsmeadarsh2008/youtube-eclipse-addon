@@ -52,12 +52,12 @@ async function getYT() {
   }
   _ytInit = true;
   try {
-    const { Innertube } = require('youtubei.js');
-    _yt = await Innertube.create({
-      cache:                    new Map(),
-      generate_session_locally: true,
-      fetch:                    (url, opts) => proxyFetch(url, opts)
-    });
+    const { Innertube } = await import('youtubei.js');
+_yt = await Innertube.create({
+  cache: new Map(),
+  generate_session_locally: true,
+  fetch: (url, opts) => proxyFetch(url, opts)
+});
     console.log('[yt] innertube ready');
     return _yt;
   } catch (e) {
