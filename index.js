@@ -836,81 +836,59 @@ app.get('/u/:token/search', authMw, async (req, res) => {
   const q = clean(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
-  const ready = await ensureYTMusic();
-  if (!ready) {
-    console.error('[ytm] init unavailable; returning fallback empty search for ' + q);
-    return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
-  }
-
   try {
-    let videos = [];
-    const [songs, albums, artists, playlists] = await Promise.all([
-      ytmusic.searchSongs(q).catch(() => []),
-      ytmusic.searchAlbums(q).catch(() => []),
-      ytmusic.searchArtists(q).catch(() => []),
-      ytmusic.searchPlaylists(q).catch(() => [])
-    ]);
+    const yt = await getYT();
+    const results = await yt.music.search(q, { type: 'song' });
+    const videoResults = await yt.music.search(q, { type: 'video' });
 
-    if (typeof ytmusic.searchVideos === 'function') {
-      videos = await ytmusic.searchVideos(q).catch(() => []);
-    }
-
-    const seenTrackIds = new Set();
-    const payload = {
-      tracks: [
-        ...(songs || []).map(s => ({
-          id: s.videoId,
-          title: s.name || 'Unknown',
-          artist: (s.artist && s.artist.name) || 'Unknown',
-          album: (s.album && s.album.name) || null,
-          duration: dur(s.duration),
-          artworkURL: thumb(s.thumbnails),
-          format: 'aac',
-          source: 'song'
-        })),
-        ...(videos || []).map(v => ({
-          id: v.videoId,
-          title: v.name || 'Unknown',
-          artist: (v.artist && v.artist.name) || 'Unknown',
-          album: null,
-          duration: dur(v.duration),
-          artworkURL: thumb(v.thumbnails),
-          format: 'aac',
-          source: 'video'
-        }))
-      ].filter(t => {
-        if (!t.id || seenTrackIds.has(t.id)) return false;
-        seenTrackIds.add(t.id);
+    const seenIds = new Set();
+    const tracks = [
+      ...(results?.contents?.flatMap(s => s.contents || []) || []),
+      ...(videoResults?.contents?.flatMap(s => s.contents || []) || [])
+    ]
+      .filter(item => {
+        const id = item?.id || item?.videoId;
+        if (!id || seenIds.has(id)) return false;
+        seenIds.add(id);
         return true;
-      }).slice(0, 30),
+      })
+      .slice(0, 30)
+      .map(item => ({
+        id: item?.id || item?.videoId,
+        title: item?.title?.toString?.() || item?.name || 'Unknown',
+        artist: item?.artists?.[0]?.name || item?.author?.name || 'Unknown',
+        album: item?.album?.name || null,
+        duration: item?.duration?.seconds || null,
+        artworkURL: item?.thumbnails?.[item.thumbnails.length - 1]?.url || null,
+        format: 'aac'
+      }));
 
-      albums: (albums || []).slice(0, 10).map(a => ({
-        id: a.albumId,
-        title: a.name || 'Unknown',
-        artist: (a.artist && a.artist.name) || 'Unknown',
-        artworkURL: thumb(a.thumbnails),
-        trackCount: a.trackCount || null,
-        year: a.year ? String(a.year) : null
-      })),
+    // Album search
+    const albumResults = await yt.music.search(q, { type: 'album' }).catch(() => null);
+    const albums = (albumResults?.contents?.flatMap(s => s.contents || []) || [])
+      .slice(0, 10)
+      .map(a => ({
+        id: a?.browse_id || a?.id,
+        title: a?.title?.toString?.() || 'Unknown',
+        artist: a?.artists?.[0]?.name || 'Unknown',
+        artworkURL: a?.thumbnails?.[a.thumbnails.length - 1]?.url || null,
+        year: a?.year || null
+      }));
 
-      artists: (artists || []).slice(0, 5).map(a => ({
-        id: a.artistId,
-        name: a.name || 'Unknown',
-        artworkURL: thumb(a.thumbnails),
+    // Artist search
+    const artistResults = await yt.music.search(q, { type: 'artist' }).catch(() => null);
+    const artists = (artistResults?.contents?.flatMap(s => s.contents || []) || [])
+      .slice(0, 5)
+      .map(a => ({
+        id: a?.browse_id || a?.id,
+        name: a?.name || a?.title?.toString?.() || 'Unknown',
+        artworkURL: a?.thumbnails?.[a.thumbnails.length - 1]?.url || null,
         genres: []
-      })),
+      }));
 
-      playlists: (playlists || []).slice(0, 10).map(p => ({
-        id: p.playlistId,
-        title: p.name || 'Unknown',
-        creator: (p.artist && p.artist.name) || null,
-        artworkURL: thumb(p.thumbnails),
-        trackCount: p.trackCount || null
-      }))
-    };
-
-    const allEmpty = !payload.tracks.length && !payload.albums.length && !payload.artists.length && !payload.playlists.length;
-    if (allEmpty) console.error('[search] empty results for query: ' + q);
+    const payload = { tracks, albums, artists, playlists: [] };
+    const allEmpty = !tracks.length && !albums.length && !artists.length;
+    if (allEmpty) console.error('[search] empty results for: ' + q);
     res.json(payload);
   } catch (e) {
     console.error('[search] ' + e.message);
