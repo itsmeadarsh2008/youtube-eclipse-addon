@@ -379,25 +379,91 @@ async function ytmPost(path, body, env) {
 // ─── Search ───────────────────────────────────────────────────────────────────
 
 async function searchTracks(query, limit, env) {
-  // No params = search All categories (tracks, albums, artists, playlists)
-  const data = await ytmPost('/youtubei/v1/search', {
-    context: { client: WEB_REMIX_CTX },
-    query,
-  }, env);
+  // Search songs only for tracks (reliable results + duration)
+  const [songData, allData] = await Promise.all([
+    ytmPost('/youtubei/v1/search', {
+      context: { client: WEB_REMIX_CTX },
+      query,
+      params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D', // songs filter
+    }, env),
+    ytmPost('/youtubei/v1/search', {
+      context: { client: WEB_REMIX_CTX },
+      query,
+      // no params = all types (albums, artists, playlists, community playlists)
+    }, env),
+  ]);
 
-  const results = [];
-  const sections = data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]
-    ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+  const tracks   = [];
+  const albums   = [];
+  const artists  = [];
+  const playlists = [];
 
-  for (const section of sections) {
+  // ── Helper: extract all shelves from a search response ──────────────────────
+  function getShelves(data) {
+    return data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]
+      ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+  }
+
+  // ── Parse SONG shelf (songs filter response) ────────────────────────────────
+  for (const section of getShelves(songData)) {
+    const shelf = section.musicShelfRenderer;
+    if (!shelf) continue;
+    for (const item of (shelf.contents || [])) {
+      if (tracks.length >= limit) break;
+      const r = item.musicResponsiveListItemRenderer;
+      if (!r) continue;
+
+      const videoId =
+        r.playlistItemData?.videoId ||
+        r.overlay?.musicItemThumbnailOverlayRenderer?.content
+          ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
+      if (!videoId) continue;
+
+      const title = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer
+        ?.text?.runs?.map(t => t.text).join('') || '';
+      const col1Runs = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer
+        ?.text?.runs || [];
+      const info = parseInfoRuns(col1Runs);
+      const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+
+      // Duration: fixedColumns first, then last col1 run if it looks like a timestamp
+      let durText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer
+        ?.text?.runs?.[0]?.text || '';
+      if (!durText) {
+        for (let i = col1Runs.length - 1; i >= 0; i--) {
+          if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(col1Runs[i].text || '')) {
+            durText = col1Runs[i].text;
+            break;
+          }
+        }
+      }
+
+      tracks.push({
+        id: videoId,
+        title,
+        artist: info.artist,
+        album: info.album,
+        duration: parseDuration(durText),
+        artworkURL: bestThumbnail(thumbs),
+        type: 'track',
+      });
+    }
+  }
+
+  // ── Parse ALL shelf (no filter) for albums / artists / playlists ─────────────
+  for (const section of getShelves(allData)) {
     const shelf = section.musicShelfRenderer;
     if (!shelf) continue;
 
-    // Detect what category this shelf is
-    const shelfTitle = shelf.title?.runs?.[0]?.text || '';
+    const shelfTitle = (shelf.title?.runs?.[0]?.text || '').toLowerCase();
+    const isAlbumShelf    = shelfTitle.includes('album') || shelfTitle.includes('single') || shelfTitle.includes('ep');
+    const isArtistShelf   = shelfTitle.includes('artist');
+    const isPlaylistShelf = shelfTitle.includes('playlist') || shelfTitle.includes('community');
+
+    // Skip song shelves here — already handled above with the filter
+    if (!isAlbumShelf && !isArtistShelf && !isPlaylistShelf) continue;
 
     for (const item of (shelf.contents || [])) {
-      if (results.length >= limit) break;
       const r = item.musicResponsiveListItemRenderer;
       if (!r) continue;
 
@@ -405,94 +471,36 @@ async function searchTracks(query, limit, env) {
         ?.text?.runs?.map(t => t.text).join('') || '';
       const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
       const artworkURL = bestThumbnail(thumbs);
-      const col1Runs = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+      const col1Runs = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer
+        ?.text?.runs || [];
 
-      // Determine type from the navigation endpoint or shelf title
-      const navEp = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer
-        ?.text?.runs?.[0]?.navigationEndpoint;
-      const browseEp = navEp?.browseEndpoint;
-      const watchEp = navEp?.watchEndpoint ||
+      // BrowseEndpoint lives on the title run or the overlay
+      const titleRuns = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+      const browseId =
+        titleRuns[0]?.navigationEndpoint?.browseEndpoint?.browseId ||
+        r.navigationEndpoint?.browseEndpoint?.browseId ||
         r.overlay?.musicItemThumbnailOverlayRenderer?.content
-          ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint ||
-        r.playlistItemData;
+          ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
 
-      // Detect type by browseId prefix or shelf name
-      let type = 'track';
-      if (browseEp?.browseId) {
-        const bid = browseEp.browseId;
-        if (bid.startsWith('MPREb_') || bid.startsWith('FEmusic_library_privately_owned_release')) type = 'album';
-        else if (bid.startsWith('UC') || bid.startsWith('MPLAUCb') || browseEp.browseEndpointContextSupportedConfigs
-          ?.browseEndpointContextMusicConfig?.pageType === 'MUSIC_PAGE_TYPE_ARTIST') type = 'artist';
-        else if (bid.startsWith('RDAMVM') || bid.startsWith('VL') || bid.startsWith('PL')) type = 'playlist';
-      }
-      if (shelfTitle === 'Albums' || shelfTitle === 'EPs & Singles') type = 'album';
-      if (shelfTitle === 'Artists') type = 'artist';
-      if (shelfTitle === 'Community playlists' || shelfTitle === 'Playlists') type = 'playlist';
+      // Artist name from col1 navigable run
+      const artistRun = col1Runs.find(run => run.navigationEndpoint?.browseEndpoint);
+      const artistName = artistRun?.text || parseInfoRuns(col1Runs).artist;
 
-      // Duration: fixedColumns first, then parse from col1 runs (last run if it looks like a time)
-      let durationText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer
-        ?.text?.runs?.[0]?.text || '';
-      if (!durationText && col1Runs.length) {
-        const last = col1Runs[col1Runs.length - 1]?.text || '';
-        if (/^\d+:\d{2}(:\d{2})?$/.test(last)) durationText = last;
-      }
-
-      const info = parseInfoRuns(col1Runs);
-
-      if (type === 'track') {
-        const videoId = watchEp?.videoId;
-        if (!videoId) continue;
-        results.push({
-          id: videoId,
-          title,
-          artist: info.artist,
-          album: info.album,
-          duration: parseDuration(durationText),
-          artworkURL,
-          type: 'track',
-        });
-      } else if (type === 'album') {
-        const browseId = browseEp?.browseId;
-        if (!browseId) continue;
-        // artist is in col1 runs — usually first navigable run
-        const artistRun = col1Runs.find(r => r.navigationEndpoint?.browseEndpoint);
-        results.push({
-          id: browseId,
-          title,
-          artist: artistRun?.text || info.artist,
-          artworkURL,
-          type: 'album',
-        });
-      } else if (type === 'artist') {
-        const browseId = browseEp?.browseId;
-        if (!browseId) continue;
-        results.push({
-          id: browseId,
-          name: title,
-          artworkURL,
-          type: 'artist',
-        });
-      } else if (type === 'playlist') {
-        const browseId = browseEp?.browseId || watchEp?.playlistId;
-        if (!browseId) continue;
-        results.push({
-          id: browseId,
-          title,
-          artist: info.artist,
-          artworkURL,
-          type: 'playlist',
-        });
+      if (isAlbumShelf && browseId) {
+        albums.push({ id: browseId, title, artist: artistName, artworkURL, type: 'album' });
+      } else if (isArtistShelf && browseId) {
+        artists.push({ id: browseId, name: title, artworkURL, type: 'artist' });
+      } else if (isPlaylistShelf) {
+        const playlistId =
+          browseId ||
+          r.overlay?.musicItemThumbnailOverlayRenderer?.content
+            ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.playlistId;
+        if (playlistId) playlists.push({ id: playlistId, title, artist: artistName, artworkURL, type: 'playlist' });
       }
     }
   }
 
-  // Group by type for Eclipse
-  const tracks   = results.filter(r => r.type === 'track');
-  const albums   = results.filter(r => r.type === 'album');
-  const artists  = results.filter(r => r.type === 'artist');
-  const playlists = results.filter(r => r.type === 'playlist');
-
-  return { tracks, albums, artists, playlists, total: results.length };
+  return { tracks, albums, artists, playlists, total: tracks.length + albums.length + artists.length + playlists.length };
 }
 
 
