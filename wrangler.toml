@@ -1,0 +1,11 @@
+name = "eclipse-ytmusic"
+main = "index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Set these as secrets via: npx wrangler secret put REDIS_URL
+# Or add them below for local dev only (do NOT commit real values)
+[vars]
+ADDON_VERSION = "1.0.0"
+# REDIS_URL = "https://your-upstash-url"   # use wrangler secret put instead
+# REDIS_TOKEN = "your-upstash-token"        # use wrangler secret put instead
