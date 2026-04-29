@@ -379,37 +379,122 @@ async function ytmPost(path, body, env) {
 // ─── Search ───────────────────────────────────────────────────────────────────
 
 async function searchTracks(query, limit, env) {
+  // No params = search All categories (tracks, albums, artists, playlists)
   const data = await ytmPost('/youtubei/v1/search', {
     context: { client: WEB_REMIX_CTX },
     query,
-    params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
   }, env);
 
-  const tracks = [];
+  const results = [];
   const sections = data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]
     ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
 
   for (const section of sections) {
     const shelf = section.musicShelfRenderer;
     if (!shelf) continue;
+
+    // Detect what category this shelf is
+    const shelfTitle = shelf.title?.runs?.[0]?.text || '';
+
     for (const item of (shelf.contents || [])) {
-      if (tracks.length >= limit) break;
+      if (results.length >= limit) break;
       const r = item.musicResponsiveListItemRenderer;
       if (!r) continue;
-      const videoId = r.playlistItemData?.videoId ||
+
+      const title = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer
+        ?.text?.runs?.map(t => t.text).join('') || '';
+      const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+      const artworkURL = bestThumbnail(thumbs);
+      const col1Runs = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+
+      // Determine type from the navigation endpoint or shelf title
+      const navEp = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer
+        ?.text?.runs?.[0]?.navigationEndpoint;
+      const browseEp = navEp?.browseEndpoint;
+      const watchEp = navEp?.watchEndpoint ||
         r.overlay?.musicItemThumbnailOverlayRenderer?.content
-          ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
-      if (!videoId) continue;
-      const title = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.map(t=>t.text).join('')||'';
-      const info = parseInfoRuns(r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs||[]);
-      const dur = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text||'';
-      const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails||[];
-      tracks.push({ id: videoId, title, artist: info.artist, album: info.album,
-        duration: parseDuration(dur), artworkURL: bestThumbnail(thumbs), type: 'track', source: 'YouTube Music' });
+          ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint ||
+        r.playlistItemData;
+
+      // Detect type by browseId prefix or shelf name
+      let type = 'track';
+      if (browseEp?.browseId) {
+        const bid = browseEp.browseId;
+        if (bid.startsWith('MPREb_') || bid.startsWith('FEmusic_library_privately_owned_release')) type = 'album';
+        else if (bid.startsWith('UC') || bid.startsWith('MPLAUCb') || browseEp.browseEndpointContextSupportedConfigs
+          ?.browseEndpointContextMusicConfig?.pageType === 'MUSIC_PAGE_TYPE_ARTIST') type = 'artist';
+        else if (bid.startsWith('RDAMVM') || bid.startsWith('VL') || bid.startsWith('PL')) type = 'playlist';
+      }
+      if (shelfTitle === 'Albums' || shelfTitle === 'EPs & Singles') type = 'album';
+      if (shelfTitle === 'Artists') type = 'artist';
+      if (shelfTitle === 'Community playlists' || shelfTitle === 'Playlists') type = 'playlist';
+
+      // Duration: fixedColumns first, then parse from col1 runs (last run if it looks like a time)
+      let durationText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer
+        ?.text?.runs?.[0]?.text || '';
+      if (!durationText && col1Runs.length) {
+        const last = col1Runs[col1Runs.length - 1]?.text || '';
+        if (/^\d+:\d{2}(:\d{2})?$/.test(last)) durationText = last;
+      }
+
+      const info = parseInfoRuns(col1Runs);
+
+      if (type === 'track') {
+        const videoId = watchEp?.videoId;
+        if (!videoId) continue;
+        results.push({
+          id: videoId,
+          title,
+          artist: info.artist,
+          album: info.album,
+          duration: parseDuration(durationText),
+          artworkURL,
+          type: 'track',
+        });
+      } else if (type === 'album') {
+        const browseId = browseEp?.browseId;
+        if (!browseId) continue;
+        // artist is in col1 runs — usually first navigable run
+        const artistRun = col1Runs.find(r => r.navigationEndpoint?.browseEndpoint);
+        results.push({
+          id: browseId,
+          title,
+          artist: artistRun?.text || info.artist,
+          artworkURL,
+          type: 'album',
+        });
+      } else if (type === 'artist') {
+        const browseId = browseEp?.browseId;
+        if (!browseId) continue;
+        results.push({
+          id: browseId,
+          name: title,
+          artworkURL,
+          type: 'artist',
+        });
+      } else if (type === 'playlist') {
+        const browseId = browseEp?.browseId || watchEp?.playlistId;
+        if (!browseId) continue;
+        results.push({
+          id: browseId,
+          title,
+          artist: info.artist,
+          artworkURL,
+          type: 'playlist',
+        });
+      }
     }
   }
-  return { tracks, total: tracks.length };
+
+  // Group by type for Eclipse
+  const tracks   = results.filter(r => r.type === 'track');
+  const albums   = results.filter(r => r.type === 'album');
+  const artists  = results.filter(r => r.type === 'artist');
+  const playlists = results.filter(r => r.type === 'playlist');
+
+  return { tracks, albums, artists, playlists, total: results.length };
 }
+
 
 // ─── Player ───────────────────────────────────────────────────────────────────
 
