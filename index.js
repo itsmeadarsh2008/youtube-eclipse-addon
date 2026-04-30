@@ -92,7 +92,7 @@ function extractDurationFromRuns(runs) {
   if (!Array.isArray(runs)) return '';
   for (let i = runs.length - 1; i >= 0; i--) {
     const t = (runs[i]?.text || '').trim();
-    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(t)) return t;
+    if (isDurationText(t)) return t;
   }
   return '';
 }
@@ -104,6 +104,28 @@ function bestThumbnail(thumbnails) {
 
 function isBullet(text) { return /^\s*[•·]\s*$/.test(text || ''); }
 
+// Only accept MM:SS or H:MM:SS — rejects play counts like "1.4B"
+function isDurationText(text) {
+  return /^\d{1,2}:\d{2}(:\d{2})?$/.test((text || '').trim());
+}
+
+// Deep-search helpers — keeps album/playlist parsing resilient to YTM layout changes
+function findDeep(obj, key, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 12) return undefined;
+  if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
+  for (const v of Object.values(obj)) {
+    const r = findDeep(v, key, depth + 1);
+    if (r !== undefined) return r;
+  }
+  return undefined;
+}
+function findAllDeep(obj, key, depth = 0, out = []) {
+  if (!obj || typeof obj !== 'object' || depth > 12) return out;
+  if (Object.prototype.hasOwnProperty.call(obj, key)) out.push(obj[key]);
+  for (const v of Object.values(obj)) findAllDeep(v, key, depth + 1, out);
+  return out;
+}
+
 function parseInfoRuns(runs) {
   if (!runs?.length) return { artist: '', album: '' };
   const parts = [];
@@ -113,7 +135,7 @@ function parseInfoRuns(runs) {
     else cur += (run.text || '');
   }
   if (cur.trim()) parts.push(cur.trim());
-  while (parts.length > 1 && /^\d{1,2}:\d{2}(:\d{2})?$/.test(parts[parts.length - 1])) parts.pop();
+  while (parts.length > 1 && isDurationText(parts[parts.length - 1])) parts.pop();
   const typeLabels = new Set(['Song','Video','EP','Single','Podcast','Album','Playlist','Compilation']);
   let idx = 0;
   if (parts.length > 1 && typeLabels.has(parts[0])) idx = 1;
@@ -145,6 +167,7 @@ function getVideoId(r) {
   if (!r) return null;
   return (
     r.playlistItemData?.videoId ||
+    r.navigationEndpoint?.watchEndpoint?.videoId ||
     r.overlay?.musicItemThumbnailOverlayRenderer?.content
       ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId ||
     r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
@@ -164,9 +187,16 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
   const info = parseInfoRuns(infoRuns);
 
-  const durationText =
-    r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text ||
-    extractDurationFromRuns(infoRuns);
+  // Scan fixedColumns for a valid timestamp — artist pages put play counts here ("1.4B")
+  let durationText = '';
+  for (const col of (r.fixedColumns || [])) {
+    const txt = col?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
+    if (isDurationText(txt)) { durationText = txt; break; }
+  }
+  if (!durationText) durationText = extractDurationFromRuns(infoRuns);
+  if (!durationText && r.lengthMs) {
+    durationText = `${Math.floor(r.lengthMs/60000)}:${String(Math.floor((r.lengthMs%60000)/1000)).padStart(2,'0')}`;
+  }
 
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
 
@@ -179,6 +209,37 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
     artworkURL: bestThumbnail(thumbs) || fallbackArtwork || '',
     format: 'aac',
   };
+}
+
+// ─── parseTrackItem — handles both renderer types ───────────────────────────────
+// Handles musicResponsiveListItemRenderer AND musicListItemRenderer
+function parseTrackItem(item, fallbackArtist, fallbackAlbum, fallbackArtwork) {
+  const r = item?.musicResponsiveListItemRenderer || item?.musicListItemRenderer || null;
+  return parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork);
+}
+
+// ─── Enrich missing durations via get_queue ───────────────────────────────────
+// Artist top-track pages return play counts in fixedColumns, not timestamps.
+// One batch call fills in real durations for any track that came back as 0.
+async function enrichDurations(tracks) {
+  const missing = tracks.filter(t => t.duration === 0);
+  if (!missing.length) return;
+  try {
+    const resp = await fetch(`${YTM_BASE}/youtubei/v1/music/get_queue?key=${YTM_API_KEY}`, {
+      method: 'POST', headers: SEARCH_HEADERS,
+      body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT }, videoIds: missing.map(t => t.id), isAudioOnly: true }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const map  = {};
+    for (const q of (data?.queueDatas || [])) {
+      const pv  = q?.content?.playlistPanelVideoRenderer;
+      const vid = pv?.videoId;
+      const txt = pv?.lengthText?.runs?.[0]?.text;
+      if (vid && txt && isDurationText(txt)) map[vid] = parseDuration(txt);
+    }
+    for (const t of missing) { if (map[t.id]) t.duration = map[t.id]; }
+  } catch (e) { console.log(LOG_PREFIX, 'enrichDurations failed:', e.message); }
 }
 
 // ─── Album item parser (from search shelves) ───────────────────────────────────
@@ -370,15 +431,16 @@ async function handleStream(trackId, env) {
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
   const expiresAt = Math.floor(Date.now() / 1000) + 21600; // YTM signed URLs valid ~6h
 
-  // PRIMARY: direct audio-only AAC from adaptiveFormats.
-  // These are audio-only streams — no video overhead, perfect for a music player.
+  // PRIMARY: HLS manifest — works natively on iOS (AVPlayer), Android (ExoPlayer), web (hls.js).
+  // Direct MP4 adaptiveFormats URLs contain YouTube's 'n' throttle param which requires
+  // client-side JS to decode (yt-dlp style); without it they cap at ~15 kbps.
+  // HLS bypasses the throttle entirely. format:'aac' is correct — Eclipse detects HLS
+  // from the URL pattern; all three players handle it automatically.
+  if (sd.hlsManifestUrl) return { url: sd.hlsManifestUrl, format: 'aac', quality: 'high', expiresAt };
+
+  // FALLBACK: direct audio/mp4 — only reached if YTM returns no HLS manifest (rare).
   const mp4Url = pickBestMp4(sd);
   if (mp4Url) return { url: mp4Url, format: 'aac', quality: 'high', expiresAt };
-
-  // FALLBACK: HLS manifest. YTM HLS includes video tracks too, but AVPlayer on iOS
-  // auto-selects audio and handles it fine. Must be labeled 'hls' not 'aac' so
-  // Eclipse knows to treat it as a manifest, not a raw audio file.
-  if (sd.hlsManifestUrl) return { url: sd.hlsManifestUrl, format: 'hls', quality: 'high', expiresAt };
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
@@ -388,12 +450,14 @@ async function handleStream(trackId, env) {
 async function handleAlbum(albumId, env) {
   const data = await ytmBrowse(albumId, env);
 
-  // Header — try every known renderer variant
+  // Header — try every known renderer variant, deep-search as last resort
   const header =
     data?.header?.musicImmersiveHeaderRenderer ||
     data?.header?.musicDetailHeaderRenderer ||
     data?.header?.musicEditableEntryPointHeaderRenderer?.header?.musicImmersiveHeaderRenderer ||
     data?.header?.musicEditableEntryPointHeaderRenderer?.header?.musicDetailHeaderRenderer ||
+    findDeep(data?.header, 'musicImmersiveHeaderRenderer') ||
+    findDeep(data?.header, 'musicDetailHeaderRenderer') ||
     {};
 
   const albumTitle = header?.title?.runs?.[0]?.text || '';
@@ -411,49 +475,21 @@ async function handleAlbum(albumId, env) {
     header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
 
-  // Collect shelf contents from both layout types
+  // Deep-search for the musicShelfRenderer with the most items.
+  // Handles singleColumn, twoColumn, and any future YTM layout automatically.
   let shelfContents = [];
-
-  // Shape A: singleColumnBrowseResultsRenderer
-  const singleCol = data?.contents?.singleColumnBrowseResultsRenderer;
-  if (singleCol && !shelfContents.length) {
-    const sections = singleCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-    for (const s of sections) {
-      if (s.musicShelfRenderer?.contents?.length) { shelfContents = s.musicShelfRenderer.contents; break; }
-    }
+  for (const shelf of findAllDeep(data?.contents, 'musicShelfRenderer')) {
+    if ((shelf?.contents?.length || 0) > shelfContents.length)
+      shelfContents = shelf.contents;
   }
 
-  // Shape B: twoColumnBrowseResultsRenderer
-  if (!shelfContents.length) {
-    const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
-    if (twoCol) {
-      const candidates = [
-        twoCol?.firstColumn?.musicTwoColumnItemSectionListRenderer?.contents,
-        twoCol?.secondColumn?.sectionListRenderer?.contents,
-        twoCol?.firstColumn?.sectionListRenderer?.contents,
-      ];
-      for (const col of candidates) {
-        if (!col) continue;
-        for (const s of col) {
-          if (s.musicShelfRenderer?.contents?.length) { shelfContents = s.musicShelfRenderer.contents; break; }
-          if (s.musicResponsiveListItemRenderer) { shelfContents = col; break; }
-        }
-        if (shelfContents.length) break;
-      }
-    }
-  }
-
-  // Parse tracks — use shared parseTrackRenderer so videoId logic is unified
+  // Parse tracks
   const tracks = [];
   for (let i = 0; i < shelfContents.length; i++) {
-    const item = shelfContents[i];
-    const r    = item?.musicResponsiveListItemRenderer;
-    if (!r) continue;
-    const t = parseTrackRenderer(r, albumArtist, albumTitle, artworkURL);
+    const t = parseTrackItem(shelfContents[i], albumArtist, albumTitle, artworkURL);
     if (!t) continue;
-    // Album tracks get the album artwork even if thumbnail is missing
     if (!t.artworkURL) t.artworkURL = artworkURL;
-    t.album      = albumTitle;
+    t.album       = albumTitle;
     t.trackNumber = i + 1;
     tracks.push(t);
   }
@@ -494,7 +530,7 @@ async function handleArtist(artistId, env) {
     const shelf = section?.musicShelfRenderer;
     if (shelf) {
       for (const item of shelf.contents || []) {
-        const t = parseTrackRenderer(item.musicResponsiveListItemRenderer, name, '', '');
+        const t = parseTrackItem(item, name, '', '');
         if (t && topTracks.length < 10) topTracks.push(t);
       }
     }
@@ -519,6 +555,10 @@ async function handleArtist(artistId, env) {
     }
   }
 
+  // Artist pages return play counts in fixedColumns (not durations).
+  // Batch-fill real durations via get_queue for any track that came back as 0.
+  if (topTracks.length) await enrichDurations(topTracks);
+
   return {
     id: artistId, name, artworkURL, bio: null,
     topTracks, albums,
@@ -537,6 +577,7 @@ async function handlePlaylist(playlistId, env) {
     data?.header?.musicDetailHeaderRenderer ||
     data?.header?.musicEditableEntryPointHeaderRenderer?.header?.musicDetailHeaderRenderer ||
     data?.header?.musicImmersiveHeaderRenderer ||
+    findDeep(data?.header, 'musicDetailHeaderRenderer') ||
     {};
 
   const title = header?.title?.runs?.[0]?.text || 'Playlist';
@@ -549,22 +590,22 @@ async function handlePlaylist(playlistId, env) {
     header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
 
-  // Tracks live in sectionListRenderer > musicShelfRenderer OR musicPlaylistShelfRenderer
-  const sections =
-    data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
-      ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-
   const tracks = [];
 
-  for (const section of sections) {
-    // Standard shelf
-    const shelf = section?.musicShelfRenderer || section?.musicPlaylistShelfRenderer;
-    if (shelf) {
-      for (const item of shelf.contents || []) {
-        const t = parseTrackRenderer(item.musicResponsiveListItemRenderer);
-        if (t) tracks.push(t);
-      }
-    }
+  // Deep-search both shelf types — handles singleColumn, twoColumn, and future YTM layouts.
+  // YTM switched playlists to twoColumnBrowseResultsRenderer mid-2024.
+  const allShelves = [
+    ...findAllDeep(data?.contents, 'musicPlaylistShelfRenderer'),
+    ...findAllDeep(data?.contents, 'musicShelfRenderer'),
+  ];
+  // Pick the shelf with the most items
+  let bestShelf = null;
+  for (const shelf of allShelves) {
+    if ((shelf?.contents?.length || 0) > (bestShelf?.contents?.length || 0)) bestShelf = shelf;
+  }
+  for (const item of (bestShelf?.contents || [])) {
+    const t = parseTrackItem(item);
+    if (t) tracks.push(t);
   }
 
   return {
@@ -594,7 +635,7 @@ function buildManifest() {
   return {
     id: 'com.ricky.youtube-music',
     name: 'YouTube Music',
-    version: '1.3.0',
+    version: '1.5.0',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS preferred, MP4 fallback.',
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'catalog'],
@@ -827,7 +868,7 @@ export default {
       }
 
       if (pathname === '/health')
-        return jsonRes({ status: 'ok', version: '1.3.0', ts: new Date().toISOString() });
+        return jsonRes({ status: 'ok', version: '1.5.0', ts: new Date().toISOString() });
 
       // Token-scoped routes  /u/:token/...
       const tp = parseTokenPath(pathname);
