@@ -26,23 +26,9 @@ const IOS_CLIENT_BASE = {
 };
 
 const QUALITY = { LOW: 'LOW', HIGH: 'HIGH', LOSSLESS: 'LOSSLESS' };
-
-const QUALITY_OPTIONS = [
-  { label: 'Low (saves data)', value: QUALITY.LOW },
-  { label: 'High',             value: QUALITY.HIGH },
-  { label: 'Best Available',   value: QUALITY.LOSSLESS },
-];
-
-const DOWNLOAD_QUALITY_OPTIONS = [
-  { label: '128 kbps', value: '128' },
-  { label: '320 kbps', value: '320' },
-];
-
 const DOWNLOAD_API_BASE = 'https://capi.y2jar.cc/scr/';
 
 // ─── Token generation ─────────────────────────────────────────────────────────
-// Tokens are cosmetic — they make every generated URL unique so users can
-// share / re-install without collision.  No auth or storage needed.
 
 function generateToken() {
   const arr = new Uint8Array(14);
@@ -132,9 +118,12 @@ async function getVisitorData(env) {
 }
 
 // ─── Search ───────────────────────────────────────────────────────────────────
+// Eclipse calls: GET /search?q={query}
+// Response must use: artworkURL (not albumCover)
 
-async function searchTracks(query, limit, env) {
-  limit = limit || 20;
+async function handleSearch(query, env) {
+  if (!query) return { tracks: [], albums: [], artists: [] };
+
   const response = await fetch(`${YTM_BASE}/youtubei/v1/search?key=${YTM_API_KEY}`, {
     method: 'POST',
     headers: {
@@ -153,6 +142,7 @@ async function searchTracks(query, limit, env) {
   if (!response.ok) throw new Error(`${LOG_PREFIX} Search HTTP ${response.status}`);
   const data = await response.json();
 
+  // Opportunistically cache visitorData
   if (data?.responseContext?.visitorData && env && env.YTM_CACHE) {
     env.YTM_CACHE.put(
       'visitorData',
@@ -170,7 +160,7 @@ async function searchTracks(query, limit, env) {
     const shelf = section.musicShelfRenderer;
     if (!shelf) continue;
     for (const item of shelf.contents || []) {
-      if (tracks.length >= limit) break;
+      if (tracks.length >= 20) break;
       const r = item.musicResponsiveListItemRenderer;
       if (!r) continue;
       const videoId =
@@ -178,6 +168,7 @@ async function searchTracks(query, limit, env) {
         r.overlay?.musicItemThumbnailOverlayRenderer?.content
           ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
       if (!videoId) continue;
+
       const title = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer
         ?.text?.runs?.map(t => t.text).join('') || '';
       const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
@@ -185,24 +176,29 @@ async function searchTracks(query, limit, env) {
       const durationText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer
         ?.text?.runs?.[0]?.text || '';
       const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+
       tracks.push({
         id: videoId,
         title,
         artist: info.artist,
         album: info.album,
         duration: parseDuration(durationText),
-        albumCover: bestThumbnail(thumbs),
+        artworkURL: bestThumbnail(thumbs),   // Eclipse field name
+        format: 'aac',
       });
     }
   }
 
-  return { tracks, total: tracks.length };
+  return { tracks, albums: [], artists: [] };
 }
 
-// ─── Player ───────────────────────────────────────────────────────────────────
+// ─── Stream resolution ────────────────────────────────────────────────────────
+// Eclipse calls: GET /stream/{id}
+// Response must use: url (not streamUrl)
 
 async function fetchPlayerData(trackId, env) {
   const visitorData = await getVisitorData(env);
+
   const response = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -231,48 +227,43 @@ async function fetchPlayerData(trackId, env) {
   return data.streamingData;
 }
 
-function pickMp4Url(sd, quality) {
+function pickMp4Url(sd) {
   const fmts = (sd.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('audio/mp4') && f.url);
   if (!fmts.length) return null;
   fmts.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return quality === QUALITY.LOW ? fmts[fmts.length - 1].url : fmts[0].url;
+  return fmts[0].url;
 }
 
-async function getTrackStreamUrl(trackId, preferredQuality, context, env, forceDirectMp4) {
-  const quality =
-    context?.settings?.quality?.value || preferredQuality || QUALITY.HIGH;
+async function handleStream(trackId, env) {
   const sd = await fetchPlayerData(trackId, env);
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
-  if (!forceDirectMp4 && sd.hlsManifestUrl) {
-    return { streamUrl: sd.hlsManifestUrl, streamType: 'hls', track: { id: trackId, audioQuality: quality } };
+  // Prefer HLS — AVPlayer handles it natively
+  if (sd.hlsManifestUrl) {
+    return {
+      url: sd.hlsManifestUrl,
+      format: 'aac',
+      quality: 'high',
+    };
   }
 
-  const mp4Url = pickMp4Url(sd, quality);
+  // Fallback: direct mp4 audio
+  const mp4Url = pickMp4Url(sd);
   if (mp4Url) {
-    return { streamUrl: mp4Url, streamType: 'mp4', track: { id: trackId, audioQuality: quality } };
+    return {
+      url: mp4Url,
+      format: 'aac',
+      quality: 'high',
+    };
   }
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
-// ─── Download ─────────────────────────────────────────────────────────────────
+// ─── Album details ────────────────────────────────────────────────────────────
+// Eclipse calls: GET /album/{id}
 
-async function getTrackDownloadUrl(trackId, quality, context) {
-  const dlQuality = context?.settings?.downloadQuality?.value || quality || '128';
-  const response = await fetch(`${DOWNLOAD_API_BASE}${trackId}?s=5`);
-  if (!response.ok) throw new Error(`${LOG_PREFIX} Download API HTTP ${response.status}`);
-  const data = await response.json();
-  if (!data.downloadUrl) throw new Error(`${LOG_PREFIX} No download URL for ${trackId}`);
-  return {
-    streamUrl: data.downloadUrl,
-    track: { id: trackId, audioQuality: dlQuality === '320' ? QUALITY.HIGH : QUALITY.LOW },
-  };
-}
-
-// ─── Album ────────────────────────────────────────────────────────────────────
-
-async function getAlbum(albumId, env) {
+async function handleAlbum(albumId, env) {
   const response = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${YTM_API_KEY}`, {
     method: 'POST',
     headers: {
@@ -305,9 +296,10 @@ async function getAlbum(albumId, env) {
       if (run.navigationEndpoint?.browseEndpoint) { albumArtist = run.text; break; }
     }
   }
-  const albumCover = bestThumbnail(
+  const artworkURL = bestThumbnail(
     header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []
   );
+
   const contents =
     data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
       ?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]
@@ -327,55 +319,42 @@ async function getAlbum(albumId, env) {
           r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer
             ?.text?.runs?.[0]?.text || ''
         ),
-        albumCover,
+        artworkURL,            // Eclipse field name
+        format: 'aac',
       };
     });
 
-  return { album: { id: albumId, title: albumTitle, artist: albumArtist, albumCover }, tracks };
+  return {
+    id: albumId,
+    title: albumTitle,
+    artist: albumArtist,
+    artworkURL,               // Eclipse field name
+    trackCount: tracks.length,
+    tracks,
+  };
 }
 
-// ─── Manifest builder ─────────────────────────────────────────────────────────
-// tokenBase is either `origin/u/:token` (token URLs) or `origin` (base URL).
+// ─── Eclipse manifest ─────────────────────────────────────────────────────────
+// Eclipse strips /manifest.json from the URL and uses the rest as base URL.
+// So token-based URL /u/:token/manifest.json → base /u/:token → Eclipse calls
+// /u/:token/search, /u/:token/stream/:id, /u/:token/album/:id  automatically.
 
-function buildManifest(tokenBase) {
+function buildManifest() {
   return {
-    id: 'youtube-music',
+    id: 'com.ricky.youtube-music',
     name: 'YouTube Music',
-    author: 'ricky',
     version: '1.0.0',
-    labels: ['YT Music', 'Audio', 'Download', 'Settings'],
-    description: 'Stream and download from YouTube Music. HLS preferred with automatic mp4 fallback.',
-    noPrefetch: true,
-    noStreamCache: true,
-    settings: {
-      quality: {
-        type: 'selector',
-        label: 'Audio Quality',
-        description: 'Select preferred streaming quality',
-        logo: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-        options: QUALITY_OPTIONS,
-        defaultValue: QUALITY.HIGH,
-      },
-      downloadQuality: {
-        type: 'selector',
-        label: 'Download Quality',
-        description: 'Quality label for downloaded tracks (cosmetic only)',
-        options: DOWNLOAD_QUALITY_OPTIONS,
-        defaultValue: '128',
-      },
-    },
-    endpoints: {
-      searchTracks:      `${tokenBase}/api/search`,
-      getTrackStreamUrl: `${tokenBase}/api/stream`,
-      getTrackDownloadUrl: `${tokenBase}/api/download`,
-      getAlbum:          `${tokenBase}/api/album`,
-    },
+    description: 'Stream and download from YouTube Music. HLS preferred, MP4 fallback.',
+    icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
+    resources: ['search', 'stream', 'catalog'],
+    types: ['track', 'album'],
+    contentType: 'music',
   };
 }
 
 // ─── Landing page ─────────────────────────────────────────────────────────────
 
-function buildPage(origin) {
+function buildPage() {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -424,7 +403,6 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
 </head>
 <body>
 
-<!-- ── Main card ── -->
 <div class="card">
   <svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-bottom:22px">
     <circle cx="26" cy="26" r="26" fill="#ff0000"/>
@@ -436,7 +414,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </svg>
 
   <h1>YouTube Music for Eclipse</h1>
-  <p class="sub">Stream and download from the full YouTube Music catalog &mdash; HLS preferred, MP4 fallback. No account required.</p>
+  <p class="sub">Stream from the full YouTube Music catalog &mdash; HLS preferred, MP4 fallback. No account required.</p>
 
   <div class="tip"><b>Save your URL.</b> Paste it below any time to copy it again without reinstalling.</div>
 
@@ -444,8 +422,8 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill">Tracks &middot; Albums</span>
     <span class="pill hi">HLS Playback</span>
     <span class="pill hi">MP4 Fallback</span>
-    <span class="pill bl">Download</span>
-    <span class="pill bl">Settings</span>
+    <span class="pill bl">Catalog Browse</span>
+    <span class="pill bl">Default Playback</span>
   </div>
 
   <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>
@@ -475,82 +453,57 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>
     <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
-    <div class="step"><div class="sn">4</div><div class="st">Search YouTube Music&rsquo;s full catalog &mdash; HLS streams load automatically</div></div>
+    <div class="step"><div class="sn">4</div><div class="st">Search YouTube Music&rsquo;s full catalog &mdash; streams load automatically</div></div>
   </div>
 
-  <div class="warn">Stream priority: <b>HLS manifest</b> (native iOS/AVPlayer) &rarr; <b>Direct MP4</b> fallback. YouTube stream URLs expire &mdash; the worker never caches them.</div>
+  <div class="warn">Stream priority: <b>HLS manifest</b> &rarr; <b>Direct MP4 audio</b> fallback. YouTube URLs expire &mdash; the worker never caches them.</div>
 </div>
 
-<footer>
-  YouTube Music for Eclipse v1.0.0 &bull; by ricky &bull; Cloudflare Workers
-</footer>
+<footer>YouTube Music for Eclipse v1.0.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 
 <script>
-var genUrl = null;
-var refUrl = null;
-
-function generate() {
-  var btn = document.getElementById('genBtn');
-  btn.disabled = true;
-  btn.textContent = 'Generating...';
-  fetch('/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) { alert(d.error); btn.disabled = false; btn.textContent = 'Generate My Addon URL'; return; }
-      genUrl = d.manifestUrl;
-      document.getElementById('genUrl').textContent = genUrl;
-      document.getElementById('genBox').style.display = 'block';
-      btn.disabled = false;
-      btn.textContent = 'Regenerate URL';
+var genUrl=null,refUrl=null;
+function generate(){
+  var btn=document.getElementById('genBtn');
+  btn.disabled=true;btn.textContent='Generating...';
+  fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Generate My Addon URL';return;}
+      genUrl=d.manifestUrl;
+      document.getElementById('genUrl').textContent=genUrl;
+      document.getElementById('genBox').style.display='block';
+      btn.disabled=false;btn.textContent='Regenerate URL';
     })
-    .catch(function(e) { alert('Error: ' + e.message); btn.disabled = false; btn.textContent = 'Generate My Addon URL'; });
+    .catch(function(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate My Addon URL';});
 }
-
-function copyGen() {
-  if (!genUrl) return;
-  var btn = document.getElementById('copyGenBtn');
-  copyText(genUrl, btn);
-}
-
-function doRefresh() {
-  var eu = document.getElementById('existingUrl').value.trim();
-  if (!eu) { alert('Paste your existing addon URL first.'); return; }
-  var btn = document.getElementById('refBtn');
-  btn.disabled = true;
-  btn.textContent = 'Refreshing...';
-  fetch('/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ existingUrl: eu }) })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) { alert(d.error); btn.disabled = false; btn.textContent = 'Refresh Existing URL'; return; }
-      refUrl = d.manifestUrl;
-      document.getElementById('refUrl').textContent = refUrl;
-      document.getElementById('refBox').style.display = 'block';
-      btn.disabled = false;
-      btn.textContent = 'Refresh Again';
+function copyGen(){if(!genUrl)return;copyText(genUrl,document.getElementById('copyGenBtn'));}
+function doRefresh(){
+  var eu=document.getElementById('existingUrl').value.trim();
+  if(!eu){alert('Paste your existing addon URL first.');return;}
+  var btn=document.getElementById('refBtn');
+  btn.disabled=true;btn.textContent='Refreshing...';
+  fetch('/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({existingUrl:eu})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Refresh Existing URL';return;}
+      refUrl=d.manifestUrl;
+      document.getElementById('refUrl').textContent=refUrl;
+      document.getElementById('refBox').style.display='block';
+      btn.disabled=false;btn.textContent='Refresh Again';
     })
-    .catch(function(e) { alert('Error: ' + e.message); btn.disabled = false; btn.textContent = 'Refresh Existing URL'; });
+    .catch(function(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Refresh Existing URL';});
 }
-
-function copyRef() {
-  if (!refUrl) return;
-  var btn = document.getElementById('copyRefBtn');
-  copyText(refUrl, btn);
-}
-
-function copyText(text, btn) {
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(function() {
-      var orig = btn.textContent;
-      btn.textContent = 'Copied!';
-      setTimeout(function() { btn.textContent = orig; }, 1500);
+function copyRef(){if(!refUrl)return;copyText(refUrl,document.getElementById('copyRefBtn'));}
+function copyText(text,btn){
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(function(){
+      var o=btn.textContent;btn.textContent='Copied!';setTimeout(function(){btn.textContent=o;},1500);
     });
   } else {
-    var ta = document.createElement('textarea');
-    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-    var orig = btn.textContent;
-    btn.textContent = 'Copied!';
-    setTimeout(function() { btn.textContent = orig; }, 1500);
+    var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+    document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);
+    var o=btn.textContent;btn.textContent='Copied!';setTimeout(function(){btn.textContent=o;},1500);
   }
 }
 </script>
@@ -574,17 +527,60 @@ function jsonRes(data, status) {
 }
 
 function htmlRes(body) {
-  return new Response(body, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+  return new Response(body, {
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+  });
 }
 
-// ─── Route helpers ────────────────────────────────────────────────────────────
+// ─── Route matching helpers ────────────────────────────────────────────────────
 
-// Parses /u/:token from a pathname and returns { token, rest }
-// e.g. /u/abc123.../api/search → { token: 'abc123...', rest: '/api/search' }
+// Parses /u/:token from a pathname prefix.
+// Returns { token, rest } where rest is the path after the token segment.
+// e.g. /u/abc.../search  →  { token: 'abc...', rest: '/search' }
+//      /u/abc.../stream/videoId  →  { token: 'abc...', rest: '/stream/videoId' }
 function parseTokenPath(pathname) {
   const m = pathname.match(/^\/u\/([a-f0-9]{28})(\/.*)?$/);
   if (!m) return null;
   return { token: m[1], rest: m[2] || '/' };
+}
+
+// Extract path param from the end: /stream/VIDEO_ID → VIDEO_ID
+function lastSegment(rest) {
+  const parts = rest.split('/').filter(Boolean);
+  return parts[parts.length - 1] || '';
+}
+
+// ─── Core route handler ───────────────────────────────────────────────────────
+// Handles either base routes or token-scoped routes identically.
+
+async function handleRoute(rest, url, env) {
+  const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
+
+  // GET /manifest.json
+  if (rest === '/manifest.json' || rest === '/manifest') {
+    return jsonRes(buildManifest());
+  }
+
+  // GET /search?q={query}   — Eclipse search
+  if (rest === '/search') {
+    return jsonRes(await handleSearch(q, env));
+  }
+
+  // GET /stream/{id}   — Eclipse stream resolution
+  if (rest.startsWith('/stream/')) {
+    const trackId = lastSegment(rest);
+    if (!trackId) return jsonRes({ error: 'Missing track ID' }, 400);
+    return jsonRes(await handleStream(trackId, env));
+  }
+
+  // GET /album/{id}   — Eclipse album browse
+  if (rest.startsWith('/album/')) {
+    const albumId = lastSegment(rest);
+    if (!albumId) return jsonRes({ error: 'Missing album ID' }, 400);
+    return jsonRes(await handleAlbum(albumId, env));
+  }
+
+  return null; // not matched
 }
 
 // ─── Worker entry ─────────────────────────────────────────────────────────────
@@ -608,104 +604,53 @@ export default {
 
     try {
       // ── Landing page
-      if (pathname === '/') return htmlRes(buildPage(url.origin));
-
-      // ── Base manifest (no token)
-      if (pathname === '/manifest.json') return jsonRes(buildManifest(url.origin));
+      if (pathname === '/') return htmlRes(buildPage());
 
       // ── Generate a unique token URL
+      // POST /generate → { token, manifestUrl }
       if (pathname === '/generate' && request.method === 'POST') {
         const token = generateToken();
-        const tokenBase = `${url.origin}/u/${token}`;
-        return jsonRes({ token, manifestUrl: `${tokenBase}/manifest.json` });
+        return jsonRes({
+          token,
+          manifestUrl: `${url.origin}/u/${token}/manifest.json`,
+        });
       }
 
-      // ── Refresh: extract token from an existing URL and return it again
+      // ── Refresh: extract token from an existing URL and echo it back
+      // POST /refresh { existingUrl } → { token, manifestUrl }
       if (pathname === '/refresh' && request.method === 'POST') {
         let body = {};
         try { body = await request.json(); } catch {}
         const raw = String(body.existingUrl || '').trim();
-        const m = raw.match(/\/u\/([a-f0-9]{28})\/manifest\.json/);
-        if (!m) return jsonRes({ error: 'Paste your full addon URL (must contain /u/{token}/manifest.json).' }, 400);
+        const m = raw.match(/\/u\/([a-f0-9]{28})/);
+        if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain /u/{token}/.' }, 400);
         const token = m[1];
-        const tokenBase = `${url.origin}/u/${token}`;
-        return jsonRes({ token, manifestUrl: `${tokenBase}/manifest.json`, refreshed: true });
+        return jsonRes({
+          token,
+          manifestUrl: `${url.origin}/u/${token}/manifest.json`,
+          refreshed: true,
+        });
       }
 
-      // ── Token-scoped routes: /u/:token/...
-      const tp = parseTokenPath(pathname);
-      if (tp) {
-        const { token, rest } = tp;
-        if (!isValidToken(token)) return jsonRes({ error: 'Invalid token.' }, 400);
-        const tokenBase = `${url.origin}/u/${token}`;
-
-        // Token-scoped manifest
-        if (rest === '/manifest.json') return jsonRes(buildManifest(tokenBase));
-
-        // Token-scoped API
-        if (rest === '/api/search') {
-          const q = url.searchParams.get('query') || url.searchParams.get('q') || '';
-          const limit = Math.min(Number(url.searchParams.get('limit') || '20'), 50);
-          if (!q) return jsonRes({ tracks: [], total: 0 });
-          return jsonRes(await searchTracks(q, limit, env));
-        }
-
-        if (rest === '/api/stream') {
-          const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
-          if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
-          const quality = url.searchParams.get('quality') || QUALITY.HIGH;
-          const forceDirectMp4 = url.searchParams.get('forceDirectMp4') === 'true';
-          return jsonRes(await getTrackStreamUrl(trackId, quality, {}, env, forceDirectMp4));
-        }
-
-        if (rest === '/api/download') {
-          const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
-          if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
-          const quality = url.searchParams.get('quality') || '128';
-          return jsonRes(await getTrackDownloadUrl(trackId, quality, {}));
-        }
-
-        if (rest === '/api/album') {
-          const albumId = url.searchParams.get('albumId') || url.searchParams.get('id');
-          if (!albumId) return jsonRes({ error: 'Missing albumId' }, 400);
-          return jsonRes(await getAlbum(albumId, env));
-        }
-
-        return jsonRes({ error: 'Not found' }, 404);
-      }
-
-      // ── Base API routes (no token — works too)
-      if (pathname === '/api/search') {
-        const q = url.searchParams.get('query') || url.searchParams.get('q') || '';
-        const limit = Math.min(Number(url.searchParams.get('limit') || '20'), 50);
-        if (!q) return jsonRes({ tracks: [], total: 0 });
-        return jsonRes(await searchTracks(q, limit, env));
-      }
-
-      if (pathname === '/api/stream') {
-        const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
-        if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
-        const quality = url.searchParams.get('quality') || QUALITY.HIGH;
-        const forceDirectMp4 = url.searchParams.get('forceDirectMp4') === 'true';
-        return jsonRes(await getTrackStreamUrl(trackId, quality, {}, env, forceDirectMp4));
-      }
-
-      if (pathname === '/api/download') {
-        const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
-        if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
-        const quality = url.searchParams.get('quality') || '128';
-        return jsonRes(await getTrackDownloadUrl(trackId, quality, {}));
-      }
-
-      if (pathname === '/api/album') {
-        const albumId = url.searchParams.get('albumId') || url.searchParams.get('id');
-        if (!albumId) return jsonRes({ error: 'Missing albumId' }, 400);
-        return jsonRes(await getAlbum(albumId, env));
-      }
-
+      // ── Health check
       if (pathname === '/health') {
         return jsonRes({ status: 'ok', version: '1.0.0', ts: new Date().toISOString() });
       }
+
+      // ── Token-scoped routes: /u/:token/{rest}
+      // Eclipse stores /u/:token/manifest.json, strips /manifest.json,
+      // then calls /u/:token/search, /u/:token/stream/:id, /u/:token/album/:id
+      const tp = parseTokenPath(pathname);
+      if (tp) {
+        if (!isValidToken(tp.token)) return jsonRes({ error: 'Invalid token.' }, 400);
+        const result = await handleRoute(tp.rest, url, env);
+        if (result) return result;
+        return jsonRes({ error: 'Not found' }, 404);
+      }
+
+      // ── Base (tokenless) routes — also works directly
+      const baseResult = await handleRoute(pathname, url, env);
+      if (baseResult) return baseResult;
 
       return jsonRes({ error: 'Not found' }, 404);
 
