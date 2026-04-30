@@ -1,24 +1,24 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.3.1
+// author: ricky | version: 1.4.1
 const LOG_PREFIX = '[YTMusic]';
-const YTM_BASE = 'https://music.youtube.com';
+const YTM_BASE   = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 const VISITOR_TTL_SEC = 1200;
 
 const WEB_REMIX_CONTEXT = {
-  clientName: 'WEB_REMIX',
+  clientName:    'WEB_REMIX',
   clientVersion: '1.20260304.03.00',
   hl: 'en',
   gl: 'US',
 };
 
 const IOS_CLIENT_BASE = {
-  clientName: 'IOS',
+  clientName:    'IOS',
   clientVersion: '20.10.01',
-  deviceMake: 'Apple',
-  deviceModel: 'iPhone16,2',
-  osName: 'iPhone',
-  osVersion: '18.3.2.22D82',
+  deviceMake:    'Apple',
+  deviceModel:   'iPhone16,2',
+  osName:        'iPhone',
+  osVersion:     '18.3.2.22D82',
   hl: 'en',
 };
 
@@ -32,7 +32,7 @@ const SEARCH_PARAMS = {
 
 const SEARCH_HEADERS = {
   'Content-Type': 'application/json',
-  'Origin': YTM_BASE,
+  'Origin':  YTM_BASE,
   'Referer': `${YTM_BASE}/`,
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 };
@@ -92,11 +92,19 @@ function parseDuration(text) {
   return parts[0] || 0;
 }
 
+// FIX 1 (part A): Validate that a string really is a timestamp (e.g. "3:47",
+// "1:02:33") before treating it as a duration. Artist-page fixedColumns[0]
+// contains play-count strings like "1.4B" — without this guard those get fed
+// into parseDuration and return 0, showing 0:00 on every top track.
+function isDurationText(text) {
+  return /^\d{1,2}:\d{2}(:\d{2})?$/.test((text || '').trim());
+}
+
 function extractDurationFromRuns(runs) {
   if (!Array.isArray(runs)) return '';
   for (let i = runs.length - 1; i >= 0; i--) {
     const t = (runs[i]?.text || '').trim();
-    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(t)) return t;
+    if (isDurationText(t)) return t;
   }
   return '';
 }
@@ -121,7 +129,8 @@ function parseInfoRuns(runs) {
     } else cur += (run.text || '');
   }
   if (cur.trim()) parts.push(cur.trim());
-  while (parts.length > 1 && /^\d{1,2}:\d{2}(:\d{2})?$/.test(parts[parts.length - 1])) parts.pop();
+  // Use isDurationText so play-count strings ("1.4B") are never stripped
+  while (parts.length > 1 && isDurationText(parts[parts.length - 1])) parts.pop();
   const typeLabels = new Set(['Song','Video','EP','Single','Podcast','Album','Playlist','Compilation']);
   let idx = 0;
   if (parts.length > 1 && typeLabels.has(parts[0])) idx = 1;
@@ -161,20 +170,40 @@ function getVideoId(r) {
   );
 }
 
+// FIX 1 (part B): Duration waterfall for artist-page top tracks.
+// fixedColumns[0] on artist pages holds a play-count ("1.4B"), not a timestamp.
+// We now validate it with isDurationText() before using it, then fall through:
+//   fixedCol (only if MM:SS / HH:MM:SS)
+//   → flex[1] info runs (has duration at end for most track types)
+//   → flex[2] runs (some layouts put duration here)
+//   → r.lengthMs  (raw millisecond field present on some responses)
 function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   if (!r) return null;
   const videoId = getVideoId(r);
   if (!videoId) return null;
-  const titleRuns  = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-  const title      = titleRuns.map(t => t.text).join('').trim();
-  const infoRuns   = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-  const info       = parseInfoRuns(infoRuns);
+
+  const titleRuns = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+  const title     = titleRuns.map(t => t.text).join('').trim();
+
+  const infoRuns  = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+  const info      = parseInfoRuns(infoRuns);
+
+  const flex2Runs = r.flexColumns?.[2]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+
+  const fixedText = r.fixedColumns?.[0]
+    ?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
+
   const durationText =
-    r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text ||
-    extractDurationFromRuns(infoRuns);
+    (isDurationText(fixedText) ? fixedText : '') ||
+    extractDurationFromRuns(infoRuns)             ||
+    extractDurationFromRuns(flex2Runs)            ||
+    (r.lengthMs
+      ? `${Math.floor(r.lengthMs / 60000)}:${String(Math.floor((r.lengthMs % 60000) / 1000)).padStart(2, '0')}`
+      : '');
+
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
   return {
-    id: videoId,
+    id:         videoId,
     title:      title || 'Unknown',
     artist:     info.artist     || fallbackArtist  || '',
     album:      info.album      || fallbackAlbum   || '',
@@ -184,7 +213,7 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   };
 }
 
-// ─── Album item parser (from search shelves) ──────────────────────────────────
+// ─── Album item parser (from search shelves / carousel) ───────────────────────
 function parseAlbumItem(item) {
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
@@ -205,7 +234,14 @@ function parseAlbumItem(item) {
   }
   const r = item?.musicResponsiveListItemRenderer;
   if (r) {
-    const id = r.navigationEndpoint?.browseEndpoint?.browseId;
+    // Try all known browseId locations for list-style album items
+    const id =
+      r.navigationEndpoint?.browseEndpoint?.browseId ||
+      r.overlay?.musicItemThumbnailOverlayRenderer?.content
+        ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId ||
+      (r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [])
+        .map(run => run.navigationEndpoint?.browseEndpoint?.browseId).find(Boolean) ||
+      null;
     if (!id) return null;
     const title    = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text || '';
     const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
@@ -339,8 +375,8 @@ async function fetchPlayerData(trackId, env) {
       'User-Agent': 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
     },
     body: JSON.stringify({
-      context:       { client: buildIosContext(visitorData) },
-      videoId:       trackId,
+      context:        { client: buildIosContext(visitorData) },
+      videoId:        trackId,
       contentCheckOk: true,
       racyCheckOk:    true,
     }),
@@ -366,18 +402,15 @@ async function handleStream(trackId, env) {
   const sd = await fetchPlayerData(trackId, env);
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
-  const expiresAt = Math.floor(Date.now() / 1000) + 21600; // ~6h
+  const expiresAt = Math.floor(Date.now() / 1000) + 21600;
 
-  // PRIMARY: HLS manifest — no 'n' param throttle, works natively on iOS,
-  // Android (ExoPlayer) and PC (Eclipse's HLS player). Eclipse reads
-  // format:'hls' and routes to its HLS player on all platforms.
+  // PRIMARY: HLS manifest — works natively on iOS/AVPlayer, Android ExoPlayer,
+  // and Eclipse's HLS player on all platforms.
   if (sd.hlsManifestUrl) {
     return { url: sd.hlsManifestUrl, format: 'hls', quality: 'high', expiresAt };
   }
 
   // FALLBACK: direct audio-only AAC from adaptiveFormats.
-  // Note: these URLs contain YouTube's 'n' param which can throttle bandwidth
-  // if not decoded — used only when HLS is unavailable.
   const mp4Url = pickBestMp4(sd);
   if (mp4Url) {
     return { url: mp4Url, format: 'aac', quality: 'high', expiresAt };
@@ -410,48 +443,54 @@ async function handleAlbum(albumId, env) {
     header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
 
-  // Collect shelf contents from both layout types
+  // Collect shelf contents — try both response shapes
   let shelfContents = [];
 
   // Shape A: singleColumnBrowseResultsRenderer
   const singleCol = data?.contents?.singleColumnBrowseResultsRenderer;
-  if (singleCol && !shelfContents.length) {
+  if (singleCol) {
     const sections = singleCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
     for (const s of sections) {
       if (s.musicShelfRenderer?.contents?.length) { shelfContents = s.musicShelfRenderer.contents; break; }
     }
   }
 
-  // Shape B: twoColumnBrowseResultsRenderer
+  // FIX 2: Shape B — twoColumnBrowseResultsRenderer
+  // The old code used spread `[...col1, ...col2]` which throws when a column is
+  // undefined, and also mistakenly set shelfContents to the *sections* array
+  // rather than the *track items* inside musicShelfRenderer.contents.
+  // We now iterate each column candidate safely and only assign the actual
+  // track items (musicShelfRenderer.contents), never the section wrapper.
   if (!shelfContents.length) {
     const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
     if (twoCol) {
-      const candidates = [
-        twoCol?.firstColumn?.musicTwoColumnItemSectionListRenderer?.contents,
+      const colCandidates = [
         twoCol?.secondColumn?.sectionListRenderer?.contents,
         twoCol?.firstColumn?.sectionListRenderer?.contents,
+        twoCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents,
       ];
-      for (const col of candidates) {
+      outer: for (const col of colCandidates) {
         if (!col) continue;
         for (const s of col) {
-          if (s.musicShelfRenderer?.contents?.length) { shelfContents = s.musicShelfRenderer.contents; break; }
-          if (s.musicResponsiveListItemRenderer)       { shelfContents = col; break; }
+          if (s.musicShelfRenderer?.contents?.length) {
+            shelfContents = s.musicShelfRenderer.contents;
+            break outer;
+          }
         }
-        if (shelfContents.length) break;
       }
     }
   }
 
+  // Parse tracks
   const tracks = [];
   for (let i = 0; i < shelfContents.length; i++) {
-    const item = shelfContents[i];
-    const r    = item?.musicResponsiveListItemRenderer;
+    const r = shelfContents[i]?.musicResponsiveListItemRenderer;
     if (!r) continue;
     const t = parseTrackRenderer(r, albumArtist, albumTitle, artworkURL);
     if (!t) continue;
     if (!t.artworkURL) t.artworkURL = artworkURL;
-    t.album        = albumTitle;
-    t.trackNumber  = i + 1;
+    t.album       = albumTitle;
+    t.trackNumber = i + 1;
     tracks.push(t);
   }
 
@@ -478,7 +517,10 @@ async function handleArtist(artistId, env) {
   const topTracks = [], albums = [];
 
   for (const section of sections) {
-    const shelf   = section?.musicShelfRenderer;
+    // Top Songs — musicShelfRenderer
+    // FIX 1 is applied inside parseTrackRenderer — play-counts are now
+    // rejected and the duration waterfall finds the real timestamp.
+    const shelf    = section?.musicShelfRenderer;
     const carousel = section?.musicCarouselShelfRenderer;
 
     if (shelf) {
@@ -517,16 +559,38 @@ async function handlePlaylist(playlistId, env) {
     header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
 
-  const sections = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
-    ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-
   const tracks = [];
-  for (const section of sections) {
-    const shelf = section?.musicShelfRenderer || section?.musicPlaylistShelfRenderer;
-    if (shelf) {
+
+  // Helper: pull tracks out of a sections array regardless of shelf type
+  function drainSections(sections) {
+    for (const section of sections) {
+      const shelf = section?.musicShelfRenderer || section?.musicPlaylistShelfRenderer;
+      if (!shelf) continue;
       for (const item of shelf.contents || []) {
         const t = parseTrackRenderer(item.musicResponsiveListItemRenderer);
         if (t) tracks.push(t);
+      }
+    }
+  }
+
+  // Shape A: singleColumnBrowseResultsRenderer
+  const singleSections = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
+    ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+  drainSections(singleSections);
+
+  // FIX 3: Shape B — twoColumnBrowseResultsRenderer
+  // Large playlists and user-created playlists now commonly return this layout.
+  // The old code only checked singleColumn so these always returned 0 tracks.
+  if (!tracks.length) {
+    const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
+    if (twoCol) {
+      const colCandidates = [
+        twoCol?.firstColumn?.sectionListRenderer?.contents,
+        twoCol?.secondColumn?.sectionListRenderer?.contents,
+        twoCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents,
+      ];
+      for (const col of colCandidates) {
+        if (col) drainSections(col);
       }
     }
   }
@@ -560,7 +624,7 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.3.1',
+    version:     '1.4.1',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS primary, MP4 fallback.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog'],
@@ -705,7 +769,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream priority: <b>HLS &rarr; MP4</b>. visitorData cached 20 min via Upstash Redis.</div>
 </div>
-<footer>YouTube Music for Eclipse v1.3.1 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.4.1 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -773,16 +837,13 @@ export default {
     }
 
     try {
-      // Landing page
       if (pathname === '/') return htmlRes(buildPage());
 
-      // Token generation
       if (pathname === '/generate' && request.method === 'POST') {
         const token = generateToken();
         return jsonRes({ token, manifestUrl: `${url.origin}/u/${token}/manifest.json` });
       }
 
-      // Token refresh (re-derive manifest URL from existing token in URL)
       if (pathname === '/refresh' && request.method === 'POST') {
         let body;
         try { body = await request.json(); } catch {}
@@ -792,8 +853,7 @@ export default {
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
 
-      // Health check
-      if (pathname === '/health') return jsonRes({ status: 'ok', version: '1.3.1', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status: 'ok', version: '1.4.1', ts: new Date().toISOString() });
 
       // Token-scoped routes: /u/<token>/...
       const tp = parseTokenPath(pathname);
@@ -804,7 +864,7 @@ export default {
         return jsonRes({ error: 'Not found', path: tp.rest }, 404);
       }
 
-      // Tokenless direct testing (e.g. /manifest.json, /search?q=...)
+      // Tokenless direct testing
       const base = await handleRoute(pathname, url, env);
       if (base) return base;
 
