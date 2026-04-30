@@ -1,20 +1,9 @@
-// eclipse-ytmusic — single-file Cloudflare Worker
-// Landing page + Eclipse-compatible API + Upstash Redis visitor-data cache
-//
-// Env vars (set via: npx wrangler secret put REDIS_URL / REDIS_TOKEN):
-//   REDIS_URL   — Upstash Redis REST URL  (https://xxx.upstash.io)
-//   REDIS_TOKEN — Upstash Redis REST token
+const LOG_PREFIX = '[YTMusic]';
+const YTM_BASE = 'https://music.youtube.com';
+const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
+const VISITOR_DATA_TTL_MS = 20 * 60 * 1000;
 
-import { Redis } from '@upstash/redis/cloudflare';
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-const YTM_BASE     = 'https://music.youtube.com';
-const YTM_API_KEY  = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
-const DOWNLOAD_API = 'https://capi.y2jar.cc/scr/';
-const VD_KEY       = 'ytm:visitorData';
-const VD_TTL_S     = 20 * 60;
-
-const WEB_REMIX_CTX = {
+const WEB_REMIX_CONTEXT = {
   clientName: 'WEB_REMIX',
   clientVersion: '1.20260304.03.00',
   hl: 'en',
@@ -31,752 +20,717 @@ const IOS_CLIENT_BASE = {
   hl: 'en',
 };
 
-// ─── Embedded HTML ────────────────────────────────────────────────────────────
-const HTML = `<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>YouTube Music · Eclipse Addon</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-:root,[data-theme="light"]{--bg:#f5f4f0;--surface:#faf9f6;--surface-2:#ffffff;--border:#ddd9d3;--text:#1a1917;--muted:#7a7874;--red:#c7372b;--red-h:#a82b20;--red-glow:rgba(199,55,43,.18);--shadow-sm:0 1px 3px rgba(0,0,0,.08);--r:12px;--rsm:8px;--rfull:9999px;--trans:180ms cubic-bezier(.16,1,.3,1);--font-d:'Space Grotesk',sans-serif;--font-b:'Inter',sans-serif}
-[data-theme="dark"]{--bg:#0f0f0e;--surface:#161614;--surface-2:#1d1c1a;--border:#2a2926;--text:#e8e6e3;--muted:#7a7874;--red:#ff4e42;--red-h:#ff6a5f;--red-glow:rgba(255,78,66,.22);--shadow-sm:0 1px 3px rgba(0,0,0,.3)}
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
-body{min-height:100dvh;background:var(--bg);color:var(--text);font-family:var(--font-b);font-size:16px;line-height:1.6;display:flex;flex-direction:column}
-button,input{font:inherit;color:inherit}button{cursor:pointer;border:none;background:none}
-:focus-visible{outline:2px solid var(--red);outline-offset:3px;border-radius:4px}
-a{color:var(--red);text-decoration:none}
-.wrap{max-width:860px;margin-inline:auto;padding-inline:clamp(16px,5vw,40px)}
-header{position:sticky;top:0;z-index:100;background:color-mix(in oklab,var(--bg) 85%,transparent);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
-.hdr{display:flex;align-items:center;justify-content:space-between;padding-block:14px}
-.logo{display:flex;align-items:center;gap:10px;font-family:var(--font-d);font-size:18px;font-weight:700;color:var(--text)}
-.logo-sub{color:var(--muted);font-weight:400}
-.tbtn{width:36px;height:36px;border-radius:var(--rfull);display:flex;align-items:center;justify-content:center;color:var(--muted);transition:background var(--trans),color var(--trans)}
-.tbtn:hover{background:var(--surface-2);color:var(--text)}
-.hero{padding-block:clamp(48px,8vw,96px) clamp(32px,5vw,56px);text-align:center}
-.badge{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500;color:var(--muted);background:var(--surface);border:1px solid var(--border);padding:4px 12px;border-radius:var(--rfull);margin-bottom:20px}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--red);box-shadow:0 0 0 3px var(--red-glow);animation:pulse 2.2s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-h1{font-family:var(--font-d);font-size:clamp(2rem,5vw,3.5rem);font-weight:700;letter-spacing:-.03em;line-height:1.1;margin-bottom:16px}
-h1 em{font-style:normal;color:var(--red)}
-.sub{max-width:52ch;margin-inline:auto;font-size:clamp(15px,2vw,17px);color:var(--muted)}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:clamp(20px,3vw,32px);box-shadow:var(--shadow-sm)}
-section{padding-bottom:clamp(32px,5vw,56px)}
-h2{font-family:var(--font-d);font-size:clamp(18px,2.5vw,22px);font-weight:700;letter-spacing:-.02em;margin-bottom:16px}
-.lbl{font-family:var(--font-d);font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
-.hint{font-size:14px;color:var(--muted);margin-bottom:18px}.hint strong{color:var(--text)}
-.row{display:flex;gap:10px;flex-wrap:wrap}
-.ipt{flex:1;min-width:0;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--rsm);padding:10px 14px;font-size:13px;font-family:ui-monospace,monospace;color:var(--text);transition:border-color var(--trans),box-shadow var(--trans)}
-.ipt:focus{outline:none;border-color:var(--red);box-shadow:0 0 0 3px var(--red-glow)}
-.btn{padding:10px 20px;border-radius:var(--rsm);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:7px;white-space:nowrap;transition:background var(--trans),transform var(--trans),box-shadow var(--trans)}
-.btn-p{background:var(--red);color:#fff}
-.btn-p:hover{background:var(--red-h);box-shadow:0 4px 14px var(--red-glow);transform:translateY(-1px)}
-.btn-p:active{transform:translateY(0)}
-.res{margin-top:16px;display:none;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--rsm);overflow:hidden}
-.res.show{display:block}
-.rrow{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;gap:10px}
-.rrow+.rrow{border-top:1px solid var(--border)}
-.rlbl{font-size:12px;color:var(--muted);font-weight:500;min-width:90px;flex-shrink:0}
-.rval{flex:1;font-size:13px;font-family:ui-monospace,monospace;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.cpybtn{flex-shrink:0;padding:5px 12px;font-size:12px;font-weight:600;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--muted);transition:all var(--trans)}
-.cpybtn:hover,.cpybtn.ok{background:var(--red);color:#fff;border-color:var(--red)}
-.steps{counter-reset:s;list-style:none;display:flex;flex-direction:column;gap:14px}
-.steps li{display:flex;align-items:flex-start;gap:14px;counter-increment:s}
-.steps li::before{content:counter(s);flex-shrink:0;width:28px;height:28px;background:var(--red);color:#fff;font-size:13px;font-weight:700;font-family:var(--font-d);border-radius:50%;display:flex;align-items:center;justify-content:center;margin-top:2px}
-.steps p{font-size:15px}
-code{background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 6px;font-size:13px;font-family:ui-monospace,monospace}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th{text-align:left;padding:8px 12px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
-td{padding:10px 12px;border-bottom:1px solid color-mix(in oklab,var(--border) 50%,transparent);vertical-align:top}
-tr:last-child td{border-bottom:none}
-.met{font-family:ui-monospace,monospace;font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;background:color-mix(in oklab,var(--red) 14%,var(--surface-2));color:var(--red)}
-.ep{font-family:ui-monospace,monospace;font-size:13px}
-footer{margin-top:auto;border-top:1px solid var(--border);padding-block:20px;text-align:center;font-size:13px;color:var(--muted)}
-@media(max-width:600px){.row{flex-direction:column}.rrow{flex-wrap:wrap}.rval{flex-basis:100%;order:1}.cpybtn{order:2}}
-</style>
-</head>
-<body>
-<header><div class="wrap"><div class="hdr">
-  <div class="logo">
-    <svg width="30" height="30" viewBox="0 0 30 30" fill="none">
-      <rect width="30" height="30" rx="8" fill="#FF0000"/>
-      <circle cx="15" cy="15" r="7" fill="white" opacity=".15"/>
-      <circle cx="15" cy="15" r="5" fill="white"/>
-      <circle cx="15" cy="15" r="2" fill="#FF0000"/>
-    </svg>
-    YT Music <span class="logo-sub">for Eclipse</span>
-  </div>
-  <button class="tbtn" data-theme-toggle aria-label="Toggle theme">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-  </button>
-</div></div></header>
-<main><div class="wrap">
-  <section class="hero">
-    <div class="badge"><span class="dot"></span> Cloudflare Workers</div>
-    <h1>YouTube Music<br><em>Eclipse Addon</em></h1>
-    <p class="sub">Stream and download from YouTube Music inside Eclipse. HLS-first with mp4 fallback. Each Generate press creates a unique install URL.</p>
-  </section>
-  <section>
-    <div class="card">
-      <div class="lbl">Your Addon URL</div>
-      <p class="hint">Press <strong>Generate</strong> for a unique manifest URL. Each press gives a new token — paste it into Eclipse to install.</p>
-      <div class="row">
-        <input class="ipt" id="manifestUrl" placeholder="Click Generate…" readonly>
-        <button class="btn btn-p" id="genBtn" onclick="doGenerate()">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
-          Generate
-        </button>
-      </div>
-      <div class="res" id="resBlock">
-        <div class="rrow"><span class="rlbl">Manifest URL</span><span class="rval" id="rv-manifest"></span><button class="cpybtn" onclick="cp('rv-manifest',this)">Copy</button></div>
-        <div class="rrow"><span class="rlbl">Base URL</span><span class="rval" id="rv-base"></span><button class="cpybtn" onclick="cp('rv-base',this)">Copy</button></div>
-        <div class="rrow"><span class="rlbl">Token</span><span class="rval" id="rv-token"></span><button class="cpybtn" onclick="cp('rv-token',this)">Copy</button></div>
-      </div>
-    </div>
-  </section>
-  <section>
-    <h2>Install in Eclipse</h2>
-    <div class="card">
-      <ol class="steps">
-        <li><p>Press <strong>Generate</strong> above and copy the Manifest URL.</p></li>
-        <li><p>Open Eclipse → <code>Settings</code> → <code>Connections</code> → <code>Add Connection</code> → <code>Addon</code>.</p></li>
-        <li><p>Paste the URL — Eclipse fetches the manifest. Tap <strong>Install</strong>.</p></li>
-        <li><p>Search any track and select the <strong>YouTube Music</strong> source.</p></li>
-      </ol>
-    </div>
-  </section>
-  <section>
-    <h2>API Endpoints</h2>
-    <div class="card" style="padding:0;overflow:hidden">
-      <table>
-        <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr><td><span class="met">GET</span></td><td class="ep">/u/:token/manifest.json</td><td>Eclipse addon manifest</td></tr>
-          <tr><td><span class="met">GET</span></td><td class="ep">/u/:token/search?q=…</td><td>Search tracks, albums, artists, playlists</td></tr>
-          <tr><td><span class="met">GET</span></td><td class="ep">/u/:token/stream/:videoId</td><td>HLS stream URL → mp4 fallback</td></tr>
-          <tr><td><span class="met">GET</span></td><td class="ep">/u/:token/album/:browseId</td><td>Album details + tracks</td></tr>
-          <tr><td><span class="met">GET</span></td><td class="ep">/u/:token/artist/:browseId</td><td>Artist info + top tracks + albums</td></tr>
-          <tr><td><span class="met">GET</span></td><td class="ep">/u/:token/download/:videoId</td><td>y2jar download URL</td></tr>
-          <tr><td><span class="met">GET</span></td><td class="ep">/generate-token</td><td>Fresh unique token</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
-</div></main>
-<footer><div class="wrap">eclipse-ytmusic · by nvmindl · Cloudflare Workers</div></footer>
-<script>
-(function(){
-  const btn=document.querySelector('[data-theme-toggle]'),r=document.documentElement;
-  let d='dark';r.setAttribute('data-theme',d);
-  if(btn)btn.addEventListener('click',()=>{
-    d=d==='dark'?'light':'dark';r.setAttribute('data-theme',d);
-    btn.innerHTML=d==='dark'
-      ?'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
-      :'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>';
-  });
-})();
-function setResult(tok,base,manifest){
-  document.getElementById('manifestUrl').value=manifest;
-  document.getElementById('rv-manifest').textContent=manifest;
-  document.getElementById('rv-base').textContent=base;
-  document.getElementById('rv-token').textContent=tok;
-  document.getElementById('resBlock').classList.add('show');
-}
-function doGenerate(){
-  const btn=document.getElementById('genBtn');
-  btn.disabled=true;
-  fetch('/generate-token')
-    .then(r=>r.json())
-    .then(d=>setResult(d.token,d.addonBase,d.manifestUrl))
-    .catch(()=>{
-      const a=new Uint8Array(16);crypto.getRandomValues(a);
-      const tok=Array.from(a,b=>b.toString(16).padStart(2,'0')).join('');
-      const o=location.origin;
-      setResult(tok,o+'/u/'+tok,o+'/u/'+tok+'/manifest.json');
-    })
-    .finally(()=>{ btn.disabled=false; });
-}
-async function cp(id,btn){
-  const txt=document.getElementById(id)?.textContent?.trim();
-  if(!txt)return;
-  try{await navigator.clipboard.writeText(txt);}catch(e){
-    const ta=document.createElement('textarea');ta.value=txt;ta.style.cssText='position:fixed;opacity:0';
-    document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);
-  }
-  const o=btn.textContent;btn.textContent='Copied!';btn.classList.add('ok');
-  setTimeout(()=>{btn.textContent=o;btn.classList.remove('ok');},1400);
-}
-</script>
-</body>
-</html>`;
+const QUALITY = {
+  LOW: 'LOW',
+  HIGH: 'HIGH',
+  LOSSLESS: 'LOSSLESS',
+};
 
-// ─── CORS / response helpers ──────────────────────────────────────────────────
+const QUALITY_OPTIONS = [
+  { label: 'Low (saves data)', value: QUALITY.LOW },
+  { label: 'High', value: QUALITY.HIGH },
+  { label: 'Best Available', value: QUALITY.LOSSLESS },
+];
 
-function cors(origin) {
-  return {
-    'Access-Control-Allow-Origin': origin || '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  };
-}
-function jsonResp(data, req, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...cors(req?.headers?.get('Origin')) },
-  });
-}
-function errResp(status, msg, req) {
-  return jsonResp({ error: msg }, req, status);
-}
+const DOWNLOAD_QUALITY_OPTIONS = [
+  { label: '128 kbps', value: '128' },
+  { label: '320 kbps', value: '320' },
+];
 
-// ─── YTMusic data helpers ─────────────────────────────────────────────────────
+const DOWNLOAD_API_BASE = 'https://capi.y2jar.cc/scr/';
 
 function parseDuration(text) {
   if (!text) return 0;
-  const p = text.split(':').map(Number);
-  if (p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
-  if (p.length === 2) return p[0] * 60 + p[1];
-  return p[0] || 0;
+  const parts = text.split(':').map(Number);
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0] || 0;
 }
 
 function bestThumbnail(thumbnails) {
-  if (!thumbnails?.length) return '';
-  return thumbnails.reduce((b, t) => ((t.width || 0) > (b.width || 0) ? t : b)).url || '';
+  if (!thumbnails || !thumbnails.length) return '';
+  return thumbnails.reduce((best, t) => ((t.width || 0) > (best.width || 0) ? t : best)).url;
 }
 
 function parseInfoRuns(runs) {
-  if (!runs?.length) return { artist: '', album: '' };
+  if (!runs || !runs.length) return { artist: '', album: '' };
   const parts = [];
-  let cur = '';
+  let current = '';
   for (const run of runs) {
-    if (run.text === ' \u2022 ') { if (cur) parts.push(cur.trim()); cur = ''; }
-    else cur += run.text;
+    if (run.text === ' • ') {
+      if (current) parts.push(current.trim());
+      current = '';
+    } else {
+      current += run.text;
+    }
   }
-  if (cur) parts.push(cur.trim());
-  // Strip trailing duration token
-  while (parts.length > 1 && /^\d{1,2}:\d{2}(:\d{2})?$/.test(parts[parts.length - 1])) parts.pop();
-  // Skip leading type labels (Song, Video, EP, Single…)
-  const labels = ['Song', 'Video', 'EP', 'Single', 'Podcast'];
-  const idx = (parts.length > 1 && labels.includes(parts[0])) ? 1 : 0;
+  if (current) parts.push(current.trim());
+  while (parts.length > 1 && /^\d+:\d{2}(:\d{2})?$/.test(parts[parts.length - 1])) parts.pop();
+  const typeLabels = ['Song', 'Video', 'EP', 'Single', 'Podcast'];
+  let idx = 0;
+  if (parts.length > 1 && typeLabels.includes(parts[0])) idx = 1;
   return { artist: parts[idx] || '', album: parts[idx + 1] || '' };
 }
 
-// ─── Upstash Redis — visitorData cache ───────────────────────────────────────
-// Falls back to in-memory if REDIS_URL / REDIS_TOKEN not set.
-
-let _memVD = null;
-let _memVDAt = 0;
-const MEM_TTL_MS = VD_TTL_S * 1000;
-
-function getRedis(env) {
-  if (env?.REDIS_URL && env?.REDIS_TOKEN) {
-    return new Redis({ url: env.REDIS_URL, token: env.REDIS_TOKEN });
-  }
-  return null;
+function buildIosContext(visitorData) {
+  const ctx = { ...IOS_CLIENT_BASE };
+  if (visitorData) ctx.visitorData = visitorData;
+  return ctx;
 }
 
-async function getVisitorData(env) {
-  const redis = getRedis(env);
-  if (redis) {
-    try { const v = await redis.get(VD_KEY); if (v) return v; } catch (_) {}
-  } else {
-    if (_memVD && Date.now() - _memVDAt < MEM_TTL_MS) return _memVD;
-  }
-  return refreshVisitorData(env);
-}
-
-async function refreshVisitorData(env) {
+async function fetchFreshVisitorData(env) {
   try {
     const resp = await fetch(`${YTM_BASE}/youtubei/v1/visitor_id?key=${YTM_API_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ context: { client: WEB_REMIX_CTX } }),
+      body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT } }),
     });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const d = await resp.json();
-    const vd = d?.responseContext?.visitorData;
-    if (vd) await cacheVisitorData(vd, env);
-    return vd || null;
+    const visitorData = d?.responseContext?.visitorData || null;
+    if (visitorData && env.YTM_CACHE) {
+      await env.YTM_CACHE.put(
+        'visitorData',
+        JSON.stringify({ visitorData, fetchedAt: Date.now() }),
+        { expirationTtl: Math.floor(VISITOR_DATA_TTL_MS / 1000) }
+      );
+    }
+    return visitorData;
   } catch (e) {
-    console.error('[YTMusic] visitorData fetch failed:', e.message);
+    console.log(LOG_PREFIX, 'visitorData fetch failed:', e.message);
     return null;
   }
 }
 
-async function cacheVisitorData(vd, env) {
-  const redis = getRedis(env);
-  if (redis) {
-    try { await redis.set(VD_KEY, vd, { ex: VD_TTL_S }); } catch (_) {}
-  } else {
-    _memVD = vd; _memVDAt = Date.now();
+async function getVisitorData(env) {
+  if (env.YTM_CACHE) {
+    const raw = await env.YTM_CACHE.get('visitorData');
+    if (raw) {
+      try {
+        const cached = JSON.parse(raw);
+        if (cached.visitorData && Date.now() - cached.fetchedAt < VISITOR_DATA_TTL_MS) {
+          return cached.visitorData;
+        }
+      } catch {}
+    }
   }
+  return fetchFreshVisitorData(env);
 }
 
-async function bustVisitorData(env) {
-  const redis = getRedis(env);
-  if (redis) { try { await redis.del(VD_KEY); } catch (_) {} }
-  else { _memVD = null; _memVDAt = 0; }
-}
+async function searchTracks(query, limit = 20, env) {
+  const headers = {
+    'Content-Type': 'application/json',
+    Origin: YTM_BASE,
+    Referer: `${YTM_BASE}/`,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  };
 
-// ─── YTM POST helper ─────────────────────────────────────────────────────────
-
-async function ytmPost(path, body, env) {
-  const resp = await fetch(`${YTM_BASE}${path}?key=${YTM_API_KEY}`, {
+  const response = await fetch(`${YTM_BASE}/youtubei/v1/search?key=${YTM_API_KEY}`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Origin': YTM_BASE,
-      'Referer': YTM_BASE + '/',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'X-Goog-Api-Key': YTM_API_KEY,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) throw new Error(`YTM HTTP ${resp.status} on ${path}`);
-  const data = await resp.json();
-  // Opportunistically refresh cached visitorData
-  if (data?.responseContext?.visitorData) {
-    await cacheVisitorData(data.responseContext.visitorData, env);
-  }
-  return data;
-}
-
-// ─── Search ───────────────────────────────────────────────────────────────────
-
-async function doSearch(query, limit, env) {
-  // Run both in parallel:
-  //   req1 — songs filter: reliable full track list with durations
-  //   req2 — no filter:    albums / artists / community playlists shelves
-  const [songsRes, allRes] = await Promise.allSettled([
-    ytmPost('/youtubei/v1/search', {
-      context: { client: WEB_REMIX_CTX },
+    headers,
+    body: JSON.stringify({
+      context: { client: WEB_REMIX_CONTEXT },
       query,
       params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
-    }, env),
-    ytmPost('/youtubei/v1/search', {
-      context: { client: WEB_REMIX_CTX },
-      query,
-    }, env),
-  ]);
+    }),
+  });
+
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Search failed: HTTP ${response.status}`);
+  const data = await response.json();
+
+  if (data?.responseContext?.visitorData && env.YTM_CACHE) {
+    await env.YTM_CACHE.put(
+      'visitorData',
+      JSON.stringify({ visitorData: data.responseContext.visitorData, fetchedAt: Date.now() }),
+      { expirationTtl: Math.floor(VISITOR_DATA_TTL_MS / 1000) }
+    );
+  }
 
   const tracks = [];
-  const albums = [];
-  const artists = [];
-  const playlists = [];
+  const sections = data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
 
-  function shelves(data) {
-    return data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]
-      ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-  }
+  for (const section of sections) {
+    const shelf = section.musicShelfRenderer;
+    if (!shelf) continue;
+    for (const item of shelf.contents || []) {
+      if (tracks.length >= limit) break;
+      const r = item.musicResponsiveListItemRenderer;
+      if (!r) continue;
 
-  // ── Tracks from songs-filtered response ──────────────────────────────────
-  if (songsRes.status === 'fulfilled') {
-    for (const section of shelves(songsRes.value)) {
-      const shelf = section.musicShelfRenderer;
-      if (!shelf) continue;
-      for (const item of (shelf.contents || [])) {
-        if (tracks.length >= limit) break;
-        const r = item.musicResponsiveListItemRenderer;
-        if (!r) continue;
+      const videoId =
+        r.playlistItemData?.videoId ||
+        r.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
+      if (!videoId) continue;
 
-        const videoId =
-          r.playlistItemData?.videoId ||
-          r.overlay?.musicItemThumbnailOverlayRenderer?.content
-            ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
-        if (!videoId) continue;
+      const title = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.map(t => t.text).join('') || '';
+      const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+      const info = parseInfoRuns(infoRuns);
+      const durationText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
+      const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
 
-        const title = r.flexColumns?.[0]
-          ?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
-          ?.map(t => t.text).join('') || '';
-
-        const col1 = r.flexColumns?.[1]
-          ?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-
-        const info = parseInfoRuns(col1);
-        const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-
-        // Duration: fixedColumns first, then scan col1 runs backwards for M:SS pattern
-        let durText = r.fixedColumns?.[0]
-          ?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
-        if (!durText) {
-          for (let i = col1.length - 1; i >= 0; i--) {
-            if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(col1[i]?.text || '')) {
-              durText = col1[i].text;
-              break;
-            }
-          }
-        }
-
-        tracks.push({
-          id: videoId,
-          title,
-          artist: info.artist,
-          album: info.album,
-          duration: parseDuration(durText),
-          artworkURL: bestThumbnail(thumbs),
-          format: 'aac',
-          type: 'track',
-        });
-      }
+      tracks.push({
+        id: videoId,
+        title,
+        artist: info.artist,
+        album: info.album,
+        duration: parseDuration(durationText),
+        albumCover: bestThumbnail(thumbs),
+      });
     }
   }
 
-  // ── Albums / Artists / Playlists from unfiltered response ────────────────
-  if (allRes.status === 'fulfilled') {
-    for (const section of shelves(allRes.value)) {
-      const shelf = section.musicShelfRenderer;
-      if (!shelf) continue;
-
-      const shelfTitle = (shelf.title?.runs?.[0]?.text || '').toLowerCase();
-
-      for (const item of (shelf.contents || [])) {
-        const r = item.musicResponsiveListItemRenderer;
-        if (!r) continue;
-
-        const title = r.flexColumns?.[0]
-          ?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
-          ?.map(t => t.text).join('') || '';
-        const col1 = r.flexColumns?.[1]
-          ?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-        const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-        const artworkURL = bestThumbnail(thumbs);
-
-        // browseId lives on the title run's navigationEndpoint, or the row-level endpoint
-        const titleNavEp = r.flexColumns?.[0]
-          ?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]
-          ?.navigationEndpoint;
-        const browseId =
-          titleNavEp?.browseEndpoint?.browseId ||
-          r.navigationEndpoint?.browseEndpoint?.browseId;
-
-        // Artist name: first run in col1 that has a browseEndpoint
-        const artistRun = col1.find(run => run.navigationEndpoint?.browseEndpoint);
-        const artistName = artistRun?.text || parseInfoRuns(col1).artist;
-
-        if (shelfTitle.includes('album') || shelfTitle.includes('single') || shelfTitle.includes(' ep')) {
-          if (browseId && !albums.find(a => a.id === browseId)) {
-            albums.push({ id: browseId, title, artist: artistName, artworkURL, type: 'album' });
-          }
-        } else if (shelfTitle.includes('artist')) {
-          if (browseId && !artists.find(a => a.id === browseId)) {
-            artists.push({ id: browseId, name: title, artworkURL, type: 'artist' });
-          }
-        } else if (shelfTitle.includes('playlist') || shelfTitle.includes('community')) {
-          // Playlists may use browseId OR a watchEndpoint playlistId
-          const plId =
-            browseId ||
-            r.overlay?.musicItemThumbnailOverlayRenderer?.content
-              ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.playlistId;
-          if (plId && !playlists.find(p => p.id === plId)) {
-            playlists.push({ id: plId, title, artist: artistName, artworkURL, type: 'playlist' });
-          }
-        }
-      }
-    }
-  }
-
-  return { tracks, albums, artists, playlists, total: tracks.length + albums.length + artists.length + playlists.length };
+  return { tracks, total: tracks.length };
 }
 
-// ─── Player ───────────────────────────────────────────────────────────────────
-
-async function fetchPlayerData(videoId, env) {
+async function fetchPlayerData(trackId, env) {
   const visitorData = await getVisitorData(env);
-  const clientCtx = Object.assign({}, IOS_CLIENT_BASE);
-  if (visitorData) clientCtx.visitorData = visitorData;
+  const clientContext = buildIosContext(visitorData);
 
-  const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
+  const response = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
     },
     body: JSON.stringify({
-      context: { client: clientCtx },
-      videoId,
+      context: { client: clientContext },
+      videoId: trackId,
       contentCheckOk: true,
       racyCheckOk: true,
     }),
   });
-  if (!resp.ok) throw new Error('Player HTTP ' + resp.status);
-  const data = await resp.json();
+
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Player HTTP error: ${response.status}`);
+  const data = await response.json();
   const status = data?.playabilityStatus?.status;
+
   if (status !== 'OK') {
-    await bustVisitorData(env);
-    throw new Error('Playback blocked: ' + (data?.playabilityStatus?.reason || status || 'unknown'));
+    if (env.YTM_CACHE) await env.YTM_CACHE.delete('visitorData');
+    throw new Error(`${LOG_PREFIX} Playback blocked: ${data?.playabilityStatus?.reason || status || 'unknown'}`);
   }
+
   return data.streamingData;
 }
 
-function pickMp4Url(sd, preferLow) {
-  const fmts = (sd.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('audio/mp4') && f.url);
-  if (!fmts.length) return null;
-  fmts.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return preferLow ? fmts[fmts.length - 1].url : fmts[0].url;
+function pickMp4Url(sd, quality) {
+  const mp4Formats = (sd.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('audio/mp4') && f.url);
+  if (!mp4Formats.length) return null;
+  mp4Formats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  return quality === QUALITY.LOW ? mp4Formats[mp4Formats.length - 1].url : mp4Formats[0].url;
 }
 
-// ─── Album ────────────────────────────────────────────────────────────────────
+async function getTrackStreamUrl(trackId, preferredQuality, context, env, forceDirectMp4 = false) {
+  const quality = context?.settings?.quality?.value || preferredQuality || QUALITY.HIGH;
+  const sd = await fetchPlayerData(trackId, env);
+  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data returned`);
 
-async function fetchAlbum(browseId, env) {
-  const data = await ytmPost('/youtubei/v1/browse', {
-    context: { client: WEB_REMIX_CTX }, browseId,
-  }, env);
+  if (!forceDirectMp4 && sd.hlsManifestUrl) {
+    return {
+      streamUrl: sd.hlsManifestUrl,
+      streamType: 'hls',
+      track: { id: trackId, audioQuality: quality },
+    };
+  }
 
-  const header = data?.header?.musicImmersiveHeaderRenderer ||
-    data?.header?.musicDetailHeaderRenderer || {};
+  const mp4Url = pickMp4Url(sd, quality);
+  if (mp4Url) {
+    return {
+      streamUrl: mp4Url,
+      streamType: 'mp4',
+      track: { id: trackId, audioQuality: quality },
+    };
+  }
+
+  throw new Error(`${LOG_PREFIX} No playable audio found for ${trackId}`);
+}
+
+async function getTrackDownloadUrl(trackId, quality, context) {
+  const dlQuality = context?.settings?.downloadQuality?.value || quality || '128';
+  const response = await fetch(`${DOWNLOAD_API_BASE}${trackId}?s=5`);
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Download API error: HTTP ${response.status}`);
+  const data = await response.json();
+  if (!data.downloadUrl) throw new Error(`${LOG_PREFIX} No download URL returned for ${trackId}`);
+  return {
+    streamUrl: data.downloadUrl,
+    track: {
+      id: trackId,
+      audioQuality: dlQuality === '320' ? QUALITY.HIGH : QUALITY.LOW,
+    },
+  };
+}
+
+async function getAlbum(albumId, env) {
+  const headers = {
+    'Content-Type': 'application/json',
+    Origin: YTM_BASE,
+    Referer: `${YTM_BASE}/`,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  };
+
+  const response = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${YTM_API_KEY}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      context: { client: WEB_REMIX_CONTEXT },
+      browseId: albumId,
+    }),
+  });
+
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Album fetch failed: HTTP ${response.status}`);
+  const data = await response.json();
+
+  if (data?.responseContext?.visitorData && env.YTM_CACHE) {
+    await env.YTM_CACHE.put(
+      'visitorData',
+      JSON.stringify({ visitorData: data.responseContext.visitorData, fetchedAt: Date.now() }),
+      { expirationTtl: Math.floor(VISITOR_DATA_TTL_MS / 1000) }
+    );
+  }
+
+  const header = data?.header?.musicImmersiveHeaderRenderer || data?.header?.musicDetailHeaderRenderer || {};
   const albumTitle = header?.title?.runs?.[0]?.text || '';
   let albumArtist = '';
-  for (const run of (header?.subtitle?.runs || [])) {
-    if (run.navigationEndpoint?.browseEndpoint) { albumArtist = run.text; break; }
+  if (header?.subtitle?.runs) {
+    for (const run of header.subtitle.runs) {
+      if (run.navigationEndpoint?.browseEndpoint) {
+        albumArtist = run.text;
+        break;
+      }
+    }
   }
-  const albumCover = bestThumbnail(
-    header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []);
+  const albumCover = bestThumbnail(header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []);
 
-  const contents = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
-    ?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]
-    ?.musicShelfRenderer?.contents || [];
+  const contents =
+    data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.musicShelfRenderer?.contents || [];
 
   const tracks = contents
     .filter(c => c.musicResponsiveListItemRenderer?.playlistItemData?.videoId)
     .map(c => {
       const r = c.musicResponsiveListItemRenderer;
-      const col1 = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-      let durText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
-      if (!durText) {
-        for (let i = col1.length - 1; i >= 0; i--) {
-          if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(col1[i]?.text || '')) { durText = col1[i].text; break; }
-        }
-      }
       return {
         id: r.playlistItemData.videoId,
         title: r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text || '',
         artist: albumArtist,
         album: albumTitle,
-        duration: parseDuration(durText),
-        artworkURL: albumCover,
-        format: 'aac',
-        type: 'track',
+        duration: parseDuration(r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || ''),
+        albumCover,
       };
     });
 
-  return { id: browseId, title: albumTitle, artist: albumArtist, artworkURL: albumCover, type: 'album', tracks };
-}
-
-// ─── Artist ───────────────────────────────────────────────────────────────────
-
-async function fetchArtist(browseId, env) {
-  const data = await ytmPost('/youtubei/v1/browse', {
-    context: { client: WEB_REMIX_CTX }, browseId,
-  }, env);
-
-  const header = data?.header?.musicImmersiveHeaderRenderer || {};
-  const artistName = header?.title?.runs?.[0]?.text || '';
-  const artistImg = bestThumbnail(
-    header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
-    header?.foregroundThumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []);
-
-  const sections = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
-    ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-
-  const tracks = [];
-  const albums = [];
-
-  for (const section of sections) {
-    const shelf = section.musicShelfRenderer;
-    const carousel = section.musicCarouselShelfRenderer;
-
-    if (shelf) {
-      for (const item of (shelf.contents || [])) {
-        const r = item.musicResponsiveListItemRenderer;
-        if (!r) continue;
-        const videoId =
-          r.playlistItemData?.videoId ||
-          r.overlay?.musicItemThumbnailOverlayRenderer?.content
-            ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
-        if (!videoId) continue;
-        const col1 = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-        let durText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
-        if (!durText) {
-          for (let i = col1.length - 1; i >= 0; i--) {
-            if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(col1[i]?.text || '')) { durText = col1[i].text; break; }
-          }
-        }
-        tracks.push({
-          id: videoId,
-          title: r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.map(t => t.text).join('') || '',
-          artist: artistName,
-          album: '',
-          duration: parseDuration(durText),
-          artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []),
-          format: 'aac',
-          type: 'track',
-        });
-      }
-    }
-
-    if (carousel) {
-      for (const item of (carousel.contents || [])) {
-        const c = item.musicTwoRowItemRenderer;
-        if (!c) continue;
-        const be = c.navigationEndpoint?.browseEndpoint;
-        if (!be?.browseId?.startsWith('MPREb_')) continue;
-        albums.push({
-          id: be.browseId,
-          title: c.title?.runs?.[0]?.text || '',
-          artist: artistName,
-          artworkURL: bestThumbnail(c.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []),
-          type: 'album',
-        });
-      }
-    }
-  }
-
-  return { id: browseId, name: artistName, artworkURL: artistImg, tracks, albums, type: 'artist' };
-}
-
-// ─── Manifest builder ─────────────────────────────────────────────────────────
-
-function buildManifest(addonBase) {
   return {
-    id: 'com.nvmindl.eclipse.ytmusic',
+    album: { id: albumId, title: albumTitle, artist: albumArtist, albumCover },
+    tracks,
+  };
+}
+
+function buildManifest(baseUrl) {
+  return {
+    id: 'youtube-music',
     name: 'YouTube Music',
-    version: '1.0.0',
-    description: 'Stream and download from YouTube Music. HLS preferred with automatic mp4 fallback.',
-    icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     author: 'nvmindl',
-    resources: ['search', 'stream', 'album', 'artist'],
-    types: ['track', 'album', 'artist', 'playlist'],
-    contentType: 'music',
+    version: '3.1.0',
+    labels: ['YT Music', 'Audio', 'Download', 'Settings'],
+    description: 'Stream and download from YouTube Music. HLS preferred with automatic mp4 fallback.',
     noPrefetch: true,
     noStreamCache: true,
-    baseUrl: addonBase,
+    settings: {
+      quality: {
+        type: 'selector',
+        label: 'Audio Quality',
+        description: 'Select preferred streaming quality',
+        logo: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
+        options: QUALITY_OPTIONS,
+        defaultValue: QUALITY.HIGH,
+      },
+      downloadQuality: {
+        type: 'selector',
+        label: 'Download Quality',
+        description: 'Quality label for downloaded tracks (cosmetic — the download API does not support quality selection)',
+        options: DOWNLOAD_QUALITY_OPTIONS,
+        defaultValue: '128',
+      },
+    },
     endpoints: {
-      search:   addonBase + '/search',
-      stream:   addonBase + '/stream/{id}',
-      album:    addonBase + '/album/{id}',
-      artist:   addonBase + '/artist/{id}',
-      download: addonBase + '/download/{id}',
+      searchTracks: `${baseUrl}/api/search`,
+      getTrackStreamUrl: `${baseUrl}/api/stream`,
+      getTrackDownloadUrl: `${baseUrl}/api/download`,
+      getAlbum: `${baseUrl}/api/album`,
     },
   };
 }
 
-// ─── Router ───────────────────────────────────────────────────────────────────
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'access-control-allow-headers': 'Content-Type',
+    },
+  });
+}
+
+function html(body) {
+  return new Response(body, {
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+  });
+}
+
+function website(baseUrl) {
+  const manifestUrl = `${baseUrl}/manifest.json`;
+  return `<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Eclipse YouTube Music Addon</title>
+  <meta name="description" content="Generate your Eclipse addon manifest URL for a Cloudflare Workers-powered YouTube Music addon." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700,900&f[]=cabinet-grotesk@500,700,800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --text-xs: clamp(0.75rem, 0.7rem + 0.25vw, 0.875rem);
+      --text-sm: clamp(0.875rem, 0.8rem + 0.35vw, 1rem);
+      --text-base: clamp(1rem, 0.95rem + 0.25vw, 1.125rem);
+      --text-lg: clamp(1.125rem, 1rem + 0.75vw, 1.5rem);
+      --text-xl: clamp(1.5rem, 1.2rem + 1.25vw, 2.25rem);
+      --text-2xl: clamp(2rem, 1.2rem + 2.5vw, 3.5rem);
+      --space-1: 0.25rem; --space-2: 0.5rem; --space-3: 0.75rem; --space-4: 1rem;
+      --space-5: 1.25rem; --space-6: 1.5rem; --space-8: 2rem; --space-10: 2.5rem;
+      --space-12: 3rem; --space-16: 4rem; --space-20: 5rem;
+      --radius-sm: 0.375rem; --radius-md: 0.5rem; --radius-lg: 0.75rem; --radius-xl: 1rem; --radius-full: 9999px;
+      --font-body: 'Satoshi', 'Inter', sans-serif;
+      --font-display: 'Cabinet Grotesk', 'Satoshi', sans-serif;
+      --color-bg: #171614;
+      --color-surface: #1c1b19;
+      --color-surface-2: #201f1d;
+      --color-surface-offset: #22211f;
+      --color-border: #393836;
+      --color-text: #f2f0eb;
+      --color-text-muted: #b5b1aa;
+      --color-primary: #ff0033;
+      --color-primary-hover: #d9002c;
+      --color-blue: #4f98a3;
+      --shadow-sm: 0 1px 2px rgb(0 0 0 / .2);
+      --shadow-md: 0 10px 30px rgb(0 0 0 / .28);
+      --shadow-lg: 0 20px 50px rgb(0 0 0 / .42);
+      --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
+      --content: 1180px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { min-height: 100%; }
+    body {
+      font-family: var(--font-body);
+      font-size: var(--text-base);
+      line-height: 1.6;
+      color: var(--color-text);
+      background:
+        radial-gradient(circle at top left, rgba(255,0,51,.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(79,152,163,.12), transparent 24%),
+        linear-gradient(180deg, #121110 0%, #171614 100%);
+    }
+    a { color: inherit; text-decoration: none; }
+    button, input { font: inherit; }
+    .container { width: min(calc(100% - 2rem), var(--content)); margin: 0 auto; }
+    .skip-link { position: absolute; left: -999px; top: 0; }
+    .skip-link:focus { left: 1rem; top: 1rem; background: var(--color-text); color: #000; padding: .75rem 1rem; border-radius: var(--radius-md); }
+    .site-header {
+      position: sticky; top: 0; z-index: 10;
+      backdrop-filter: blur(16px);
+      background: rgba(18,17,16,.72);
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .nav {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: var(--space-4) 0;
+      gap: var(--space-4);
+    }
+    .brand { display: flex; align-items: center; gap: .85rem; font-weight: 700; }
+    .logo {
+      width: 2.5rem; height: 2.5rem; border-radius: .85rem; display: grid; place-items: center;
+      background: linear-gradient(135deg, rgba(255,0,51,.2), rgba(79,152,163,.15));
+      border: 1px solid rgba(255,255,255,.1);
+      box-shadow: var(--shadow-sm);
+    }
+    .hero {
+      padding: clamp(4rem, 8vw, 7rem) 0 var(--space-16);
+    }
+    .hero-grid {
+      display: grid; grid-template-columns: 1.15fr .85fr; gap: var(--space-10); align-items: center;
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: .5rem; padding: .45rem .8rem; border-radius: var(--radius-full);
+      background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08); color: var(--color-text-muted); font-size: var(--text-sm);
+    }
+    h1 {
+      font-family: var(--font-display);
+      font-size: var(--text-2xl);
+      line-height: 1;
+      letter-spacing: -.03em;
+      margin-top: var(--space-5);
+      max-width: 11ch;
+    }
+    .hero p {
+      color: var(--color-text-muted);
+      margin-top: var(--space-5);
+      max-width: 62ch;
+    }
+    .cta-row { display: flex; gap: var(--space-3); flex-wrap: wrap; margin-top: var(--space-6); }
+    .btn {
+      min-height: 44px; padding: .9rem 1.1rem; border-radius: .9rem; border: 1px solid transparent;
+      transition: all var(--transition); display: inline-flex; align-items: center; justify-content: center; gap: .65rem;
+    }
+    .btn-primary { background: var(--color-primary); color: white; box-shadow: var(--shadow-md); }
+    .btn-primary:hover { background: var(--color-primary-hover); transform: translateY(-1px); }
+    .btn-secondary { background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.1); }
+    .btn-secondary:hover { background: rgba(255,255,255,.08); }
+    .panel {
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.025));
+      border: 1px solid rgba(255,255,255,.09);
+      border-radius: 1.35rem;
+      box-shadow: var(--shadow-lg);
+    }
+    .generator { padding: var(--space-6); }
+    .generator h2, .section-title { font-family: var(--font-display); font-size: var(--text-xl); line-height: 1.05; }
+    .generator p, .muted { color: var(--color-text-muted); }
+    .stack { display: grid; gap: var(--space-4); margin-top: var(--space-5); }
+    .field { display: grid; gap: .55rem; }
+    label { font-size: var(--text-sm); color: var(--color-text-muted); }
+    input {
+      width: 100%; min-height: 52px; padding: .9rem 1rem; border-radius: .9rem;
+      border: 1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.16); color: var(--color-text);
+      outline: none;
+    }
+    input:focus { border-color: rgba(255,0,51,.65); box-shadow: 0 0 0 4px rgba(255,0,51,.14); }
+    .output {
+      margin-top: var(--space-4); padding: 1rem; border-radius: .9rem; background: rgba(0,0,0,.28);
+      border: 1px solid rgba(255,255,255,.09); word-break: break-all; font-size: var(--text-sm);
+    }
+    .mini-grid {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-top: var(--space-8);
+    }
+    .stat-card, .feature-card {
+      padding: var(--space-5); background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08); border-radius: 1rem;
+    }
+    .stat-card strong { display: block; font-size: var(--text-lg); }
+    .section { padding: var(--space-10) 0; }
+    .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-top: var(--space-6); }
+    .feature-card h3 { margin-bottom: .5rem; font-size: 1.05rem; }
+    .feature-card p { color: var(--color-text-muted); font-size: var(--text-sm); }
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-top: var(--space-6); }
+    .step-number {
+      width: 2rem; height: 2rem; border-radius: var(--radius-full); display: grid; place-items: center; margin-bottom: 1rem;
+      background: rgba(255,0,51,.18); color: #fff; border: 1px solid rgba(255,0,51,.35);
+    }
+    code.inline {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .93em; padding: .15rem .35rem; border-radius: .4rem; background: rgba(255,255,255,.06);
+    }
+    .site-footer {
+      padding: var(--space-10) 0 var(--space-16); color: var(--color-text-muted); font-size: var(--text-sm);
+    }
+    @media (max-width: 980px) {
+      .hero-grid, .feature-grid, .steps, .mini-grid { grid-template-columns: 1fr; }
+      h1 { max-width: 14ch; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="container nav">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-label="Eclipse YT Music logo">
+            <path d="M4 12a8 8 0 1 0 8-8" />
+            <path d="M15 7.5 20 10.5 15 13.5Z" fill="currentColor" stroke="none" />
+          </svg>
+        </div>
+        <div>
+          <div style="font-weight:800;line-height:1">Eclipse YT Music</div>
+          <div style="font-size:.85rem;color:var(--color-text-muted)">Cloudflare Worker addon</div>
+        </div>
+      </div>
+      <a class="btn btn-secondary" href="${manifestUrl}" target="_blank" rel="noopener noreferrer">Open manifest</a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <div class="eyebrow">YouTube + YouTube Music search • Eclipse-ready manifest</div>
+          <h1>Generate your addon URL and drop it straight into Eclipse.</h1>
+          <p>This worker ships a clean manifest endpoint, search, album lookup, playback URL resolution, and download URL passthrough. The page is built to make setup fast on desktop or mobile.</p>
+          <div class="cta-row">
+            <button class="btn btn-primary" id="copyManifest">Copy manifest URL</button>
+            <a class="btn btn-secondary" href="#setup">Install steps</a>
+          </div>
+          <div class="mini-grid">
+            <div class="stat-card"><strong>Search</strong><span class="muted">YouTube Music track search</span></div>
+            <div class="stat-card"><strong>Playback</strong><span class="muted">HLS first, MP4 fallback</span></div>
+            <div class="stat-card"><strong>Deploy</strong><span class="muted">Cloudflare Workers + Wrangler</span></div>
+          </div>
+        </div>
+
+        <aside class="panel generator" aria-label="Manifest generator">
+          <h2>Manifest URL</h2>
+          <p>Most deployments can use the auto-detected Worker origin instantly.</p>
+          <div class="stack">
+            <div class="field">
+              <label for="baseUrl">Worker base URL</label>
+              <input id="baseUrl" type="url" value="${baseUrl}" />
+            </div>
+            <button class="btn btn-primary" id="generateBtn">Generate manifest URL</button>
+            <div class="output" id="manifestOutput">${manifestUrl}</div>
+            <div class="cta-row">
+              <button class="btn btn-secondary" id="copyBtn">Copy</button>
+              <a class="btn btn-secondary" id="openBtn" href="${manifestUrl}" target="_blank" rel="noopener noreferrer">Open</a>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section" id="features">
+      <div class="container">
+        <h2 class="section-title">What this worker includes</h2>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>Manifest endpoint</h3>
+            <p>A single <code class="inline">/manifest.json</code> endpoint exposes Eclipse-facing metadata and server endpoints for search, stream, album, and download actions.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Automatic visitorData refresh</h3>
+            <p>The worker refreshes visitor identity with TTL-backed caching so first play and retry behavior stay smoother across sessions.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Nice install page</h3>
+            <p>Users get a polished landing page that shows the ready-to-copy manifest URL, plus a dead-simple setup flow that works well on mobile.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="setup">
+      <div class="container">
+        <h2 class="section-title">Install flow</h2>
+        <div class="steps">
+          <article class="feature-card">
+            <div class="step-number">1</div>
+            <h3>Deploy the Worker</h3>
+            <p>Run <code class="inline">npm install</code> and then <code class="inline">npm run deploy</code>. Cloudflare will assign your worker URL.</p>
+          </article>
+          <article class="feature-card">
+            <div class="step-number">2</div>
+            <h3>Copy the manifest</h3>
+            <p>Use the copy button on this page. The manifest URL points to <code class="inline">/manifest.json</code> on your worker origin.</p>
+          </article>
+          <article class="feature-card">
+            <div class="step-number">3</div>
+            <h3>Add it in Eclipse</h3>
+            <p>Paste that URL into Eclipse addon installation and the app can call the worker-backed endpoints directly.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">Built for Eclipse addon hosting on Cloudflare Workers.</div>
+  </footer>
+
+  <script>
+    const baseUrlInput = document.getElementById('baseUrl');
+    const manifestOutput = document.getElementById('manifestOutput');
+    const openBtn = document.getElementById('openBtn');
+
+    function normalizeBaseUrl(url) {
+      return String(url || '').trim().replace(/\/$/, '');
+    }
+
+    function updateManifest() {
+      const base = normalizeBaseUrl(baseUrlInput.value || window.location.origin);
+      const manifest = base + '/manifest.json';
+      manifestOutput.textContent = manifest;
+      openBtn.href = manifest;
+      return manifest;
+    }
+
+    async function copyText(text, button) {
+      try {
+        await navigator.clipboard.writeText(text);
+        const old = button.textContent;
+        button.textContent = 'Copied';
+        setTimeout(() => button.textContent = old, 1400);
+      } catch {
+        const range = document.createRange();
+        range.selectNodeContents(manifestOutput);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('copy');
+        selection.removeAllRanges();
+      }
+    }
+
+    document.getElementById('generateBtn').addEventListener('click', () => updateManifest());
+    document.getElementById('copyBtn').addEventListener('click', (e) => copyText(updateManifest(), e.currentTarget));
+    document.getElementById('copyManifest').addEventListener('click', (e) => copyText(updateManifest(), e.currentTarget));
+    baseUrlInput.addEventListener('input', updateManifest);
+    updateManifest();
+  </script>
+</body>
+</html>`;
+}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (request.method === 'OPTIONS')
-      return new Response(null, { headers: cors(request.headers.get('Origin')) });
+    if (request.method === 'OPTIONS') return json({}, 204);
 
-    const { pathname } = url;
+    try {
+      if (url.pathname === '/') {
+        return html(website(url.origin));
+      }
 
-    // ── Landing page ──────────────────────────────────────────────────────────
-    if (pathname === '/' || pathname === '')
-      return new Response(HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      if (url.pathname === '/manifest.json') {
+        return json(buildManifest(url.origin));
+      }
 
-    // ── Token generator ───────────────────────────────────────────────────────
-    if (pathname === '/generate-token') {
-      const arr = new Uint8Array(16);
-      crypto.getRandomValues(arr);
-      const token = Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
-      const addonBase = `${url.origin}/u/${token}`;
-      return jsonResp({ token, addonBase, manifestUrl: `${addonBase}/manifest.json` }, request);
+      if (url.pathname === '/api/search') {
+        const query = url.searchParams.get('query') || '';
+        const limit = Number(url.searchParams.get('limit') || '20');
+        return json(await searchTracks(query, limit, env));
+      }
+
+      if (url.pathname === '/api/stream') {
+        const trackId = url.searchParams.get('trackId');
+        const quality = url.searchParams.get('quality') || QUALITY.HIGH;
+        const forceDirectMp4 = url.searchParams.get('forceDirectMp4') === 'true';
+        if (!trackId) return json({ error: 'Missing trackId' }, 400);
+        return json(await getTrackStreamUrl(trackId, quality, {}, env, forceDirectMp4));
+      }
+
+      if (url.pathname === '/api/download') {
+        const trackId = url.searchParams.get('trackId');
+        const quality = url.searchParams.get('quality') || '128';
+        if (!trackId) return json({ error: 'Missing trackId' }, 400);
+        return json(await getTrackDownloadUrl(trackId, quality, {}));
+      }
+
+      if (url.pathname === '/api/album') {
+        const albumId = url.searchParams.get('albumId');
+        if (!albumId) return json({ error: 'Missing albumId' }, 400);
+        return json(await getAlbum(albumId, env));
+      }
+
+      return json({ error: 'Not found' }, 404);
+    } catch (error) {
+      return json({ error: error.message || 'Unknown error' }, 500);
     }
-
-    // ── All addon routes are under /u/:token/ ──────────────────────────────────
-    const tokenMatch = pathname.match(/^\/u\/([0-9a-f]{32})(\/.*)?$/);
-    if (!tokenMatch) return errResp(404, 'Not found', request);
-
-    const token = tokenMatch[1];
-    const sub   = (tokenMatch[2] || '/').split('?')[0];
-    const addonBase = `${url.origin}/u/${token}`;
-
-    // Manifest
-    if (sub === '/manifest.json')
-      return jsonResp(buildManifest(addonBase), request);
-
-    // Search
-    if (sub === '/search') {
-      const q = url.searchParams.get('q') || url.searchParams.get('query') || url.searchParams.get('s') || '';
-      const limit = Math.min(parseInt(url.searchParams.get('limit') || '20', 10), 50);
-      if (!q) return jsonResp({ tracks: [], albums: [], artists: [], playlists: [] }, request);
-      try { return jsonResp(await doSearch(q, limit, env), request); }
-      catch (e) { return errResp(502, e.message, request); }
-    }
-
-    // Stream  — Eclipse expects: { url, format, quality, expiresAt }
-    if (sub.startsWith('/stream/')) {
-      const videoId = sub.slice(8);
-      if (!videoId) return errResp(400, 'Missing videoId', request);
-      const forceMP4 = url.searchParams.get('forceDirectMp4') === '1';
-      try {
-        const sd = await fetchPlayerData(videoId, env);
-        if (!sd) return errResp(502, 'No streaming data', request);
-
-        // HLS preferred
-        if (!forceMP4 && sd.hlsManifestUrl) {
-          return jsonResp({
-            url: sd.hlsManifestUrl,
-            format: 'hls',
-            quality: 'high',
-            expiresAt: Math.floor(Date.now() / 1000) + 21600,
-          }, request);
-        }
-
-        // mp4 fallback
-        const preferLow = url.searchParams.get('quality') === 'low';
-        const mp4 = pickMp4Url(sd, preferLow);
-        if (mp4) {
-          return jsonResp({
-            url: mp4,
-            format: 'aac',
-            quality: preferLow ? '128kbps' : '256kbps',
-            expiresAt: Math.floor(Date.now() / 1000) + 21600,
-          }, request);
-        }
-        return errResp(404, 'No playable audio for ' + videoId, request);
-      } catch (e) { return errResp(502, e.message, request); }
-    }
-
-    // Album
-    if (sub.startsWith('/album/')) {
-      const browseId = sub.slice(7);
-      if (!browseId) return errResp(400, 'Missing browseId', request);
-      try { return jsonResp(await fetchAlbum(browseId, env), request); }
-      catch (e) { return errResp(502, e.message, request); }
-    }
-
-    // Artist
-    if (sub.startsWith('/artist/')) {
-      const browseId = sub.slice(8);
-      if (!browseId) return errResp(400, 'Missing browseId', request);
-      try { return jsonResp(await fetchArtist(browseId, env), request); }
-      catch (e) { return errResp(502, e.message, request); }
-    }
-
-    // Download
-    if (sub.startsWith('/download/')) {
-      const videoId = sub.slice(10);
-      if (!videoId) return errResp(400, 'Missing videoId', request);
-      try {
-        const resp = await fetch(DOWNLOAD_API + videoId + '?s=5');
-        if (!resp.ok) throw new Error('Download API HTTP ' + resp.status);
-        const data = await resp.json();
-        if (!data.downloadUrl) throw new Error('No downloadUrl in response');
-        return jsonResp({
-          url: data.downloadUrl,
-          format: 'mp3',
-          quality: '320kbps',
-          expiresAt: Math.floor(Date.now() / 1000) + 3600,
-        }, request);
-      } catch (e) { return errResp(502, e.message, request); }
-    }
-
-    return errResp(404, 'Not found', request);
   },
 };
