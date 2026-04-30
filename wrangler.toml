@@ -3,7 +3,7 @@ main = "index.js"
 compatibility_date = "2025-01-01"
 
 [vars]
-ADDON_VERSION = "1.1.0"
+ADDON_VERSION = "1.3.0"
 
 # ── Upstash Redis ──────────────────────────────────────────────────────────────
 # Set these as Worker secrets (NOT plain vars) so they stay out of source code:

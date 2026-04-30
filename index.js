@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky  |  version: 1.2.0
+// author: ricky  |  version: 1.3.0
 
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
@@ -15,13 +15,12 @@ const IOS_CLIENT_BASE = {
   osName: 'iPhone', osVersion: '18.3.2.22D82', hl: 'en',
 };
 
-// YTM per-tab search params
 const SEARCH_PARAMS = {
-  songs:    'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
-  videos:   'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D',
-  albums:   'EgWKAQIYAWoKEAkQChAFEAMQBA%3D%3D',
-  artists:  'EgWKAQIgAWoKEAkQChAFEAMQBA%3D%3D',
-  playlists:'EgWKAQIoAWoKEAkQChAFEAMQBA%3D%3D',
+  songs:     'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
+  videos:    'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D',
+  albums:    'EgWKAQIYAWoKEAkQChAFEAMQBA%3D%3D',
+  artists:   'EgWKAQIgAWoKEAkQChAFEAMQBA%3D%3D',
+  playlists: 'EgWKAQIoAWoKEAkQChAFEAMQBA%3D%3D',
 };
 
 const SEARCH_HEADERS = {
@@ -31,14 +30,14 @@ const SEARCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 };
 
-// ─── Upstash Redis (direct REST fetch — no npm package) ──────────────────────
+// ─── Upstash Redis ─────────────────────────────────────────────────────────────
 
 async function upstashCmd(env, ...args) {
   const url   = env?.UPSTASH_REDIS_REST_URL;
   const token = env?.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) return null;
   try {
-    const res  = await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(args),
@@ -48,7 +47,7 @@ async function upstashCmd(env, ...args) {
   } catch { return null; }
 }
 
-// ─── visitorData — Upstash Redis TTL cache ───────────────────────────────────
+// ─── visitorData via Upstash ───────────────────────────────────────────────────
 
 async function getVisitorData(env) {
   const cached = await upstashCmd(env, 'GET', 'ytm:visitor');
@@ -64,12 +63,12 @@ async function fetchFreshVisitorData(env) {
       body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT } }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const d  = await resp.json();
+    const d = await resp.json();
     const vd = d?.responseContext?.visitorData || null;
     if (vd) upstashCmd(env, 'SET', 'ytm:visitor', vd, 'EX', VISITOR_TTL_SEC);
     return vd;
   } catch (e) {
-    console.log(LOG_PREFIX, 'visitorData fetch failed:', e.message);
+    console.log(LOG_PREFIX, 'visitorData failed:', e.message);
     return null;
   }
 }
@@ -79,7 +78,7 @@ function tryRefreshVisitor(data, env) {
   if (vd) upstashCmd(env, 'SET', 'ytm:visitor', vd, 'EX', VISITOR_TTL_SEC);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function parseDuration(text) {
   if (!text) return 0;
@@ -103,9 +102,7 @@ function bestThumbnail(thumbnails) {
   return thumbnails.reduce((b, t) => ((t.width || 0) > (b.width || 0) ? t : b)).url;
 }
 
-function isBullet(text) {
-  return /^\s*[•·]\s*$/.test(text || '');
-}
+function isBullet(text) { return /^\s*[•·]\s*$/.test(text || ''); }
 
 function parseInfoRuns(runs) {
   if (!runs?.length) return { artist: '', album: '' };
@@ -116,9 +113,7 @@ function parseInfoRuns(runs) {
     else cur += (run.text || '');
   }
   if (cur.trim()) parts.push(cur.trim());
-  // Drop trailing duration strings
   while (parts.length > 1 && /^\d{1,2}:\d{2}(:\d{2})?$/.test(parts[parts.length - 1])) parts.pop();
-  // Drop leading type labels
   const typeLabels = new Set(['Song','Video','EP','Single','Podcast','Album','Playlist','Compilation']);
   let idx = 0;
   if (parts.length > 1 && typeLabels.has(parts[0])) idx = 1;
@@ -131,47 +126,73 @@ function buildIosContext(visitorData) {
   return ctx;
 }
 
-// ─── Item parsers ─────────────────────────────────────────────────────────────
+// ─── Shared YTM browse POST ────────────────────────────────────────────────────
 
-function parseTrackRenderer(r) {
+async function ytmBrowse(browseId, env) {
+  const resp = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${YTM_API_KEY}`, {
+    method: 'POST', headers: SEARCH_HEADERS,
+    body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT }, browseId }),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} Browse HTTP ${resp.status}`);
+  const data = await resp.json();
+  tryRefreshVisitor(data, env);
+  return data;
+}
+
+// ─── Track renderer parser (used everywhere) ───────────────────────────────────
+
+function getVideoId(r) {
   if (!r) return null;
-  const videoId =
+  return (
     r.playlistItemData?.videoId ||
     r.overlay?.musicItemThumbnailOverlayRenderer?.content
-      ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
+      ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId ||
+    r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs
+      ?.find(run => run.navigationEndpoint?.watchEndpoint?.videoId)
+      ?.navigationEndpoint?.watchEndpoint?.videoId ||
+    null
+  );
+}
+
+function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
+  if (!r) return null;
+  const videoId = getVideoId(r);
   if (!videoId) return null;
 
-  const title    = (r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [])
-                     .map(t => t.text).join('').trim();
+  const titleRuns = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+  const title = titleRuns.map(t => t.text).join('').trim();
   const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-  const info     = parseInfoRuns(infoRuns);
+  const info = parseInfoRuns(infoRuns);
 
   const durationText =
     r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text ||
     extractDurationFromRuns(infoRuns);
 
+  const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+
   return {
-    id: videoId, title,
-    artist: info.artist, album: info.album,
+    id: videoId,
+    title: title || 'Unknown',
+    artist: info.artist || fallbackArtist || '',
+    album:  info.album  || fallbackAlbum  || '',
     duration: parseDuration(durationText),
-    artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []),
+    artworkURL: bestThumbnail(thumbs) || fallbackArtwork || '',
     format: 'aac',
   };
 }
 
+// ─── Album item parser (from search shelves) ───────────────────────────────────
+
 function parseAlbumItem(item) {
-  // musicTwoRowItemRenderer (most common in albums shelf)
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
-    const id =
-      r2.navigationEndpoint?.browseEndpoint?.browseId ||
-      r2.overlay?.musicItemThumbnailOverlayRenderer?.content
-        ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
+    const id = r2.navigationEndpoint?.browseEndpoint?.browseId ||
+               r2.overlay?.musicItemThumbnailOverlayRenderer?.content
+                 ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
     if (!id) return null;
-    const title   = r2.title?.runs?.[0]?.text || '';
-    const subRuns = r2.subtitle?.runs || [];
+    const title = r2.title?.runs?.[0]?.text || '';
     const skipSet = new Set(['Album','EP','Single','Compilation','Podcast']);
-    const artist  = subRuns
+    const artist = (r2.subtitle?.runs || [])
       .filter(r => !isBullet(r.text) && !/^\d{4}$/.test(r.text.trim()) && !skipSet.has(r.text.trim()))
       .map(r => r.text.trim()).filter(Boolean).join(' ').trim();
     return {
@@ -179,7 +200,6 @@ function parseAlbumItem(item) {
       artworkURL: bestThumbnail(r2.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []),
     };
   }
-  // musicResponsiveListItemRenderer fallback
   const r = item?.musicResponsiveListItemRenderer;
   if (r) {
     const id = r.navigationEndpoint?.browseEndpoint?.browseId;
@@ -202,45 +222,33 @@ function parseArtistItem(item) {
   const name = (r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [])
                  .map(t => t.text).join('').trim();
   if (!id || !name) return null;
-  return {
-    id, name,
-    artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []),
-  };
+  return { id, name, artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
 }
 
 function parsePlaylistItem(item) {
-  // musicTwoRowItemRenderer
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
-    const id =
-      r2.navigationEndpoint?.browseEndpoint?.browseId ||
-      r2.overlay?.musicItemThumbnailOverlayRenderer?.content
-        ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
+    const id = r2.navigationEndpoint?.browseEndpoint?.browseId ||
+               r2.overlay?.musicItemThumbnailOverlayRenderer?.content
+                 ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
     if (!id) return null;
-    const title = r2.title?.runs?.[0]?.text || '';
-    const subRuns = r2.subtitle?.runs || [];
-    const creator = subRuns.filter(r => !isBullet(r.text)).map(r => r.text.trim()).filter(Boolean)[0] || '';
-    return {
-      id, title, creator,
-      artworkURL: bestThumbnail(r2.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []),
-    };
+    const title   = r2.title?.runs?.[0]?.text || '';
+    const creator = (r2.subtitle?.runs || []).filter(r => !isBullet(r.text))
+                      .map(r => r.text.trim()).filter(Boolean)[0] || '';
+    return { id, title, creator, artworkURL: bestThumbnail(r2.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
   }
-  // musicResponsiveListItemRenderer
   const r = item?.musicResponsiveListItemRenderer;
   if (r) {
     const id = r.navigationEndpoint?.browseEndpoint?.browseId;
     if (!id) return null;
     const title = (r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [])
                     .map(t => t.text).join('').trim();
-    return {
-      id, title,
-      artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []),
-    };
+    return { id, title, artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
   }
   return null;
 }
 
-// ─── YTM search helper ────────────────────────────────────────────────────────
+// ─── YTM search helper ─────────────────────────────────────────────────────────
 
 async function ytmSearch(query, params, env) {
   const body = { context: { client: WEB_REMIX_CONTEXT }, query };
@@ -261,8 +269,7 @@ function getShelves(data) {
   ).map(s => s.musicShelfRenderer).filter(Boolean);
 }
 
-// ─── Search — 5 parallel tab fetches ─────────────────────────────────────────
-// Songs + Videos + Albums + Artists + Playlists tabs fired simultaneously
+// ─── Search ────────────────────────────────────────────────────────────────────
 
 async function handleSearch(query, env) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
@@ -275,17 +282,13 @@ async function handleSearch(query, env) {
     ytmSearch(query, SEARCH_PARAMS.playlists, env),
   ]);
 
-  const tracks    = [];
-  const albums    = [];
-  const artists   = [];
-  const playlists = [];
-  const seenIds   = new Set();
+  const tracks = [], albums = [], artists = [], playlists = [];
+  const seenIds = new Set();
 
   function addTrack(t) {
     if (t && !seenIds.has(t.id)) { seenIds.add(t.id); tracks.push(t); }
   }
 
-  // Songs
   if (songsR.status === 'fulfilled') {
     for (const shelf of getShelves(songsR.value)) {
       for (const item of shelf.contents || []) {
@@ -294,8 +297,6 @@ async function handleSearch(query, env) {
       }
     }
   }
-
-  // Videos
   if (videosR.status === 'fulfilled') {
     for (const shelf of getShelves(videosR.value)) {
       for (const item of shelf.contents || []) {
@@ -304,8 +305,6 @@ async function handleSearch(query, env) {
       }
     }
   }
-
-  // Albums
   if (albumsR.status === 'fulfilled') {
     for (const shelf of getShelves(albumsR.value)) {
       for (const item of shelf.contents || []) {
@@ -314,8 +313,6 @@ async function handleSearch(query, env) {
       }
     }
   }
-
-  // Artists
   if (artistsR.status === 'fulfilled') {
     for (const shelf of getShelves(artistsR.value)) {
       for (const item of shelf.contents || []) {
@@ -324,8 +321,6 @@ async function handleSearch(query, env) {
       }
     }
   }
-
-  // Playlists
   if (playlistsR.status === 'fulfilled') {
     for (const shelf of getShelves(playlistsR.value)) {
       for (const item of shelf.contents || []) {
@@ -338,7 +333,7 @@ async function handleSearch(query, env) {
   return { tracks, albums, artists, playlists };
 }
 
-// ─── Stream ───────────────────────────────────────────────────────────────────
+// ─── Stream ────────────────────────────────────────────────────────────────────
 
 async function fetchPlayerData(trackId, env) {
   const visitorData = await getVisitorData(env);
@@ -354,7 +349,7 @@ async function fetchPlayerData(trackId, env) {
     }),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
-  const data   = await resp.json();
+  const data = await resp.json();
   const status = data?.playabilityStatus?.status;
   if (status !== 'OK') {
     upstashCmd(env, 'DEL', 'ytm:visitor');
@@ -379,18 +374,12 @@ async function handleStream(trackId, env) {
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
-// ─── Album browse — handles both single-column and two-column YTM layouts ────
+// ─── Album browse ──────────────────────────────────────────────────────────────
 
 async function handleAlbum(albumId, env) {
-  const resp = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${YTM_API_KEY}`, {
-    method: 'POST', headers: SEARCH_HEADERS,
-    body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT }, browseId: albumId }),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} Album HTTP ${resp.status}`);
-  const data = await resp.json();
-  tryRefreshVisitor(data, env);
+  const data = await ytmBrowse(albumId, env);
 
-  // Header — try all known renderer variants
+  // Header — try every known renderer variant
   const header =
     data?.header?.musicImmersiveHeaderRenderer ||
     data?.header?.musicDetailHeaderRenderer ||
@@ -400,7 +389,6 @@ async function handleAlbum(albumId, env) {
 
   const albumTitle = header?.title?.runs?.[0]?.text || '';
 
-  // Artist from subtitle runs (find the navigable one), fallback to straplineTextOne
   let albumArtist = '';
   for (const run of header?.subtitle?.runs || []) {
     if (run.navigationEndpoint?.browseEndpoint) { albumArtist = run.text; break; }
@@ -414,65 +402,169 @@ async function handleAlbum(albumId, env) {
     header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
 
-  // Track list — try all known layout shapes
+  // Collect shelf contents from both layout types
   let shelfContents = [];
 
-  // Shape 1: singleColumnBrowseResultsRenderer
+  // Shape A: singleColumnBrowseResultsRenderer
   const singleCol = data?.contents?.singleColumnBrowseResultsRenderer;
   if (singleCol && !shelfContents.length) {
     const sections = singleCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
     for (const s of sections) {
-      if (s.musicShelfRenderer?.contents?.length) {
-        shelfContents = s.musicShelfRenderer.contents; break;
+      if (s.musicShelfRenderer?.contents?.length) { shelfContents = s.musicShelfRenderer.contents; break; }
+    }
+  }
+
+  // Shape B: twoColumnBrowseResultsRenderer
+  if (!shelfContents.length) {
+    const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
+    if (twoCol) {
+      const candidates = [
+        twoCol?.firstColumn?.musicTwoColumnItemSectionListRenderer?.contents,
+        twoCol?.secondColumn?.sectionListRenderer?.contents,
+        twoCol?.firstColumn?.sectionListRenderer?.contents,
+      ];
+      for (const col of candidates) {
+        if (!col) continue;
+        for (const s of col) {
+          if (s.musicShelfRenderer?.contents?.length) { shelfContents = s.musicShelfRenderer.contents; break; }
+          if (s.musicResponsiveListItemRenderer) { shelfContents = col; break; }
+        }
+        if (shelfContents.length) break;
       }
     }
   }
 
-  // Shape 2: twoColumnBrowseResultsRenderer (newer YTM album pages)
-  const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
-  if (twoCol && !shelfContents.length) {
-    // Tracks usually live in the first/second column section list
-    const candidates = [
-      twoCol?.firstColumn?.musicTwoColumnItemSectionListRenderer?.contents,
-      twoCol?.secondColumn?.sectionListRenderer?.contents,
-      twoCol?.firstColumn?.sectionListRenderer?.contents,
-    ];
-    for (const col of candidates) {
-      if (!col) continue;
-      for (const s of col) {
-        if (s.musicShelfRenderer?.contents?.length) {
-          shelfContents = s.musicShelfRenderer.contents; break;
-        }
-        if (s.musicResponsiveListItemRenderer) {
-          shelfContents = col; break;
-        }
-      }
-      if (shelfContents.length) break;
-    }
+  // Parse tracks — use shared parseTrackRenderer so videoId logic is unified
+  const tracks = [];
+  for (let i = 0; i < shelfContents.length; i++) {
+    const item = shelfContents[i];
+    const r    = item?.musicResponsiveListItemRenderer;
+    if (!r) continue;
+    const t = parseTrackRenderer(r, albumArtist, albumTitle, artworkURL);
+    if (!t) continue;
+    // Album tracks get the album artwork even if thumbnail is missing
+    if (!t.artworkURL) t.artworkURL = artworkURL;
+    t.album      = albumTitle;
+    t.trackNumber = i + 1;
+    tracks.push(t);
   }
 
-  const tracks = shelfContents
-    .filter(c => c.musicResponsiveListItemRenderer?.playlistItemData?.videoId)
-    .map((c, i) => {
-      const r = c.musicResponsiveListItemRenderer;
-      const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-      const durationText =
-        r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text ||
-        extractDurationFromRuns(infoRuns);
-      return {
-        id: r.playlistItemData.videoId,
-        title: r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text || '',
-        artist: albumArtist, album: albumTitle,
-        trackNumber: i + 1,
-        duration: parseDuration(durationText),
-        artworkURL, format: 'aac',
-      };
-    });
-
-  return { id: albumId, title: albumTitle, artist: albumArtist, artworkURL, trackCount: tracks.length, tracks };
+  return {
+    id: albumId, title: albumTitle, artist: albumArtist,
+    artworkURL, trackCount: tracks.length, tracks,
+  };
 }
 
-// ─── Token helpers ────────────────────────────────────────────────────────────
+// ─── Artist browse ─────────────────────────────────────────────────────────────
+
+async function handleArtist(artistId, env) {
+  const data = await ytmBrowse(artistId, env);
+
+  // Header
+  const header =
+    data?.header?.musicImmersiveHeaderRenderer ||
+    data?.header?.musicVisualHeaderRenderer ||
+    {};
+  const name = header?.title?.runs?.[0]?.text || 'Unknown Artist';
+  const artworkURL = bestThumbnail(
+    header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
+    header?.foregroundThumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
+    header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
+  );
+
+  // Sections
+  const sections =
+    data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
+      ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+
+  const topTracks = [];
+  const albums    = [];
+
+  for (const section of sections) {
+    // Top Songs — musicShelfRenderer
+    const shelf = section?.musicShelfRenderer;
+    if (shelf) {
+      for (const item of shelf.contents || []) {
+        const t = parseTrackRenderer(item.musicResponsiveListItemRenderer, name, '', '');
+        if (t && topTracks.length < 10) topTracks.push(t);
+      }
+    }
+
+    // Albums / Singles / EPs — musicCarouselShelfRenderer
+    const carousel = section?.musicCarouselShelfRenderer;
+    if (carousel) {
+      const carouselTitle =
+        carousel.header?.musicCarouselShelfBasicHeaderRenderer?.title?.runs?.[0]?.text || '';
+      // Include all: Albums, Singles, EPs, Compilations, Videos
+      for (const item of carousel.contents || []) {
+        const a = parseAlbumItem(item);
+        if (a && albums.length < 30) albums.push({ ...a, artist: a.artist || name });
+      }
+    }
+
+    // Some pages use musicDescriptionShelfRenderer for bio — skip
+    // Some pages put top songs in a musicCarouselShelfRenderer titled "Songs"
+    if (!shelf && !carousel) {
+      const descShelf = section?.musicDescriptionShelfRenderer;
+      // ignore bios here
+    }
+  }
+
+  return {
+    id: artistId, name, artworkURL, bio: null,
+    topTracks, albums,
+  };
+}
+
+// ─── Playlist browse ───────────────────────────────────────────────────────────
+
+async function handlePlaylist(playlistId, env) {
+  // YTM browse IDs for playlists use VL prefix
+  const browseId = playlistId.startsWith('VL') ? playlistId : 'VL' + playlistId;
+  const data = await ytmBrowse(browseId, env);
+
+  // Header — playlists use musicDetailHeaderRenderer or musicEditableEntryPointHeaderRenderer
+  const header =
+    data?.header?.musicDetailHeaderRenderer ||
+    data?.header?.musicEditableEntryPointHeaderRenderer?.header?.musicDetailHeaderRenderer ||
+    data?.header?.musicImmersiveHeaderRenderer ||
+    {};
+
+  const title = header?.title?.runs?.[0]?.text || 'Playlist';
+  // Creator / subtitle: join all non-bullet runs, skip "Playlist" label
+  const creator = (header?.subtitle?.runs || [])
+    .filter(r => !isBullet(r.text) && r.text !== 'Playlist')
+    .map(r => r.text.trim()).filter(Boolean).join('').trim();
+  const artworkURL = bestThumbnail(
+    header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
+    header?.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
+  );
+
+  // Tracks live in sectionListRenderer > musicShelfRenderer OR musicPlaylistShelfRenderer
+  const sections =
+    data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
+      ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+
+  const tracks = [];
+
+  for (const section of sections) {
+    // Standard shelf
+    const shelf = section?.musicShelfRenderer || section?.musicPlaylistShelfRenderer;
+    if (shelf) {
+      for (const item of shelf.contents || []) {
+        const t = parseTrackRenderer(item.musicResponsiveListItemRenderer);
+        if (t) tracks.push(t);
+      }
+    }
+  }
+
+  return {
+    id: playlistId, title, creator,
+    artworkURL, trackCount: tracks.length, tracks,
+  };
+}
+
+// ─── Token helpers ─────────────────────────────────────────────────────────────
 
 function generateToken() {
   const arr = new Uint8Array(14);
@@ -487,13 +579,13 @@ function parseTokenPath(pathname) {
 }
 function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || ''; }
 
-// ─── Eclipse manifest ─────────────────────────────────────────────────────────
+// ─── Eclipse manifest ──────────────────────────────────────────────────────────
 
 function buildManifest() {
   return {
     id: 'com.ricky.youtube-music',
     name: 'YouTube Music',
-    version: '1.2.0',
+    version: '1.3.0',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS preferred, MP4 fallback.',
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'catalog'],
@@ -502,7 +594,7 @@ function buildManifest() {
   };
 }
 
-// ─── Shared route handler ─────────────────────────────────────────────────────
+// ─── Route handler (shared by token + tokenless paths) ────────────────────────
 
 async function handleRoute(rest, url, env) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
@@ -525,10 +617,22 @@ async function handleRoute(rest, url, env) {
     return jsonRes(await handleAlbum(id, env));
   }
 
+  if (rest.startsWith('/artist/')) {
+    const id = lastSegment(rest);
+    if (!id) return jsonRes({ error: 'Missing artist ID' }, 400);
+    return jsonRes(await handleArtist(id, env));
+  }
+
+  if (rest.startsWith('/playlist/')) {
+    const id = lastSegment(rest);
+    if (!id) return jsonRes({ error: 'Missing playlist ID' }, 400);
+    return jsonRes(await handlePlaylist(id, env));
+  }
+
   return null;
 }
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
+// ─── Response helpers ──────────────────────────────────────────────────────────
 
 function jsonRes(data, status) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -542,9 +646,11 @@ function jsonRes(data, status) {
     },
   });
 }
-function htmlRes(b) { return new Response(b, { headers: { 'content-type': 'text/html; charset=utf-8' } }); }
+function htmlRes(b) {
+  return new Response(b, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
 
-// ─── Landing page ─────────────────────────────────────────────────────────────
+// ─── Landing page ──────────────────────────────────────────────────────────────
 
 function buildPage() {
   return `<!DOCTYPE html>
@@ -627,11 +733,11 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>
     <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
-    <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists</div></div>
+    <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse support</div></div>
   </div>
-  <div class="warn">Stream priority: <b>HLS &rarr; MP4</b>. YouTube URLs expire — never cached. visitorData cached 20 min via Upstash Redis.</div>
+  <div class="warn">Endpoints: /search /stream/:id /album/:id /artist/:id /playlist/:id<br>Stream priority: <b>HLS &rarr; MP4</b>. visitorData cached 20 min via Upstash Redis.</div>
 </div>
-<footer>YouTube Music for Eclipse v1.2.0 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.3.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -679,11 +785,11 @@ function copyText(text,btn){
 </html>`;
 }
 
-// ─── Worker entry ─────────────────────────────────────────────────────────────
+// ─── Worker entry ──────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request, env) {
-    const url      = new URL(request.url);
+    const url = new URL(request.url);
     const { pathname } = url;
 
     if (request.method === 'OPTIONS') {
@@ -706,13 +812,13 @@ export default {
         let body = {};
         try { body = await request.json(); } catch {}
         const raw = String(body.existingUrl || '').trim();
-        const m   = raw.match(/\/u\/([a-f0-9]{28})/);
+        const m = raw.match(/\/u\/([a-f0-9]{28})/);
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain /u/{token}/' }, 400);
         return jsonRes({ token: m[1], manifestUrl: `${url.origin}/u/${m[1]}/manifest.json`, refreshed: true });
       }
 
       if (pathname === '/health')
-        return jsonRes({ status: 'ok', version: '1.2.0', ts: new Date().toISOString() });
+        return jsonRes({ status: 'ok', version: '1.3.0', ts: new Date().toISOString() });
 
       // Token-scoped routes  /u/:token/...
       const tp = parseTokenPath(pathname);
@@ -720,10 +826,10 @@ export default {
         if (!isValidToken(tp.token)) return jsonRes({ error: 'Invalid token.' }, 400);
         const result = await handleRoute(tp.rest, url, env);
         if (result) return result;
-        return jsonRes({ error: 'Not found' }, 404);
+        return jsonRes({ error: 'Not found', path: tp.rest }, 404);
       }
 
-      // Tokenless (for direct testing)
+      // Tokenless (direct testing)
       const base = await handleRoute(pathname, url, env);
       if (base) return base;
 
