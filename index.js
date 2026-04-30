@@ -1,3 +1,8 @@
+// ─── YouTube Music — Eclipse Addon ────────────────────────────────────────────
+// Cloudflare Workers edition
+// author: ricky
+// version: 1.0.0
+
 const LOG_PREFIX = '[YTMusic]';
 const YTM_BASE = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -20,16 +25,12 @@ const IOS_CLIENT_BASE = {
   hl: 'en',
 };
 
-const QUALITY = {
-  LOW: 'LOW',
-  HIGH: 'HIGH',
-  LOSSLESS: 'LOSSLESS',
-};
+const QUALITY = { LOW: 'LOW', HIGH: 'HIGH', LOSSLESS: 'LOSSLESS' };
 
 const QUALITY_OPTIONS = [
   { label: 'Low (saves data)', value: QUALITY.LOW },
-  { label: 'High', value: QUALITY.HIGH },
-  { label: 'Best Available', value: QUALITY.LOSSLESS },
+  { label: 'High',             value: QUALITY.HIGH },
+  { label: 'Best Available',   value: QUALITY.LOSSLESS },
 ];
 
 const DOWNLOAD_QUALITY_OPTIONS = [
@@ -38,6 +39,22 @@ const DOWNLOAD_QUALITY_OPTIONS = [
 ];
 
 const DOWNLOAD_API_BASE = 'https://capi.y2jar.cc/scr/';
+
+// ─── Token generation ─────────────────────────────────────────────────────────
+// Tokens are cosmetic — they make every generated URL unique so users can
+// share / re-install without collision.  No auth or storage needed.
+
+function generateToken() {
+  const arr = new Uint8Array(14);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function isValidToken(t) {
+  return typeof t === 'string' && /^[a-f0-9]{28}$/.test(t);
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function parseDuration(text) {
   if (!text) return 0;
@@ -49,22 +66,18 @@ function parseDuration(text) {
 
 function bestThumbnail(thumbnails) {
   if (!thumbnails || !thumbnails.length) return '';
-  return thumbnails.reduce((best, t) => ((t.width || 0) > (best.width || 0) ? t : best)).url;
+  return thumbnails.reduce((b, t) => ((t.width || 0) > (b.width || 0) ? t : b)).url;
 }
 
 function parseInfoRuns(runs) {
   if (!runs || !runs.length) return { artist: '', album: '' };
   const parts = [];
-  let current = '';
+  let cur = '';
   for (const run of runs) {
-    if (run.text === ' • ') {
-      if (current) parts.push(current.trim());
-      current = '';
-    } else {
-      current += run.text;
-    }
+    if (run.text === ' \u2022 ') { if (cur) parts.push(cur.trim()); cur = ''; }
+    else cur += run.text;
   }
-  if (current) parts.push(current.trim());
+  if (cur) parts.push(cur.trim());
   while (parts.length > 1 && /^\d+:\d{2}(:\d{2})?$/.test(parts[parts.length - 1])) parts.pop();
   const typeLabels = ['Song', 'Video', 'EP', 'Single', 'Podcast'];
   let idx = 0;
@@ -78,6 +91,8 @@ function buildIosContext(visitorData) {
   return ctx;
 }
 
+// ─── visitorData — KV-backed TTL cache ────────────────────────────────────────
+
 async function fetchFreshVisitorData(env) {
   try {
     const resp = await fetch(`${YTM_BASE}/youtubei/v1/visitor_id?key=${YTM_API_KEY}`, {
@@ -87,15 +102,15 @@ async function fetchFreshVisitorData(env) {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const d = await resp.json();
-    const visitorData = d?.responseContext?.visitorData || null;
-    if (visitorData && env.YTM_CACHE) {
+    const vd = d?.responseContext?.visitorData || null;
+    if (vd && env && env.YTM_CACHE) {
       await env.YTM_CACHE.put(
         'visitorData',
-        JSON.stringify({ visitorData, fetchedAt: Date.now() }),
+        JSON.stringify({ visitorData: vd, fetchedAt: Date.now() }),
         { expirationTtl: Math.floor(VISITOR_DATA_TTL_MS / 1000) }
       );
     }
-    return visitorData;
+    return vd;
   } catch (e) {
     console.log(LOG_PREFIX, 'visitorData fetch failed:', e.message);
     return null;
@@ -103,31 +118,31 @@ async function fetchFreshVisitorData(env) {
 }
 
 async function getVisitorData(env) {
-  if (env.YTM_CACHE) {
-    const raw = await env.YTM_CACHE.get('visitorData');
-    if (raw) {
-      try {
+  if (env && env.YTM_CACHE) {
+    try {
+      const raw = await env.YTM_CACHE.get('visitorData');
+      if (raw) {
         const cached = JSON.parse(raw);
-        if (cached.visitorData && Date.now() - cached.fetchedAt < VISITOR_DATA_TTL_MS) {
+        if (cached.visitorData && Date.now() - cached.fetchedAt < VISITOR_DATA_TTL_MS)
           return cached.visitorData;
-        }
-      } catch {}
-    }
+      }
+    } catch {}
   }
-  return fetchFreshVisitorData(env);
+  return fetchFreshVisitorData(env || {});
 }
 
-async function searchTracks(query, limit = 20, env) {
-  const headers = {
-    'Content-Type': 'application/json',
-    Origin: YTM_BASE,
-    Referer: `${YTM_BASE}/`,
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  };
+// ─── Search ───────────────────────────────────────────────────────────────────
 
+async function searchTracks(query, limit, env) {
+  limit = limit || 20;
   const response = await fetch(`${YTM_BASE}/youtubei/v1/search?key=${YTM_API_KEY}`, {
     method: 'POST',
-    headers,
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: YTM_BASE,
+      Referer: `${YTM_BASE}/`,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    },
     body: JSON.stringify({
       context: { client: WEB_REMIX_CONTEXT },
       query,
@@ -135,11 +150,11 @@ async function searchTracks(query, limit = 20, env) {
     }),
   });
 
-  if (!response.ok) throw new Error(`${LOG_PREFIX} Search failed: HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Search HTTP ${response.status}`);
   const data = await response.json();
 
-  if (data?.responseContext?.visitorData && env.YTM_CACHE) {
-    await env.YTM_CACHE.put(
+  if (data?.responseContext?.visitorData && env && env.YTM_CACHE) {
+    env.YTM_CACHE.put(
       'visitorData',
       JSON.stringify({ visitorData: data.responseContext.visitorData, fetchedAt: Date.now() }),
       { expirationTtl: Math.floor(VISITOR_DATA_TTL_MS / 1000) }
@@ -147,7 +162,9 @@ async function searchTracks(query, limit = 20, env) {
   }
 
   const tracks = [];
-  const sections = data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+  const sections =
+    data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]
+      ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
 
   for (const section of sections) {
     const shelf = section.musicShelfRenderer;
@@ -156,18 +173,18 @@ async function searchTracks(query, limit = 20, env) {
       if (tracks.length >= limit) break;
       const r = item.musicResponsiveListItemRenderer;
       if (!r) continue;
-
       const videoId =
         r.playlistItemData?.videoId ||
-        r.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
+        r.overlay?.musicItemThumbnailOverlayRenderer?.content
+          ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
       if (!videoId) continue;
-
-      const title = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.map(t => t.text).join('') || '';
+      const title = r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer
+        ?.text?.runs?.map(t => t.text).join('') || '';
       const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
       const info = parseInfoRuns(infoRuns);
-      const durationText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
+      const durationText = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer
+        ?.text?.runs?.[0]?.text || '';
       const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-
       tracks.push({
         id: videoId,
         title,
@@ -182,10 +199,10 @@ async function searchTracks(query, limit = 20, env) {
   return { tracks, total: tracks.length };
 }
 
+// ─── Player ───────────────────────────────────────────────────────────────────
+
 async function fetchPlayerData(trackId, env) {
   const visitorData = await getVisitorData(env);
-  const clientContext = buildIosContext(visitorData);
-
   const response = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -193,115 +210,108 @@ async function fetchPlayerData(trackId, env) {
       'User-Agent': 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
     },
     body: JSON.stringify({
-      context: { client: clientContext },
+      context: { client: buildIosContext(visitorData) },
       videoId: trackId,
       contentCheckOk: true,
       racyCheckOk: true,
     }),
   });
 
-  if (!response.ok) throw new Error(`${LOG_PREFIX} Player HTTP error: ${response.status}`);
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${response.status}`);
   const data = await response.json();
   const status = data?.playabilityStatus?.status;
 
   if (status !== 'OK') {
-    if (env.YTM_CACHE) await env.YTM_CACHE.delete('visitorData');
-    throw new Error(`${LOG_PREFIX} Playback blocked: ${data?.playabilityStatus?.reason || status || 'unknown'}`);
+    if (env && env.YTM_CACHE) env.YTM_CACHE.delete('visitorData');
+    throw new Error(
+      `${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason || status || 'unknown'}`
+    );
   }
 
   return data.streamingData;
 }
 
 function pickMp4Url(sd, quality) {
-  const mp4Formats = (sd.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('audio/mp4') && f.url);
-  if (!mp4Formats.length) return null;
-  mp4Formats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return quality === QUALITY.LOW ? mp4Formats[mp4Formats.length - 1].url : mp4Formats[0].url;
+  const fmts = (sd.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('audio/mp4') && f.url);
+  if (!fmts.length) return null;
+  fmts.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  return quality === QUALITY.LOW ? fmts[fmts.length - 1].url : fmts[0].url;
 }
 
-async function getTrackStreamUrl(trackId, preferredQuality, context, env, forceDirectMp4 = false) {
-  const quality = context?.settings?.quality?.value || preferredQuality || QUALITY.HIGH;
+async function getTrackStreamUrl(trackId, preferredQuality, context, env, forceDirectMp4) {
+  const quality =
+    context?.settings?.quality?.value || preferredQuality || QUALITY.HIGH;
   const sd = await fetchPlayerData(trackId, env);
-  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data returned`);
+  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
   if (!forceDirectMp4 && sd.hlsManifestUrl) {
-    return {
-      streamUrl: sd.hlsManifestUrl,
-      streamType: 'hls',
-      track: { id: trackId, audioQuality: quality },
-    };
+    return { streamUrl: sd.hlsManifestUrl, streamType: 'hls', track: { id: trackId, audioQuality: quality } };
   }
 
   const mp4Url = pickMp4Url(sd, quality);
   if (mp4Url) {
-    return {
-      streamUrl: mp4Url,
-      streamType: 'mp4',
-      track: { id: trackId, audioQuality: quality },
-    };
+    return { streamUrl: mp4Url, streamType: 'mp4', track: { id: trackId, audioQuality: quality } };
   }
 
-  throw new Error(`${LOG_PREFIX} No playable audio found for ${trackId}`);
+  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
+
+// ─── Download ─────────────────────────────────────────────────────────────────
 
 async function getTrackDownloadUrl(trackId, quality, context) {
   const dlQuality = context?.settings?.downloadQuality?.value || quality || '128';
   const response = await fetch(`${DOWNLOAD_API_BASE}${trackId}?s=5`);
-  if (!response.ok) throw new Error(`${LOG_PREFIX} Download API error: HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Download API HTTP ${response.status}`);
   const data = await response.json();
-  if (!data.downloadUrl) throw new Error(`${LOG_PREFIX} No download URL returned for ${trackId}`);
+  if (!data.downloadUrl) throw new Error(`${LOG_PREFIX} No download URL for ${trackId}`);
   return {
     streamUrl: data.downloadUrl,
-    track: {
-      id: trackId,
-      audioQuality: dlQuality === '320' ? QUALITY.HIGH : QUALITY.LOW,
-    },
+    track: { id: trackId, audioQuality: dlQuality === '320' ? QUALITY.HIGH : QUALITY.LOW },
   };
 }
 
-async function getAlbum(albumId, env) {
-  const headers = {
-    'Content-Type': 'application/json',
-    Origin: YTM_BASE,
-    Referer: `${YTM_BASE}/`,
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  };
+// ─── Album ────────────────────────────────────────────────────────────────────
 
+async function getAlbum(albumId, env) {
   const response = await fetch(`${YTM_BASE}/youtubei/v1/browse?key=${YTM_API_KEY}`, {
     method: 'POST',
-    headers,
-    body: JSON.stringify({
-      context: { client: WEB_REMIX_CONTEXT },
-      browseId: albumId,
-    }),
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: YTM_BASE,
+      Referer: `${YTM_BASE}/`,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    },
+    body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT }, browseId: albumId }),
   });
 
-  if (!response.ok) throw new Error(`${LOG_PREFIX} Album fetch failed: HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`${LOG_PREFIX} Album HTTP ${response.status}`);
   const data = await response.json();
 
-  if (data?.responseContext?.visitorData && env.YTM_CACHE) {
-    await env.YTM_CACHE.put(
+  if (data?.responseContext?.visitorData && env && env.YTM_CACHE) {
+    env.YTM_CACHE.put(
       'visitorData',
       JSON.stringify({ visitorData: data.responseContext.visitorData, fetchedAt: Date.now() }),
       { expirationTtl: Math.floor(VISITOR_DATA_TTL_MS / 1000) }
     );
   }
 
-  const header = data?.header?.musicImmersiveHeaderRenderer || data?.header?.musicDetailHeaderRenderer || {};
+  const header =
+    data?.header?.musicImmersiveHeaderRenderer ||
+    data?.header?.musicDetailHeaderRenderer || {};
   const albumTitle = header?.title?.runs?.[0]?.text || '';
   let albumArtist = '';
   if (header?.subtitle?.runs) {
     for (const run of header.subtitle.runs) {
-      if (run.navigationEndpoint?.browseEndpoint) {
-        albumArtist = run.text;
-        break;
-      }
+      if (run.navigationEndpoint?.browseEndpoint) { albumArtist = run.text; break; }
     }
   }
-  const albumCover = bestThumbnail(header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []);
-
+  const albumCover = bestThumbnail(
+    header?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []
+  );
   const contents =
-    data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.musicShelfRenderer?.contents || [];
+    data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
+      ?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]
+      ?.musicShelfRenderer?.contents || [];
 
   const tracks = contents
     .filter(c => c.musicResponsiveListItemRenderer?.playlistItemData?.videoId)
@@ -309,26 +319,30 @@ async function getAlbum(albumId, env) {
       const r = c.musicResponsiveListItemRenderer;
       return {
         id: r.playlistItemData.videoId,
-        title: r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text || '',
+        title: r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer
+          ?.text?.runs?.[0]?.text || '',
         artist: albumArtist,
         album: albumTitle,
-        duration: parseDuration(r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || ''),
+        duration: parseDuration(
+          r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer
+            ?.text?.runs?.[0]?.text || ''
+        ),
         albumCover,
       };
     });
 
-  return {
-    album: { id: albumId, title: albumTitle, artist: albumArtist, albumCover },
-    tracks,
-  };
+  return { album: { id: albumId, title: albumTitle, artist: albumArtist, albumCover }, tracks };
 }
 
-function buildManifest(baseUrl) {
+// ─── Manifest builder ─────────────────────────────────────────────────────────
+// tokenBase is either `origin/u/:token` (token URLs) or `origin` (base URL).
+
+function buildManifest(tokenBase) {
   return {
     id: 'youtube-music',
     name: 'YouTube Music',
-    author: 'nvmindl',
-    version: '3.1.0',
+    author: 'ricky',
+    version: '1.0.0',
     labels: ['YT Music', 'Audio', 'Download', 'Settings'],
     description: 'Stream and download from YouTube Music. HLS preferred with automatic mp4 fallback.',
     noPrefetch: true,
@@ -345,392 +359,359 @@ function buildManifest(baseUrl) {
       downloadQuality: {
         type: 'selector',
         label: 'Download Quality',
-        description: 'Quality label for downloaded tracks (cosmetic — the download API does not support quality selection)',
+        description: 'Quality label for downloaded tracks (cosmetic only)',
         options: DOWNLOAD_QUALITY_OPTIONS,
         defaultValue: '128',
       },
     },
     endpoints: {
-      searchTracks: `${baseUrl}/api/search`,
-      getTrackStreamUrl: `${baseUrl}/api/stream`,
-      getTrackDownloadUrl: `${baseUrl}/api/download`,
-      getAlbum: `${baseUrl}/api/album`,
+      searchTracks:      `${tokenBase}/api/search`,
+      getTrackStreamUrl: `${tokenBase}/api/stream`,
+      getTrackDownloadUrl: `${tokenBase}/api/download`,
+      getAlbum:          `${tokenBase}/api/album`,
     },
   };
 }
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET,POST,OPTIONS',
-      'access-control-allow-headers': 'Content-Type',
-    },
-  });
-}
+// ─── Landing page ─────────────────────────────────────────────────────────────
 
-function html(body) {
-  return new Response(body, {
-    headers: { 'content-type': 'text/html; charset=utf-8' },
-  });
-}
-
-function website(baseUrl) {
-  const manifestUrl = `${baseUrl}/manifest.json`;
-  return `<!doctype html>
-<html lang="en" data-theme="dark">
+function buildPage(origin) {
+  return `<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Eclipse YouTube Music Addon</title>
-  <meta name="description" content="Generate your Eclipse addon manifest URL for a Cloudflare Workers-powered YouTube Music addon." />
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700,900&f[]=cabinet-grotesk@500,700,800&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --text-xs: clamp(0.75rem, 0.7rem + 0.25vw, 0.875rem);
-      --text-sm: clamp(0.875rem, 0.8rem + 0.35vw, 1rem);
-      --text-base: clamp(1rem, 0.95rem + 0.25vw, 1.125rem);
-      --text-lg: clamp(1.125rem, 1rem + 0.75vw, 1.5rem);
-      --text-xl: clamp(1.5rem, 1.2rem + 1.25vw, 2.25rem);
-      --text-2xl: clamp(2rem, 1.2rem + 2.5vw, 3.5rem);
-      --space-1: 0.25rem; --space-2: 0.5rem; --space-3: 0.75rem; --space-4: 1rem;
-      --space-5: 1.25rem; --space-6: 1.5rem; --space-8: 2rem; --space-10: 2.5rem;
-      --space-12: 3rem; --space-16: 4rem; --space-20: 5rem;
-      --radius-sm: 0.375rem; --radius-md: 0.5rem; --radius-lg: 0.75rem; --radius-xl: 1rem; --radius-full: 9999px;
-      --font-body: 'Satoshi', 'Inter', sans-serif;
-      --font-display: 'Cabinet Grotesk', 'Satoshi', sans-serif;
-      --color-bg: #171614;
-      --color-surface: #1c1b19;
-      --color-surface-2: #201f1d;
-      --color-surface-offset: #22211f;
-      --color-border: #393836;
-      --color-text: #f2f0eb;
-      --color-text-muted: #b5b1aa;
-      --color-primary: #ff0033;
-      --color-primary-hover: #d9002c;
-      --color-blue: #4f98a3;
-      --shadow-sm: 0 1px 2px rgb(0 0 0 / .2);
-      --shadow-md: 0 10px 30px rgb(0 0 0 / .28);
-      --shadow-lg: 0 20px 50px rgb(0 0 0 / .42);
-      --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
-      --content: 1180px;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { min-height: 100%; }
-    body {
-      font-family: var(--font-body);
-      font-size: var(--text-base);
-      line-height: 1.6;
-      color: var(--color-text);
-      background:
-        radial-gradient(circle at top left, rgba(255,0,51,.14), transparent 28%),
-        radial-gradient(circle at top right, rgba(79,152,163,.12), transparent 24%),
-        linear-gradient(180deg, #121110 0%, #171614 100%);
-    }
-    a { color: inherit; text-decoration: none; }
-    button, input { font: inherit; }
-    .container { width: min(calc(100% - 2rem), var(--content)); margin: 0 auto; }
-    .skip-link { position: absolute; left: -999px; top: 0; }
-    .skip-link:focus { left: 1rem; top: 1rem; background: var(--color-text); color: #000; padding: .75rem 1rem; border-radius: var(--radius-md); }
-    .site-header {
-      position: sticky; top: 0; z-index: 10;
-      backdrop-filter: blur(16px);
-      background: rgba(18,17,16,.72);
-      border-bottom: 1px solid rgba(255,255,255,.08);
-    }
-    .nav {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: var(--space-4) 0;
-      gap: var(--space-4);
-    }
-    .brand { display: flex; align-items: center; gap: .85rem; font-weight: 700; }
-    .logo {
-      width: 2.5rem; height: 2.5rem; border-radius: .85rem; display: grid; place-items: center;
-      background: linear-gradient(135deg, rgba(255,0,51,.2), rgba(79,152,163,.15));
-      border: 1px solid rgba(255,255,255,.1);
-      box-shadow: var(--shadow-sm);
-    }
-    .hero {
-      padding: clamp(4rem, 8vw, 7rem) 0 var(--space-16);
-    }
-    .hero-grid {
-      display: grid; grid-template-columns: 1.15fr .85fr; gap: var(--space-10); align-items: center;
-    }
-    .eyebrow {
-      display: inline-flex; align-items: center; gap: .5rem; padding: .45rem .8rem; border-radius: var(--radius-full);
-      background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08); color: var(--color-text-muted); font-size: var(--text-sm);
-    }
-    h1 {
-      font-family: var(--font-display);
-      font-size: var(--text-2xl);
-      line-height: 1;
-      letter-spacing: -.03em;
-      margin-top: var(--space-5);
-      max-width: 11ch;
-    }
-    .hero p {
-      color: var(--color-text-muted);
-      margin-top: var(--space-5);
-      max-width: 62ch;
-    }
-    .cta-row { display: flex; gap: var(--space-3); flex-wrap: wrap; margin-top: var(--space-6); }
-    .btn {
-      min-height: 44px; padding: .9rem 1.1rem; border-radius: .9rem; border: 1px solid transparent;
-      transition: all var(--transition); display: inline-flex; align-items: center; justify-content: center; gap: .65rem;
-    }
-    .btn-primary { background: var(--color-primary); color: white; box-shadow: var(--shadow-md); }
-    .btn-primary:hover { background: var(--color-primary-hover); transform: translateY(-1px); }
-    .btn-secondary { background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.1); }
-    .btn-secondary:hover { background: rgba(255,255,255,.08); }
-    .panel {
-      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.025));
-      border: 1px solid rgba(255,255,255,.09);
-      border-radius: 1.35rem;
-      box-shadow: var(--shadow-lg);
-    }
-    .generator { padding: var(--space-6); }
-    .generator h2, .section-title { font-family: var(--font-display); font-size: var(--text-xl); line-height: 1.05; }
-    .generator p, .muted { color: var(--color-text-muted); }
-    .stack { display: grid; gap: var(--space-4); margin-top: var(--space-5); }
-    .field { display: grid; gap: .55rem; }
-    label { font-size: var(--text-sm); color: var(--color-text-muted); }
-    input {
-      width: 100%; min-height: 52px; padding: .9rem 1rem; border-radius: .9rem;
-      border: 1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.16); color: var(--color-text);
-      outline: none;
-    }
-    input:focus { border-color: rgba(255,0,51,.65); box-shadow: 0 0 0 4px rgba(255,0,51,.14); }
-    .output {
-      margin-top: var(--space-4); padding: 1rem; border-radius: .9rem; background: rgba(0,0,0,.28);
-      border: 1px solid rgba(255,255,255,.09); word-break: break-all; font-size: var(--text-sm);
-    }
-    .mini-grid {
-      display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-top: var(--space-8);
-    }
-    .stat-card, .feature-card {
-      padding: var(--space-5); background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08); border-radius: 1rem;
-    }
-    .stat-card strong { display: block; font-size: var(--text-lg); }
-    .section { padding: var(--space-10) 0; }
-    .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-top: var(--space-6); }
-    .feature-card h3 { margin-bottom: .5rem; font-size: 1.05rem; }
-    .feature-card p { color: var(--color-text-muted); font-size: var(--text-sm); }
-    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-top: var(--space-6); }
-    .step-number {
-      width: 2rem; height: 2rem; border-radius: var(--radius-full); display: grid; place-items: center; margin-bottom: 1rem;
-      background: rgba(255,0,51,.18); color: #fff; border: 1px solid rgba(255,0,51,.35);
-    }
-    code.inline {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: .93em; padding: .15rem .35rem; border-radius: .4rem; background: rgba(255,255,255,.06);
-    }
-    .site-footer {
-      padding: var(--space-10) 0 var(--space-16); color: var(--color-text-muted); font-size: var(--text-sm);
-    }
-    @media (max-width: 980px) {
-      .hero-grid, .feature-grid, .steps, .mini-grid { grid-template-columns: 1fr; }
-      h1 { max-width: 14ch; }
-    }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YouTube Music for Eclipse</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#080808;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}
+.card{background:#111;border:1px solid #1e1e1e;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.6);margin-bottom:20px}
+h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}
+h2{font-size:16px;font-weight:700;margin-bottom:14px;color:#fff}
+p.sub{font-size:14px;color:#666;margin-bottom:20px;line-height:1.6}
+.tip{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:12px;color:#888;line-height:1.7}
+.tip b{color:#ccc}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
+.pill{border-radius:20px;font-size:11px;font-weight:600;padding:4px 10px;background:#181818;color:#aaa;border:1px solid #2a2a2a}
+.pill.hi{background:#1a0d10;color:#ff4d6d;border-color:#3a1520}
+.pill.bl{background:#0d1520;color:#4a9eff;border-color:#1a3050}
+.lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#444;margin-bottom:8px;margin-top:16px}
+input{width:100%;background:#0a0a0a;border:1px solid #1e1e1e;border-radius:10px;color:#e0e0e0;font-size:14px;padding:12px 14px;margin-bottom:6px;outline:none;transition:border-color .15s}
+input:focus{border-color:#fff}
+input::placeholder{color:#2e2e2e}
+.hint{font-size:12px;color:#3a3a3a;margin-bottom:12px;line-height:1.7}
+button{cursor:pointer;border:none;border-radius:10px;font-size:15px;font-weight:700;padding:13px;width:100%;margin-top:6px;margin-bottom:6px;transition:background .15s}
+.bw{background:#fff;color:#000}
+.bw:hover{background:#e0e0e0}
+.bw:disabled{background:#1e1e1e;color:#333;cursor:not-allowed}
+.bg{background:#141414;color:#e0e0e0;border:1px solid #2a2a2a}
+.bg:hover{background:#1e1e1e}
+.bg:disabled{background:#0f0f0f;color:#333;cursor:not-allowed}
+.bd{background:#0f0f0f;color:#777;border:1px solid #1a1a1a;font-size:13px;padding:10px}
+.bd:hover{background:#1a1a1a;color:#fff}
+.box{display:none;background:#0a0a0a;border:1px solid #1a1a1a;border-radius:12px;padding:18px;margin-bottom:10px}
+.blbl{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
+.burl{font-size:12px;color:#fff;word-break:break-all;font-family:'SF Mono','Fira Code',monospace;margin-bottom:14px;line-height:1.5}
+hr{border:none;border-top:1px solid #161616;margin:24px 0}
+.steps{display:flex;flex-direction:column;gap:12px}
+.step{display:flex;gap:12px;align-items:flex-start}
+.sn{background:#161616;border:1px solid #222;border-radius:50%;width:26px;height:26px;min-width:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#555}
+.st{font-size:13px;color:#555;line-height:1.6}
+.st b{color:#999}
+.warn{background:#0d0d0d;border:1px solid #1e1e1e;border-radius:10px;padding:14px;margin-top:20px;font-size:12px;color:#555;line-height:1.7}
+footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-height:1.8}
+</style>
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to content</a>
-  <header class="site-header">
-    <div class="container nav">
-      <div class="brand">
-        <div class="logo" aria-hidden="true">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-label="Eclipse YT Music logo">
-            <path d="M4 12a8 8 0 1 0 8-8" />
-            <path d="M15 7.5 20 10.5 15 13.5Z" fill="currentColor" stroke="none" />
-          </svg>
-        </div>
-        <div>
-          <div style="font-weight:800;line-height:1">Eclipse YT Music</div>
-          <div style="font-size:.85rem;color:var(--color-text-muted)">Cloudflare Worker addon</div>
-        </div>
-      </div>
-      <a class="btn btn-secondary" href="${manifestUrl}" target="_blank" rel="noopener noreferrer">Open manifest</a>
-    </div>
-  </header>
 
-  <main id="main">
-    <section class="hero">
-      <div class="container hero-grid">
-        <div>
-          <div class="eyebrow">YouTube + YouTube Music search • Eclipse-ready manifest</div>
-          <h1>Generate your addon URL and drop it straight into Eclipse.</h1>
-          <p>This worker ships a clean manifest endpoint, search, album lookup, playback URL resolution, and download URL passthrough. The page is built to make setup fast on desktop or mobile.</p>
-          <div class="cta-row">
-            <button class="btn btn-primary" id="copyManifest">Copy manifest URL</button>
-            <a class="btn btn-secondary" href="#setup">Install steps</a>
-          </div>
-          <div class="mini-grid">
-            <div class="stat-card"><strong>Search</strong><span class="muted">YouTube Music track search</span></div>
-            <div class="stat-card"><strong>Playback</strong><span class="muted">HLS first, MP4 fallback</span></div>
-            <div class="stat-card"><strong>Deploy</strong><span class="muted">Cloudflare Workers + Wrangler</span></div>
-          </div>
-        </div>
+<!-- ── Main card ── -->
+<div class="card">
+  <svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-bottom:22px">
+    <circle cx="26" cy="26" r="26" fill="#ff0000"/>
+    <rect x="11" y="20" width="4" height="12" rx="2" fill="white"/>
+    <rect x="18" y="14" width="4" height="24" rx="2" fill="white"/>
+    <rect x="25" y="18" width="4" height="16" rx="2" fill="white"/>
+    <rect x="32" y="11" width="4" height="30" rx="2" fill="white"/>
+    <rect x="39" y="17" width="4" height="18" rx="2" fill="white"/>
+  </svg>
 
-        <aside class="panel generator" aria-label="Manifest generator">
-          <h2>Manifest URL</h2>
-          <p>Most deployments can use the auto-detected Worker origin instantly.</p>
-          <div class="stack">
-            <div class="field">
-              <label for="baseUrl">Worker base URL</label>
-              <input id="baseUrl" type="url" value="${baseUrl}" />
-            </div>
-            <button class="btn btn-primary" id="generateBtn">Generate manifest URL</button>
-            <div class="output" id="manifestOutput">${manifestUrl}</div>
-            <div class="cta-row">
-              <button class="btn btn-secondary" id="copyBtn">Copy</button>
-              <a class="btn btn-secondary" id="openBtn" href="${manifestUrl}" target="_blank" rel="noopener noreferrer">Open</a>
-            </div>
-          </div>
-        </aside>
-      </div>
-    </section>
+  <h1>YouTube Music for Eclipse</h1>
+  <p class="sub">Stream and download from the full YouTube Music catalog &mdash; HLS preferred, MP4 fallback. No account required.</p>
 
-    <section class="section" id="features">
-      <div class="container">
-        <h2 class="section-title">What this worker includes</h2>
-        <div class="feature-grid">
-          <article class="feature-card">
-            <h3>Manifest endpoint</h3>
-            <p>A single <code class="inline">/manifest.json</code> endpoint exposes Eclipse-facing metadata and server endpoints for search, stream, album, and download actions.</p>
-          </article>
-          <article class="feature-card">
-            <h3>Automatic visitorData refresh</h3>
-            <p>The worker refreshes visitor identity with TTL-backed caching so first play and retry behavior stay smoother across sessions.</p>
-          </article>
-          <article class="feature-card">
-            <h3>Nice install page</h3>
-            <p>Users get a polished landing page that shows the ready-to-copy manifest URL, plus a dead-simple setup flow that works well on mobile.</p>
-          </article>
-        </div>
-      </div>
-    </section>
+  <div class="tip"><b>Save your URL.</b> Paste it below any time to copy it again without reinstalling.</div>
 
-    <section class="section" id="setup">
-      <div class="container">
-        <h2 class="section-title">Install flow</h2>
-        <div class="steps">
-          <article class="feature-card">
-            <div class="step-number">1</div>
-            <h3>Deploy the Worker</h3>
-            <p>Run <code class="inline">npm install</code> and then <code class="inline">npm run deploy</code>. Cloudflare will assign your worker URL.</p>
-          </article>
-          <article class="feature-card">
-            <div class="step-number">2</div>
-            <h3>Copy the manifest</h3>
-            <p>Use the copy button on this page. The manifest URL points to <code class="inline">/manifest.json</code> on your worker origin.</p>
-          </article>
-          <article class="feature-card">
-            <div class="step-number">3</div>
-            <h3>Add it in Eclipse</h3>
-            <p>Paste that URL into Eclipse addon installation and the app can call the worker-backed endpoints directly.</p>
-          </article>
-        </div>
-      </div>
-    </section>
-  </main>
+  <div class="pills">
+    <span class="pill">Tracks &middot; Albums</span>
+    <span class="pill hi">HLS Playback</span>
+    <span class="pill hi">MP4 Fallback</span>
+    <span class="pill bl">Download</span>
+    <span class="pill bl">Settings</span>
+  </div>
 
-  <footer class="site-footer">
-    <div class="container">Built for Eclipse addon hosting on Cloudflare Workers.</div>
-  </footer>
+  <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>
 
-  <script>
-    const baseUrlInput = document.getElementById('baseUrl');
-    const manifestOutput = document.getElementById('manifestOutput');
-    const openBtn = document.getElementById('openBtn');
+  <div class="box" id="genBox">
+    <div class="blbl">Your addon URL &mdash; paste into Eclipse</div>
+    <div class="burl" id="genUrl"></div>
+    <button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button>
+  </div>
 
-    function normalizeBaseUrl(url) {
-      return String(url || '').trim().replace(/\/$/, '');
-    }
+  <hr>
 
-    function updateManifest() {
-      const base = normalizeBaseUrl(baseUrlInput.value || window.location.origin);
-      const manifest = base + '/manifest.json';
-      manifestOutput.textContent = manifest;
-      openBtn.href = manifest;
-      return manifest;
-    }
+  <h2>Refresh existing URL</h2>
+  <input type="text" id="existingUrl" placeholder="Paste your existing addon URL here">
+  <div class="hint">Keeps the same token active &mdash; nothing to reinstall.</div>
+  <button class="bg" id="refBtn" onclick="doRefresh()">Refresh Existing URL</button>
 
-    async function copyText(text, button) {
-      try {
-        await navigator.clipboard.writeText(text);
-        const old = button.textContent;
-        button.textContent = 'Copied';
-        setTimeout(() => button.textContent = old, 1400);
-      } catch {
-        const range = document.createRange();
-        range.selectNodeContents(manifestOutput);
-        const selection = window.getSelection();
-        selection.removeAllRanges();
-        selection.addRange(range);
-        document.execCommand('copy');
-        selection.removeAllRanges();
-      }
-    }
+  <div class="box" id="refBox">
+    <div class="blbl">Refreshed &mdash; same URL still works in Eclipse</div>
+    <div class="burl" id="refUrl"></div>
+    <button class="bd" id="copyRefBtn" onclick="copyRef()">Copy URL</button>
+  </div>
 
-    document.getElementById('generateBtn').addEventListener('click', () => updateManifest());
-    document.getElementById('copyBtn').addEventListener('click', (e) => copyText(updateManifest(), e.currentTarget));
-    document.getElementById('copyManifest').addEventListener('click', (e) => copyText(updateManifest(), e.currentTarget));
-    baseUrlInput.addEventListener('input', updateManifest);
-    updateManifest();
-  </script>
+  <hr>
+
+  <div class="steps">
+    <div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>
+    <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>
+    <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
+    <div class="step"><div class="sn">4</div><div class="st">Search YouTube Music&rsquo;s full catalog &mdash; HLS streams load automatically</div></div>
+  </div>
+
+  <div class="warn">Stream priority: <b>HLS manifest</b> (native iOS/AVPlayer) &rarr; <b>Direct MP4</b> fallback. YouTube stream URLs expire &mdash; the worker never caches them.</div>
+</div>
+
+<footer>
+  YouTube Music for Eclipse v1.0.0 &bull; by ricky &bull; Cloudflare Workers
+</footer>
+
+<script>
+var genUrl = null;
+var refUrl = null;
+
+function generate() {
+  var btn = document.getElementById('genBtn');
+  btn.disabled = true;
+  btn.textContent = 'Generating...';
+  fetch('/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) { alert(d.error); btn.disabled = false; btn.textContent = 'Generate My Addon URL'; return; }
+      genUrl = d.manifestUrl;
+      document.getElementById('genUrl').textContent = genUrl;
+      document.getElementById('genBox').style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Regenerate URL';
+    })
+    .catch(function(e) { alert('Error: ' + e.message); btn.disabled = false; btn.textContent = 'Generate My Addon URL'; });
+}
+
+function copyGen() {
+  if (!genUrl) return;
+  var btn = document.getElementById('copyGenBtn');
+  copyText(genUrl, btn);
+}
+
+function doRefresh() {
+  var eu = document.getElementById('existingUrl').value.trim();
+  if (!eu) { alert('Paste your existing addon URL first.'); return; }
+  var btn = document.getElementById('refBtn');
+  btn.disabled = true;
+  btn.textContent = 'Refreshing...';
+  fetch('/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ existingUrl: eu }) })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) { alert(d.error); btn.disabled = false; btn.textContent = 'Refresh Existing URL'; return; }
+      refUrl = d.manifestUrl;
+      document.getElementById('refUrl').textContent = refUrl;
+      document.getElementById('refBox').style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Refresh Again';
+    })
+    .catch(function(e) { alert('Error: ' + e.message); btn.disabled = false; btn.textContent = 'Refresh Existing URL'; });
+}
+
+function copyRef() {
+  if (!refUrl) return;
+  var btn = document.getElementById('copyRefBtn');
+  copyText(refUrl, btn);
+}
+
+function copyText(text, btn) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function() {
+      var orig = btn.textContent;
+      btn.textContent = 'Copied!';
+      setTimeout(function() { btn.textContent = orig; }, 1500);
+    });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    var orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = orig; }, 1500);
+  }
+}
+</script>
 </body>
 </html>`;
 }
 
+// ─── Response helpers ──────────────────────────────────────────────────────────
+
+function jsonRes(data, status) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status: status || 200,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'Content-Type',
+      'cache-control': 'no-store',
+    },
+  });
+}
+
+function htmlRes(body) {
+  return new Response(body, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
+// ─── Route helpers ────────────────────────────────────────────────────────────
+
+// Parses /u/:token from a pathname and returns { token, rest }
+// e.g. /u/abc123.../api/search → { token: 'abc123...', rest: '/api/search' }
+function parseTokenPath(pathname) {
+  const m = pathname.match(/^\/u\/([a-f0-9]{28})(\/.*)?$/);
+  if (!m) return null;
+  return { token: m[1], rest: m[2] || '/' };
+}
+
+// ─── Worker entry ─────────────────────────────────────────────────────────────
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const { pathname } = url;
 
-    if (request.method === 'OPTIONS') return json({}, 204);
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET, POST, OPTIONS',
+          'access-control-allow-headers': 'Content-Type',
+        },
+      });
+    }
 
     try {
-      if (url.pathname === '/') {
-        return html(website(url.origin));
+      // ── Landing page
+      if (pathname === '/') return htmlRes(buildPage(url.origin));
+
+      // ── Base manifest (no token)
+      if (pathname === '/manifest.json') return jsonRes(buildManifest(url.origin));
+
+      // ── Generate a unique token URL
+      if (pathname === '/generate' && request.method === 'POST') {
+        const token = generateToken();
+        const tokenBase = `${url.origin}/u/${token}`;
+        return jsonRes({ token, manifestUrl: `${tokenBase}/manifest.json` });
       }
 
-      if (url.pathname === '/manifest.json') {
-        return json(buildManifest(url.origin));
+      // ── Refresh: extract token from an existing URL and return it again
+      if (pathname === '/refresh' && request.method === 'POST') {
+        let body = {};
+        try { body = await request.json(); } catch {}
+        const raw = String(body.existingUrl || '').trim();
+        const m = raw.match(/\/u\/([a-f0-9]{28})\/manifest\.json/);
+        if (!m) return jsonRes({ error: 'Paste your full addon URL (must contain /u/{token}/manifest.json).' }, 400);
+        const token = m[1];
+        const tokenBase = `${url.origin}/u/${token}`;
+        return jsonRes({ token, manifestUrl: `${tokenBase}/manifest.json`, refreshed: true });
       }
 
-      if (url.pathname === '/api/search') {
-        const query = url.searchParams.get('query') || '';
-        const limit = Number(url.searchParams.get('limit') || '20');
-        return json(await searchTracks(query, limit, env));
+      // ── Token-scoped routes: /u/:token/...
+      const tp = parseTokenPath(pathname);
+      if (tp) {
+        const { token, rest } = tp;
+        if (!isValidToken(token)) return jsonRes({ error: 'Invalid token.' }, 400);
+        const tokenBase = `${url.origin}/u/${token}`;
+
+        // Token-scoped manifest
+        if (rest === '/manifest.json') return jsonRes(buildManifest(tokenBase));
+
+        // Token-scoped API
+        if (rest === '/api/search') {
+          const q = url.searchParams.get('query') || url.searchParams.get('q') || '';
+          const limit = Math.min(Number(url.searchParams.get('limit') || '20'), 50);
+          if (!q) return jsonRes({ tracks: [], total: 0 });
+          return jsonRes(await searchTracks(q, limit, env));
+        }
+
+        if (rest === '/api/stream') {
+          const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
+          if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
+          const quality = url.searchParams.get('quality') || QUALITY.HIGH;
+          const forceDirectMp4 = url.searchParams.get('forceDirectMp4') === 'true';
+          return jsonRes(await getTrackStreamUrl(trackId, quality, {}, env, forceDirectMp4));
+        }
+
+        if (rest === '/api/download') {
+          const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
+          if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
+          const quality = url.searchParams.get('quality') || '128';
+          return jsonRes(await getTrackDownloadUrl(trackId, quality, {}));
+        }
+
+        if (rest === '/api/album') {
+          const albumId = url.searchParams.get('albumId') || url.searchParams.get('id');
+          if (!albumId) return jsonRes({ error: 'Missing albumId' }, 400);
+          return jsonRes(await getAlbum(albumId, env));
+        }
+
+        return jsonRes({ error: 'Not found' }, 404);
       }
 
-      if (url.pathname === '/api/stream') {
-        const trackId = url.searchParams.get('trackId');
+      // ── Base API routes (no token — works too)
+      if (pathname === '/api/search') {
+        const q = url.searchParams.get('query') || url.searchParams.get('q') || '';
+        const limit = Math.min(Number(url.searchParams.get('limit') || '20'), 50);
+        if (!q) return jsonRes({ tracks: [], total: 0 });
+        return jsonRes(await searchTracks(q, limit, env));
+      }
+
+      if (pathname === '/api/stream') {
+        const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
+        if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
         const quality = url.searchParams.get('quality') || QUALITY.HIGH;
         const forceDirectMp4 = url.searchParams.get('forceDirectMp4') === 'true';
-        if (!trackId) return json({ error: 'Missing trackId' }, 400);
-        return json(await getTrackStreamUrl(trackId, quality, {}, env, forceDirectMp4));
+        return jsonRes(await getTrackStreamUrl(trackId, quality, {}, env, forceDirectMp4));
       }
 
-      if (url.pathname === '/api/download') {
-        const trackId = url.searchParams.get('trackId');
+      if (pathname === '/api/download') {
+        const trackId = url.searchParams.get('trackId') || url.searchParams.get('id');
+        if (!trackId) return jsonRes({ error: 'Missing trackId' }, 400);
         const quality = url.searchParams.get('quality') || '128';
-        if (!trackId) return json({ error: 'Missing trackId' }, 400);
-        return json(await getTrackDownloadUrl(trackId, quality, {}));
+        return jsonRes(await getTrackDownloadUrl(trackId, quality, {}));
       }
 
-      if (url.pathname === '/api/album') {
-        const albumId = url.searchParams.get('albumId');
-        if (!albumId) return json({ error: 'Missing albumId' }, 400);
-        return json(await getAlbum(albumId, env));
+      if (pathname === '/api/album') {
+        const albumId = url.searchParams.get('albumId') || url.searchParams.get('id');
+        if (!albumId) return jsonRes({ error: 'Missing albumId' }, 400);
+        return jsonRes(await getAlbum(albumId, env));
       }
 
-      return json({ error: 'Not found' }, 404);
-    } catch (error) {
-      return json({ error: error.message || 'Unknown error' }, 500);
+      if (pathname === '/health') {
+        return jsonRes({ status: 'ok', version: '1.0.0', ts: new Date().toISOString() });
+      }
+
+      return jsonRes({ error: 'Not found' }, 404);
+
+    } catch (err) {
+      console.error(LOG_PREFIX, err);
+      return jsonRes({ error: err.message || 'Internal error' }, 500);
     }
   },
 };
