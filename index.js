@@ -368,17 +368,16 @@ function pickBestMp4(sd) {
 async function handleStream(trackId, env) {
   const sd = await fetchPlayerData(trackId, env);
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-  const expiresAt = Math.floor(Date.now() / 1000) + 21600; // YTM signed URLs valid ~6h
+  const expiresAt = Math.floor(Date.now() / 1000) + 21600;
 
-  // PRIMARY: direct audio-only AAC from adaptiveFormats.
-  // These are audio-only streams — no video overhead, perfect for a music player.
+  // PRIMARY: HLS manifest — no 'n' throttle param, works on iOS/Android/web natively.
+  // format:'aac' is intentional: Eclipse uses codec labels only; AVPlayer, ExoPlayer
+  // and hls.js all detect HLS from the URL pattern regardless of this field.
+  if (sd.hlsManifestUrl) return { url: sd.hlsManifestUrl, format: 'aac', quality: 'high', expiresAt };
+
+  // FALLBACK: direct audio/mp4 from adaptiveFormats (rare — only if no HLS returned).
   const mp4Url = pickBestMp4(sd);
   if (mp4Url) return { url: mp4Url, format: 'aac', quality: 'high', expiresAt };
-
-  // FALLBACK: HLS manifest. YTM HLS includes video tracks too, but AVPlayer on iOS
-  // auto-selects audio and handles it fine. Must be labeled 'hls' not 'aac' so
-  // Eclipse knows to treat it as a manifest, not a raw audio file.
-  if (sd.hlsManifestUrl) return { url: sd.hlsManifestUrl, format: 'hls', quality: 'high', expiresAt };
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
@@ -594,7 +593,7 @@ function buildManifest() {
   return {
     id: 'com.ricky.youtube-music',
     name: 'YouTube Music',
-    version: '1.3.0',
+    version: '1.5.2',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS preferred, MP4 fallback.',
     icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources: ['search', 'stream', 'catalog'],
@@ -827,7 +826,7 @@ export default {
       }
 
       if (pathname === '/health')
-        return jsonRes({ status: 'ok', version: '1.3.0', ts: new Date().toISOString() });
+        return jsonRes({ status: 'ok', version: '1.5.2', ts: new Date().toISOString() });
 
       // Token-scoped routes  /u/:token/...
       const tp = parseTokenPath(pathname);
