@@ -1,7 +1,7 @@
 {
-  "name": "eclipse-ytmusic",
+  "name": "youtube",
   "version": "1.0.0",
-  "description": "YouTube Music addon for Eclipse — Cloudflare Workers",
+  "description": "YouTube Music addon for Eclipse — powered by Cloudflare Workers",
   "main": "index.js",
   "scripts": {
     "dev": "wrangler dev",
@@ -9,9 +9,9 @@
     "tail": "wrangler tail"
   },
   "devDependencies": {
-    "wrangler": "^3.57.0"
+    "wrangler": "^3.114.4"
   },
-  "dependencies": {
-    "@upstash/redis": "^1.34.3"
-  }
+  "keywords": ["eclipse", "music", "youtube", "cloudflare-workers", "addon"],
+  "author": "ricky",
+  "license": "MIT"
 }
