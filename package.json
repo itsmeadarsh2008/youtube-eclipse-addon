@@ -1,5 +1,5 @@
 {
-  "name": "youtube",
+  "name": "eclipse-ytmusic",
   "version": "1.0.0",
   "description": "YouTube Music addon for Eclipse — powered by Cloudflare Workers",
   "main": "index.js",
