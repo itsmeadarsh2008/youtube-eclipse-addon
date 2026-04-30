@@ -3,9 +3,18 @@ main = "index.js"
 compatibility_date = "2025-01-01"
 
 [vars]
-ADDON_VERSION = "1.0.0"
+ADDON_VERSION = "1.1.0"
 
-# Optional: Add a custom domain route below
+# ── Upstash Redis ──────────────────────────────────────────────────────────────
+# Set these as Worker secrets (NOT plain vars) so they stay out of source code:
+#
+#   wrangler secret put UPSTASH_REDIS_REST_URL
+#   wrangler secret put UPSTASH_REDIS_REST_TOKEN
+#
+# Get both values from: https://console.upstash.com → your Redis DB → REST API
+# The worker falls back gracefully if these aren't set (no caching, still works).
+
+# ── Optional: custom domain ────────────────────────────────────────────────────
 # [[routes]]
 # pattern = "ytmusic.yourdomain.com"
 # zone_name = "yourdomain.com"
