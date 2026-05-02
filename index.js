@@ -451,7 +451,7 @@ function generateToken() {
 }
 function isValidToken(t) { return typeof t === 'string' && /^[a-f0-9]{28}$/.test(t); }
 function parseTokenPath(p) {
-  const m = p.match(/^\\/u\\/([a-f0-9]{28})(\\/.*)?$/);
+  const m = p.match(new RegExp("^/u/([a-f0-9]{28})(/.*)?$"));
   return m ? { token: m[1], rest: m[2] || '/' } : null;
 }
 function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || ''; }
