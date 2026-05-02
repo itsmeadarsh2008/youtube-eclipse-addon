@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.6
+// author: ricky | version: 1.4.7
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -329,27 +329,23 @@ async function handleDownload(trackId, env, userToken) {
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
-  // Skip HLS for downloads — it's segmented and cannot be saved as a file.
-  // Always use a direct AAC/mp4 URL so Eclipse can write a real file offline.
+  // Skip HLS — segmented streams cannot be saved as a file.
+  // Redirect directly to the YouTube CDN audio URL so Eclipse downloads
+  // the file without the Worker having to proxy the bytes (avoids CF timeouts).
   const fmts = (sd.adaptiveFormats || [])
     .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
   if (!fmts.length) throw new Error(`${LOG_PREFIX} No downloadable audio format for ${trackId}`);
 
-  const audioResp = await fetch(fmts[0].url);
-  if (!audioResp.ok) throw new Error(`${LOG_PREFIX} Audio fetch failed: ${audioResp.status}`);
-
-  const contentLength = audioResp.headers.get('content-length');
-  const headers = {
-    'Content-Type': 'audio/mp4',
-    'Content-Disposition': `attachment; filename="${trackId}.m4a"`,
-    'access-control-allow-origin': '*',
-    'cache-control': 'no-store',
-  };
-  if (contentLength) headers['Content-Length'] = contentLength;
-
-  return new Response(audioResp.body, { status: 200, headers });
+  return new Response(null, {
+    status: 302,
+    headers: {
+      'Location': fmts[0].url,
+      'access-control-allow-origin': '*',
+      'cache-control': 'no-store',
+    },
+  });
 }
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
@@ -494,7 +490,7 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.4.6',
+    version:     '1.4.7',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog', 'download'],
@@ -616,9 +612,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse and offline download support</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS primary &rarr; AAC fallback. Download: direct AAC proxy with Content-Disposition for offline saves. visitorData cached 20 min via Upstash Redis (per-user token).</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS primary &rarr; AAC fallback. Download: 302 redirect to direct YouTube CDN audio URL for reliable offline saves. visitorData cached 20 min via Upstash Redis (per-user token).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.4.6 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.4.7 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -671,7 +667,7 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.6', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.7', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
