@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.3
+// author: ricky | version: 1.4.5
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -26,7 +26,6 @@ const SEARCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 };
 
-// ─── Upstash Redis ────────────────────────────────────────────────────────────
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) return null;
@@ -40,9 +39,6 @@ async function upstashCmd(env, ...args) {
   } catch { return null; }
 }
 
-// userToken = the per-user URL token (e.g. from /u/<token>/...).
-// Each user gets their own visitorData key so YouTube sees N separate "devices"
-// instead of one shared identity being hammered from many IPs simultaneously.
 async function getVisitorData(env, userToken) {
   const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   const cached = await upstashCmd(env, 'GET', key);
@@ -68,7 +64,6 @@ function tryRefreshVisitor(data, env, userToken) {
   if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function parseDuration(text) {
   if (!text) return 0;
   const parts = String(text).trim().split(':').map(Number);
@@ -90,9 +85,6 @@ function runsText(runs) {
   return (runs || []).map(r => r.text || '').join('').trim();
 }
 
-// Parse "Artist • Album • 3:47" flex runs — returns { artist, album, duration }
-// Duration is the LAST bullet-segment that matches MM:SS (present in song search results).
-// Artist pages omit duration entirely — caller must handle the empty string case.
 function parseInfoRuns(runs) {
   if (!runs?.length) return { artist: '', album: '', duration: '' };
   const parts = [];
@@ -103,7 +95,6 @@ function parseInfoRuns(runs) {
   }
   if (cur.trim()) parts.push(cur.trim());
 
-  // Pull off trailing duration segment (e.g. "3:47") if present
   let duration = '';
   if (parts.length && isDuration(parts[parts.length - 1])) {
     duration = parts.pop();
@@ -121,7 +112,6 @@ function buildIosContext(visitorData) {
   return ctx;
 }
 
-// ─── Core fetch helpers ───────────────────────────────────────────────────────
 async function ytmPost(path, body, env, userToken) {
   const resp = await fetch(`${YTM_BASE}${path}`, {
     method: 'POST', headers: SEARCH_HEADERS, body: JSON.stringify(body),
@@ -141,7 +131,6 @@ async function ytmSearch(query, params, env, userToken) {
   return ytmPost(`/youtubei/v1/search?key=${YTM_API_KEY}`, body, env, userToken);
 }
 
-// ─── videoId extraction ───────────────────────────────────────────────────────
 function getVideoId(r) {
   if (!r) return null;
   return (
@@ -155,14 +144,6 @@ function getVideoId(r) {
   );
 }
 
-// ─── Track renderer → track object ───────────────────────────────────────────
-// fixedColumns[0] holds duration for: album tracks, playlist tracks, search results.
-// Artist top-songs browse has NO fixedColumns AND no duration in flex runs.
-// We handle all cases:
-//   1. fixedColumns[0] text (validated as MM:SS)
-//   2. Last bullet-segment of flex1 runs if it looks like a duration
-//   3. lengthMs field (rare but present on some responses)
-//   4. Zero — caller can later enrich via search if needed
 function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   if (!r) return null;
   const videoId = getVideoId(r);
@@ -172,7 +153,6 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
   const info = parseInfoRuns(infoRuns);
 
-  // Duration: fixed column first, then from parseInfoRuns, then lengthMs
   const fixedRaw = r.fixedColumns?.[0]
     ?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
   const durationStr =
@@ -194,7 +174,6 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   };
 }
 
-// ─── Album/Artist/Playlist item parsers (for search results & carousels) ──────
 function parseAlbumItem(item) {
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
@@ -260,7 +239,6 @@ function parsePlaylistItem(item) {
   return null;
 }
 
-// ─── Extract search shelves ───────────────────────────────────────────────────
 function getShelves(data) {
   return (
     data?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]
@@ -268,7 +246,6 @@ function getShelves(data) {
   ).map(s => s.musicShelfRenderer).filter(Boolean);
 }
 
-// ─── Search ───────────────────────────────────────────────────────────────────
 async function handleSearch(query, env, userToken) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
   const [songsR, videosR, albumsR, artistsR, plR] = await Promise.allSettled([
@@ -293,7 +270,6 @@ async function handleSearch(query, env, userToken) {
   return { tracks, albums, artists, playlists };
 }
 
-// ─── Stream ───────────────────────────────────────────────────────────────────
 async function handleStream(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
   const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
@@ -312,20 +288,36 @@ async function handleStream(trackId, env, userToken) {
     upstashCmd(env, 'DEL', key);
     throw new Error(`${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
   }
+
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-  if (sd.hlsManifestUrl) return { url: sd.hlsManifestUrl, format: 'hls', quality: 'high', expiresAt: Math.floor(Date.now()/1000)+21600 };
-  const fmts = (sd.adaptiveFormats||[]).filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url).sort((a,b)=>(b.bitrate||0)-(a.bitrate||0));
-  if (fmts.length) return { url: fmts[0].url, format: 'aac', quality: 'high', expiresAt: Math.floor(Date.now()/1000)+21600 };
+
+  // Playback-first: HLS is more reliable for client playback from Eclipse.
+  if (sd.hlsManifestUrl) {
+    return {
+      url: sd.hlsManifestUrl,
+      format: 'hls',
+      quality: 'high',
+      expiresAt: Math.floor(Date.now() / 1000) + 21600,
+    };
+  }
+
+  const fmts = (sd.adaptiveFormats || [])
+    .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
+    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+  if (fmts.length) {
+    return {
+      url: fmts[0].url,
+      format: 'aac',
+      quality: 'high',
+      expiresAt: Math.floor(Date.now() / 1000) + 21600,
+    };
+  }
+
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
-// ─── Browse helpers ───────────────────────────────────────────────────────────
-// CONFIRMED via live API: Both albums and playlists use twoColumnBrowseResultsRenderer
-// with this exact shape:
-//   .tabs[0].tabRenderer.content.sectionListRenderer  -> header (musicResponsiveHeaderRenderer)
-//   .secondaryContents.sectionListRenderer            -> track shelf (musicShelfRenderer / musicPlaylistShelfRenderer)
-// There is NO firstColumn/secondColumn. The old code was wrong.
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
   if (!twoCol) return [];
@@ -343,33 +335,26 @@ function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArt
 }
 
 function extractResponsiveHeader(data) {
-  // Header lives in tabs[0] -> musicResponsiveHeaderRenderer (new layout)
-  // OR in data.header.* (older layout — kept as fallback)
   const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
   const tabSection = twoCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0];
   const rhr = tabSection?.musicResponsiveHeaderRenderer;
   if (rhr) return rhr;
-  // Older fallback
   return data?.header?.musicImmersiveHeaderRenderer
     || data?.header?.musicDetailHeaderRenderer
     || null;
 }
 
-// ─── Album ────────────────────────────────────────────────────────────────────
 async function handleAlbum(albumId, env, userToken) {
   const data = await ytmBrowse(albumId, env, userToken);
   const hdr  = extractResponsiveHeader(data) || {};
 
   const albumTitle = runsText(hdr.title?.runs);
   let albumArtist  = '';
-  // For musicResponsiveHeaderRenderer: artist is in subtitle runs with a browseEndpoint
   for (const run of hdr.subtitle?.runs || []) {
     if (run.navigationEndpoint?.browseEndpoint) { albumArtist = run.text; break; }
   }
-  // Older musicDetailHeaderRenderer uses straplineTextOne
   if (!albumArtist) albumArtist = runsText(hdr.straplineTextOne?.runs);
   if (!albumArtist) {
-    // Last fallback: find any non-bullet, non-year, non-type segment in subtitle
     const skip = new Set(['Album','EP','Single','Compilation']);
     for (const run of hdr.subtitle?.runs || []) {
       const t = run.text?.trim();
@@ -388,12 +373,6 @@ async function handleAlbum(albumId, env, userToken) {
   return { id: albumId, title: albumTitle, artist: albumArtist, artworkURL, trackCount: tracks.length, tracks };
 }
 
-// ─── Artist ───────────────────────────────────────────────────────────────────
-// CONFIRMED: Artist browse uses singleColumnBrowseResultsRenderer.
-// Top songs shelf has NO fixedColumns and NO duration in the browse response at all.
-// Fix: after gathering videoIds from browse, do ONE songs search scoped to the
-// artist name and merge durations in by videoId. Search results DO have duration
-// in flex1 runs (parsed by parseInfoRuns → info.duration).
 async function handleArtist(artistId, env, userToken) {
   const data = await ytmBrowse(artistId, env, userToken);
   const hdr  = data?.header?.musicImmersiveHeaderRenderer || data?.header?.musicVisualHeaderRenderer || {};
@@ -411,7 +390,7 @@ async function handleArtist(artistId, env, userToken) {
   for (const section of sections) {
     const shelf    = section.musicShelfRenderer;
     const carousel = section.musicCarouselShelfRenderer;
-    if (shelf)    for (const it of shelf.contents    || []) {
+    if (shelf)    for (const it of shelf.contents || []) {
       const t = parseTrackRenderer(it.musicResponsiveListItemRenderer, name, '', '');
       if (t && topTracks.length < 10) topTracks.push(t);
     }
@@ -421,9 +400,6 @@ async function handleArtist(artistId, env, userToken) {
     }
   }
 
-  // Enrich durations: artist browse never includes duration.
-  // A songs search for the artist name returns results with duration in flex1.
-  // We match by videoId and fill in any zero-duration tracks.
   if (topTracks.some(t => t.duration === 0)) {
     try {
       const sr   = await ytmSearch(name, SEARCH_PARAMS.songs, env, userToken);
@@ -449,9 +425,7 @@ async function handleArtist(artistId, env, userToken) {
   return { id: artistId, name, artworkURL, bio: null, topTracks, albums };
 }
 
-// ─── Playlist ─────────────────────────────────────────────────────────────────
 async function handlePlaylist(playlistId, env, userToken) {
-  // Ensure the VL prefix that YTM browse requires
   const browseId = playlistId.startsWith('VL') ? playlistId : 'VL' + playlistId;
   const data = await ytmBrowse(browseId, env, userToken);
 
@@ -465,13 +439,11 @@ async function handlePlaylist(playlistId, env, userToken) {
     hdr.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
 
-  // Playlist tracks are in secondaryContents (same layout as albums)
   const tracks = extractSecondaryTracks(data);
 
   return { id: playlistId, title, creator, artworkURL, trackCount: tracks.length, tracks };
 }
 
-// ─── Token helpers ────────────────────────────────────────────────────────────
 function generateToken() {
   const arr = new Uint8Array(14);
   crypto.getRandomValues(arr);
@@ -479,18 +451,17 @@ function generateToken() {
 }
 function isValidToken(t) { return typeof t === 'string' && /^[a-f0-9]{28}$/.test(t); }
 function parseTokenPath(p) {
-  const m = p.match(/^\/u\/([a-f0-9]{28})(\/.*)?$/);
+  const m = p.match(/^\\/u\\/([a-f0-9]{28})(\\/.*)?$/);
   return m ? { token: m[1], rest: m[2] || '/' } : null;
 }
 function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || ''; }
 
-// ─── Eclipse manifest ─────────────────────────────────────────────────────────
 function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.4.3',
-    description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS primary, MP4 fallback.',
+    version:     '1.4.5',
+    description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. Playback-first HLS with AAC fallback.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist'],
@@ -498,7 +469,6 @@ function buildManifest() {
   };
 }
 
-// ─── Route dispatcher ─────────────────────────────────────────────────────────
 async function handleRoute(rest, url, env, userToken) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest());
@@ -510,7 +480,6 @@ async function handleRoute(rest, url, env, userToken) {
   return null;
 }
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
 function jsonRes(data, status) {
   return new Response(JSON.stringify(data, null, 2), {
     status: status || 200,
@@ -525,7 +494,6 @@ function jsonRes(data, status) {
 }
 function htmlRes(b) { return new Response(b, { headers: { 'content-type': 'text/html; charset=utf-8' } }); }
 
-// ─── Landing page ─────────────────────────────────────────────────────────────
 function buildPage() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -584,7 +552,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill">Songs &middot; Videos</span>
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
     <span class="pill hi">HLS Primary</span>
-    <span class="pill hi">MP4 Fallback</span>
+    <span class="pill gr">AAC Fallback</span>
     <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
   </div>
@@ -611,9 +579,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse support</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS &rarr; MP4. visitorData cached 20 min via Upstash Redis (per-user token).</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS primary for playback reliability &rarr; AAC fallback. visitorData cached 20 min via Upstash Redis (per-user token).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.4.3 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.4.5 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -650,7 +618,6 @@ function copyText(text,btn){
 </html>`;
 }
 
-// ─── Worker entry ─────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     const url = new URL(request.url), pathname = url.pathname;
@@ -667,7 +634,7 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.3', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.5', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
