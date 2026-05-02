@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.5
+// author: ricky | version: 1.4.6
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -270,12 +270,14 @@ async function handleSearch(query, env, userToken) {
   return { tracks, albums, artists, playlists };
 }
 
-async function handleStream(trackId, env, userToken) {
+async function fetchPlayerData(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
   const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json',
-      'User-Agent': 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)' },
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
+    },
     body: JSON.stringify({
       context: { client: buildIosContext(visitorData) },
       videoId: trackId, contentCheckOk: true, racyCheckOk: true,
@@ -288,7 +290,11 @@ async function handleStream(trackId, env, userToken) {
     upstashCmd(env, 'DEL', key);
     throw new Error(`${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
   }
+  return data;
+}
 
+async function handleStream(trackId, env, userToken) {
+  const data = await fetchPlayerData(trackId, env, userToken);
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
@@ -316,6 +322,34 @@ async function handleStream(trackId, env, userToken) {
   }
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
+}
+
+async function handleDownload(trackId, env, userToken) {
+  const data = await fetchPlayerData(trackId, env, userToken);
+  const sd = data.streamingData;
+  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
+
+  // Skip HLS for downloads — it's segmented and cannot be saved as a file.
+  // Always use a direct AAC/mp4 URL so Eclipse can write a real file offline.
+  const fmts = (sd.adaptiveFormats || [])
+    .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
+    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+  if (!fmts.length) throw new Error(`${LOG_PREFIX} No downloadable audio format for ${trackId}`);
+
+  const audioResp = await fetch(fmts[0].url);
+  if (!audioResp.ok) throw new Error(`${LOG_PREFIX} Audio fetch failed: ${audioResp.status}`);
+
+  const contentLength = audioResp.headers.get('content-length');
+  const headers = {
+    'Content-Type': 'audio/mp4',
+    'Content-Disposition': `attachment; filename="${trackId}.m4a"`,
+    'access-control-allow-origin': '*',
+    'cache-control': 'no-store',
+  };
+  if (contentLength) headers['Content-Length'] = contentLength;
+
+  return new Response(audioResp.body, { status: 200, headers });
 }
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
@@ -460,19 +494,21 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.4.5',
-    description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. Playback-first HLS with AAC fallback.',
+    version:     '1.4.6',
+    description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-    resources:   ['search', 'stream', 'catalog'],
+    resources:   ['search', 'stream', 'catalog', 'download'],
     types:       ['track', 'album', 'artist', 'playlist'],
     contentType: 'music',
+    downloadUrl: '/download/{id}',
   };
 }
 
 async function handleRoute(rest, url, env, userToken) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest());
-  if (rest === '/search')         return jsonRes(await handleSearch(q, env, userToken));
+  if (rest === '/search')            return jsonRes(await handleSearch(q, env, userToken));
+  if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return await handleDownload(id, env, userToken); }
   if (rest.startsWith('/stream/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id, env, userToken)); }
   if (rest.startsWith('/album/'))    { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id, env, userToken)); }
   if (rest.startsWith('/artist/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id, env, userToken)); }
@@ -553,6 +589,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
     <span class="pill hi">HLS Primary</span>
     <span class="pill gr">AAC Fallback</span>
+    <span class="pill gr">Offline Downloads</span>
     <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
   </div>
@@ -577,11 +614,11 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>
     <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
-    <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse support</div></div>
+    <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse and offline download support</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS primary for playback reliability &rarr; AAC fallback. visitorData cached 20 min via Upstash Redis (per-user token).</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS primary &rarr; AAC fallback. Download: direct AAC proxy with Content-Disposition for offline saves. visitorData cached 20 min via Upstash Redis (per-user token).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.4.5 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.4.6 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -634,7 +671,7 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.5', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.6', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
