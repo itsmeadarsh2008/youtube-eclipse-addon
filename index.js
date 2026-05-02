@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.2
+// author: ricky | version: 1.4.3
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -40,12 +40,17 @@ async function upstashCmd(env, ...args) {
   } catch { return null; }
 }
 
-async function getVisitorData(env) {
-  const cached = await upstashCmd(env, 'GET', 'ytm:visitor');
+// userToken = the per-user URL token (e.g. from /u/<token>/...).
+// Each user gets their own visitorData key so YouTube sees N separate "devices"
+// instead of one shared identity being hammered from many IPs simultaneously.
+async function getVisitorData(env, userToken) {
+  const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
+  const cached = await upstashCmd(env, 'GET', key);
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
-  return fetchFreshVisitorData(env);
+  return fetchFreshVisitorData(env, userToken);
 }
-async function fetchFreshVisitorData(env) {
+async function fetchFreshVisitorData(env, userToken) {
+  const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   try {
     const resp = await fetch(`${YTM_BASE}/youtubei/v1/visitor_id?key=${YTM_API_KEY}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -53,13 +58,14 @@ async function fetchFreshVisitorData(env) {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const vd = (await resp.json())?.responseContext?.visitorData || null;
-    if (vd) upstashCmd(env, 'SET', 'ytm:visitor', vd, 'EX', VISITOR_TTL_SEC);
+    if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
     return vd;
   } catch (e) { console.log(LOG_PREFIX, 'visitorData failed:', e.message); return null; }
 }
-function tryRefreshVisitor(data, env) {
+function tryRefreshVisitor(data, env, userToken) {
   const vd = data?.responseContext?.visitorData;
-  if (vd) upstashCmd(env, 'SET', 'ytm:visitor', vd, 'EX', VISITOR_TTL_SEC);
+  const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
+  if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -116,23 +122,23 @@ function buildIosContext(visitorData) {
 }
 
 // ─── Core fetch helpers ───────────────────────────────────────────────────────
-async function ytmPost(path, body, env) {
+async function ytmPost(path, body, env, userToken) {
   const resp = await fetch(`${YTM_BASE}${path}`, {
     method: 'POST', headers: SEARCH_HEADERS, body: JSON.stringify(body),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} HTTP ${resp.status} on ${path}`);
   const data = await resp.json();
-  tryRefreshVisitor(data, env);
+  tryRefreshVisitor(data, env, userToken);
   return data;
 }
-async function ytmBrowse(browseId, env) {
+async function ytmBrowse(browseId, env, userToken) {
   return ytmPost(`/youtubei/v1/browse?key=${YTM_API_KEY}`,
-    { context: { client: WEB_REMIX_CONTEXT }, browseId }, env);
+    { context: { client: WEB_REMIX_CONTEXT }, browseId }, env, userToken);
 }
-async function ytmSearch(query, params, env) {
+async function ytmSearch(query, params, env, userToken) {
   const body = { context: { client: WEB_REMIX_CONTEXT }, query };
   if (params) body.params = params;
-  return ytmPost(`/youtubei/v1/search?key=${YTM_API_KEY}`, body, env);
+  return ytmPost(`/youtubei/v1/search?key=${YTM_API_KEY}`, body, env, userToken);
 }
 
 // ─── videoId extraction ───────────────────────────────────────────────────────
@@ -263,14 +269,14 @@ function getShelves(data) {
 }
 
 // ─── Search ───────────────────────────────────────────────────────────────────
-async function handleSearch(query, env) {
+async function handleSearch(query, env, userToken) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
   const [songsR, videosR, albumsR, artistsR, plR] = await Promise.allSettled([
-    ytmSearch(query, SEARCH_PARAMS.songs,     env),
-    ytmSearch(query, SEARCH_PARAMS.videos,    env),
-    ytmSearch(query, SEARCH_PARAMS.albums,    env),
-    ytmSearch(query, SEARCH_PARAMS.artists,   env),
-    ytmSearch(query, SEARCH_PARAMS.playlists, env),
+    ytmSearch(query, SEARCH_PARAMS.songs,     env, userToken),
+    ytmSearch(query, SEARCH_PARAMS.videos,    env, userToken),
+    ytmSearch(query, SEARCH_PARAMS.albums,    env, userToken),
+    ytmSearch(query, SEARCH_PARAMS.artists,   env, userToken),
+    ytmSearch(query, SEARCH_PARAMS.playlists, env, userToken),
   ]);
   const tracks = [], albums = [], artists = [], playlists = [], seenIds = new Set();
   const addTrack = t => { if (t && !seenIds.has(t.id)) { seenIds.add(t.id); tracks.push(t); } };
@@ -288,8 +294,8 @@ async function handleSearch(query, env) {
 }
 
 // ─── Stream ───────────────────────────────────────────────────────────────────
-async function handleStream(trackId, env) {
-  const visitorData = await getVisitorData(env);
+async function handleStream(trackId, env, userToken) {
+  const visitorData = await getVisitorData(env, userToken);
   const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json',
@@ -302,7 +308,8 @@ async function handleStream(trackId, env) {
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
   const data = await resp.json();
   if (data?.playabilityStatus?.status !== 'OK') {
-    upstashCmd(env, 'DEL', 'ytm:visitor');
+    const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
+    upstashCmd(env, 'DEL', key);
     throw new Error(`${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
   }
   const sd = data.streamingData;
@@ -349,8 +356,8 @@ function extractResponsiveHeader(data) {
 }
 
 // ─── Album ────────────────────────────────────────────────────────────────────
-async function handleAlbum(albumId, env) {
-  const data = await ytmBrowse(albumId, env);
+async function handleAlbum(albumId, env, userToken) {
+  const data = await ytmBrowse(albumId, env, userToken);
   const hdr  = extractResponsiveHeader(data) || {};
 
   const albumTitle = runsText(hdr.title?.runs);
@@ -387,8 +394,8 @@ async function handleAlbum(albumId, env) {
 // Fix: after gathering videoIds from browse, do ONE songs search scoped to the
 // artist name and merge durations in by videoId. Search results DO have duration
 // in flex1 runs (parsed by parseInfoRuns → info.duration).
-async function handleArtist(artistId, env) {
-  const data = await ytmBrowse(artistId, env);
+async function handleArtist(artistId, env, userToken) {
+  const data = await ytmBrowse(artistId, env, userToken);
   const hdr  = data?.header?.musicImmersiveHeaderRenderer || data?.header?.musicVisualHeaderRenderer || {};
   const name = runsText(hdr.title?.runs) || 'Unknown Artist';
   const artworkURL = bestThumbnail(
@@ -419,7 +426,7 @@ async function handleArtist(artistId, env) {
   // We match by videoId and fill in any zero-duration tracks.
   if (topTracks.some(t => t.duration === 0)) {
     try {
-      const sr   = await ytmSearch(name, SEARCH_PARAMS.songs, env);
+      const sr   = await ytmSearch(name, SEARCH_PARAMS.songs, env, userToken);
       const dMap = new Map();
       for (const shelf of getShelves(sr)) {
         for (const it of shelf.contents || []) {
@@ -443,10 +450,10 @@ async function handleArtist(artistId, env) {
 }
 
 // ─── Playlist ─────────────────────────────────────────────────────────────────
-async function handlePlaylist(playlistId, env) {
+async function handlePlaylist(playlistId, env, userToken) {
   // Ensure the VL prefix that YTM browse requires
   const browseId = playlistId.startsWith('VL') ? playlistId : 'VL' + playlistId;
-  const data = await ytmBrowse(browseId, env);
+  const data = await ytmBrowse(browseId, env, userToken);
 
   const hdr = extractResponsiveHeader(data) || {};
   const title    = runsText(hdr.title?.runs) || 'Playlist';
@@ -482,7 +489,7 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.4.2',
+    version:     '1.4.3',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS primary, MP4 fallback.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog'],
@@ -492,14 +499,14 @@ function buildManifest() {
 }
 
 // ─── Route dispatcher ─────────────────────────────────────────────────────────
-async function handleRoute(rest, url, env) {
+async function handleRoute(rest, url, env, userToken) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest());
-  if (rest === '/search')         return jsonRes(await handleSearch(q, env));
-  if (rest.startsWith('/stream/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id, env)); }
-  if (rest.startsWith('/album/'))    { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id, env)); }
-  if (rest.startsWith('/artist/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id, env)); }
-  if (rest.startsWith('/playlist/')) { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handlePlaylist(id, env)); }
+  if (rest === '/search')         return jsonRes(await handleSearch(q, env, userToken));
+  if (rest.startsWith('/stream/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id, env, userToken)); }
+  if (rest.startsWith('/album/'))    { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id, env, userToken)); }
+  if (rest.startsWith('/artist/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id, env, userToken)); }
+  if (rest.startsWith('/playlist/')) { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handlePlaylist(id, env, userToken)); }
   return null;
 }
 
@@ -604,9 +611,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse support</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS &rarr; MP4. visitorData cached 20 min via Upstash Redis.</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS &rarr; MP4. visitorData cached 20 min via Upstash Redis (per-user token).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.4.2 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.4.3 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -660,15 +667,15 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.2', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.3', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
         if (!isValidToken(tp.token)) return jsonRes({ error: 'Invalid token.' }, 400);
-        const r = await handleRoute(tp.rest, url, env);
+        const r = await handleRoute(tp.rest, url, env, tp.token);
         return r || jsonRes({ error: 'Not found', path: tp.rest }, 404);
       }
-      const base = await handleRoute(pathname, url, env);
+      const base = await handleRoute(pathname, url, env, null);
       return base || jsonRes({ error: 'Not found' }, 404);
     } catch (err) {
       console.error(LOG_PREFIX, err);
