@@ -1,7 +1,8 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.5.0
+// author: ricky | version: 1.5.1
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
+const YT_BASE     = 'https://www.youtube.com';   // non-iOS player calls — avoids music.youtube.com bot wall
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 const VISITOR_TTL_SEC = 1200;
 
@@ -316,44 +317,50 @@ async function handleSearch(query, env, userToken) {
 }
 
 // ─── Multi-client player fetch ────────────────────────────────────────────────
-// Chain: iOS (HLS) → ANDROID_TESTSUITE (bot bypass) → ANDROID_MUSIC → WEB_EMBEDDED → MWEB
-// ANDROID_TESTSUITE is Google's internal test client and is never hit by the
-// "Sign in to confirm you're not a bot" wall, making it the key fallback.
+// Chain: iOS (music.youtube.com) → ANDROID_TESTSUITE (www.youtube.com) → ANDROID_MUSIC → WEB_EMBEDDED → MWEB
+// KEY FIX v1.5.1: music.youtube.com enforces bot/sign-in checks on Android & Web clients
+// but www.youtube.com does NOT. iOS is exempt on music.youtube.com so it stays as-is.
+// Switching non-iOS clients to YT_BASE (www.youtube.com) fixes Android/Windows playback.
 async function fetchPlayerData(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
 
   const clients = [
     {
       label: 'IOS',
+      base: YTM_BASE,  // iOS works fine on music.youtube.com
       ctx: buildIosContext(visitorData),
       ua: 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
     },
     {
       label: 'ANDROID_TESTSUITE',
+      base: YT_BASE,   // www.youtube.com — bypasses music.youtube.com bot check on Android/Web
       ctx: buildAndroidTestsuiteContext(visitorData),
       ua: 'com.google.android.youtube/17.31.35 (Linux; U; Android 14) gzip',
     },
     {
       label: 'ANDROID_MUSIC',
+      base: YT_BASE,
       ctx: buildAndroidContext(visitorData),
       ua: 'com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14) gzip',
     },
     {
       label: 'WEB_EMBEDDED',
+      base: YT_BASE,
       ctx: buildWebEmbeddedContext(visitorData),
       ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     },
     {
       label: 'MWEB',
+      base: YT_BASE,
       ctx: buildMwebContext(visitorData),
       ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
     },
   ];
 
   let lastErr;
-  for (const { label, ctx, ua } of clients) {
+  for (const { label, base, ctx, ua } of clients) {
     try {
-      const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
+      const resp = await fetch(`${base}/youtubei/v1/player?prettyPrint=false`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'User-Agent': ua },
         body: JSON.stringify({
@@ -595,7 +602,7 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.5.0',
+    version:     '1.5.1',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. Multi-client (iOS/Android/WEB) with HLS + AAC + Opus fallback. Offline download support.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog', 'download'],
@@ -721,7 +728,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Player chain: iOS &rarr; ANDROID_TESTSUITE &rarr; ANDROID_MUSIC &rarr; WEB_EMBEDDED &rarr; MWEB. HLS &rarr; AAC &rarr; Opus. Download: 302 redirect to YouTube CDN. visitorData: 20 min per-user via Upstash Redis.</div>
 </div>
-<footer>YouTube Music for Eclipse v1.5.0 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.5.1 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -774,7 +781,7 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.0', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.1', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
