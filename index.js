@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.9
+// author: ricky | version: 1.4.7
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -13,22 +13,6 @@ const IOS_CLIENT_BASE = {
   deviceMake: 'Apple', deviceModel: 'iPhone16,2',
   osName: 'iPhone', osVersion: '18.3.2.22D82', hl: 'en',
 };
-const ANDROID_MUSIC_CLIENT = {
-  clientName: 'ANDROID_MUSIC', clientVersion: '7.27.52',
-  androidSdkVersion: 34,
-  osName: 'Android', osVersion: '14', hl: 'en',
-};
-// WEB_EMBEDDED_PLAYER — works for age-restricted and general playback
-const WEB_EMBEDDED_CLIENT = {
-  clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '2.20260304.00.00',
-  hl: 'en', gl: 'US',
-};
-// MWEB — mobile web fallback, rarely blocked
-const MWEB_CLIENT = {
-  clientName: 'MWEB', clientVersion: '2.20260304.03.00',
-  hl: 'en', gl: 'US',
-};
-
 const SEARCH_PARAMS = {
   songs:     'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
   videos:    'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D',
@@ -56,13 +40,13 @@ async function upstashCmd(env, ...args) {
 }
 
 async function getVisitorData(env, userToken) {
-  const key = `ytm:visitor:${userToken}`;
+  const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   const cached = await upstashCmd(env, 'GET', key);
   if (cached && typeof cached === 'string' && cached.length > 4) return cached;
   return fetchFreshVisitorData(env, userToken);
 }
 async function fetchFreshVisitorData(env, userToken) {
-  const key = `ytm:visitor:${userToken}`;
+  const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   try {
     const resp = await fetch(`${YTM_BASE}/youtubei/v1/visitor_id?key=${YTM_API_KEY}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -76,7 +60,7 @@ async function fetchFreshVisitorData(env, userToken) {
 }
 function tryRefreshVisitor(data, env, userToken) {
   const vd = data?.responseContext?.visitorData;
-  const key = `ytm:visitor:${userToken}`;
+  const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
 }
 
@@ -124,21 +108,6 @@ function parseInfoRuns(runs) {
 
 function buildIosContext(visitorData) {
   const ctx = { ...IOS_CLIENT_BASE };
-  if (visitorData) ctx.visitorData = visitorData;
-  return ctx;
-}
-function buildAndroidContext(visitorData) {
-  const ctx = { ...ANDROID_MUSIC_CLIENT };
-  if (visitorData) ctx.visitorData = visitorData;
-  return ctx;
-}
-function buildWebEmbeddedContext(visitorData) {
-  const ctx = { ...WEB_EMBEDDED_CLIENT };
-  if (visitorData) ctx.visitorData = visitorData;
-  return ctx;
-}
-function buildMwebContext(visitorData) {
-  const ctx = { ...MWEB_CLIENT };
   if (visitorData) ctx.visitorData = visitorData;
   return ctx;
 }
@@ -301,67 +270,27 @@ async function handleSearch(query, env, userToken) {
   return { tracks, albums, artists, playlists };
 }
 
-// ─── Multi-client player fetch: iOS → Android Music → WEB_EMBEDDED → MWEB ───
 async function fetchPlayerData(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
-
-  const clients = [
-    {
-      label: 'IOS',
-      ctx: buildIosContext(visitorData),
-      ua: 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
+  const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
     },
-    {
-      label: 'ANDROID_MUSIC',
-      ctx: buildAndroidContext(visitorData),
-      ua: 'com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14) gzip',
-    },
-    {
-      label: 'WEB_EMBEDDED',
-      ctx: buildWebEmbeddedContext(visitorData),
-      ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    },
-    {
-      label: 'MWEB',
-      ctx: buildMwebContext(visitorData),
-      ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-    },
-  ];
-
-  let lastErr;
-  for (const { label, ctx, ua } of clients) {
-    try {
-      const resp = await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': ua },
-        body: JSON.stringify({
-          context: { client: ctx },
-          videoId: trackId, contentCheckOk: true, racyCheckOk: true,
-        }),
-      });
-      if (!resp.ok) {
-        lastErr = new Error(`${LOG_PREFIX} [${label}] Player HTTP ${resp.status}`);
-        console.log(LOG_PREFIX, `[${label}] HTTP ${resp.status}, trying next client`);
-        continue;
-      }
-      const data = await resp.json();
-      tryRefreshVisitor(data, env, userToken);
-      if (data?.playabilityStatus?.status === 'OK') {
-        console.log(LOG_PREFIX, `[${label}] player OK for ${trackId}`);
-        return data;
-      }
-      lastErr = new Error(`${LOG_PREFIX} [${label}] Blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
-      console.log(LOG_PREFIX, `[${label}] blocked — ${data?.playabilityStatus?.reason}, trying next client`);
-    } catch (e) {
-      lastErr = e;
-      console.log(LOG_PREFIX, `[${label}] exception: ${e.message}`);
-    }
+    body: JSON.stringify({
+      context: { client: buildIosContext(visitorData) },
+      videoId: trackId, contentCheckOk: true, racyCheckOk: true,
+    }),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') {
+    const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
+    upstashCmd(env, 'DEL', key);
+    throw new Error(`${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
   }
-
-  // All clients failed — nuke cached visitorData so next request gets a fresh one
-  const key = `ytm:visitor:${userToken}`;
-  upstashCmd(env, 'DEL', key);
-  throw new Error(lastErr?.message || `${LOG_PREFIX} All clients failed for ${trackId}`);
+  return data;
 }
 
 async function handleStream(trackId, env, userToken) {
@@ -369,7 +298,7 @@ async function handleStream(trackId, env, userToken) {
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
-  // HLS first (iOS client returns this) — most reliable for Eclipse playback
+  // Playback-first: HLS is more reliable for client playback from Eclipse.
   if (sd.hlsManifestUrl) {
     return {
       url: sd.hlsManifestUrl,
@@ -379,7 +308,6 @@ async function handleStream(trackId, env, userToken) {
     };
   }
 
-  // AAC adaptive fallback (Android / WEB_EMBEDDED / MWEB clients return this)
   const fmts = (sd.adaptiveFormats || [])
     .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -393,20 +321,6 @@ async function handleStream(trackId, env, userToken) {
     };
   }
 
-  // Last resort: opus/webm
-  const opusFmts = (sd.adaptiveFormats || [])
-    .filter(f => f.mimeType?.startsWith('audio/webm') && f.url)
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-  if (opusFmts.length) {
-    return {
-      url: opusFmts[0].url,
-      format: 'opus',
-      quality: 'high',
-      expiresAt: Math.floor(Date.now() / 1000) + 21600,
-    };
-  }
-
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
@@ -415,6 +329,9 @@ async function handleDownload(trackId, env, userToken) {
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
+  // Skip HLS — segmented streams cannot be saved as a file.
+  // Redirect directly to the YouTube CDN audio URL so Eclipse downloads
+  // the file without the Worker having to proxy the bytes (avoids CF timeouts).
   const fmts = (sd.adaptiveFormats || [])
     .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -573,8 +490,8 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.4.9',
-    description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. Multi-client (iOS/Android/WEB) with HLS + AAC + Opus fallback. Offline download support.',
+    version:     '1.4.7',
+    description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog', 'download'],
     types:       ['track', 'album', 'artist', 'playlist'],
@@ -668,10 +585,8 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
     <span class="pill hi">HLS Primary</span>
     <span class="pill gr">AAC Fallback</span>
-    <span class="pill gr">Opus Fallback</span>
     <span class="pill gr">Offline Downloads</span>
     <span class="pill gr">Upstash Redis</span>
-    <span class="pill bl">iOS + Android + Web</span>
     <span class="pill bl">No Account</span>
   </div>
   <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>
@@ -697,9 +612,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse and offline download support</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Player: iOS &rarr; Android Music &rarr; WEB_EMBEDDED &rarr; MWEB fallback chain. HLS primary &rarr; AAC &rarr; Opus fallback. Download: 302 redirect to direct YouTube CDN audio URL. visitorData cached 20 min per-user via Upstash Redis.</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS primary &rarr; AAC fallback. Download: 302 redirect to direct YouTube CDN audio URL for reliable offline saves. visitorData cached 20 min via Upstash Redis (per-user token).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.4.9 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.4.7 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -752,7 +667,7 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.9', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.7', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
@@ -760,10 +675,7 @@ export default {
         const r = await handleRoute(tp.rest, url, env, tp.token);
         return r || jsonRes({ error: 'Not found', path: tp.rest }, 404);
       }
-
-      // Anonymous path — per-request key from cf-ray to avoid shared visitorData bot flagging
-      const anonKey = `anon_${request.headers.get('cf-ray')?.slice(0, 8) || Math.random().toString(36).slice(2)}`;
-      const base = await handleRoute(pathname, url, env, anonKey);
+      const base = await handleRoute(pathname, url, env, null);
       return base || jsonRes({ error: 'Not found' }, 404);
     } catch (err) {
       console.error(LOG_PREFIX, err);
