@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.9
+// author: ricky | version: 1.5.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -8,22 +8,31 @@ const VISITOR_TTL_SEC = 1200;
 const WEB_REMIX_CONTEXT = {
   clientName: 'WEB_REMIX', clientVersion: '1.20260304.03.00', hl: 'en', gl: 'US',
 };
+// Client 1: iOS — returns HLS manifest, best for Eclipse
 const IOS_CLIENT_BASE = {
   clientName: 'IOS', clientVersion: '20.10.01',
   deviceMake: 'Apple', deviceModel: 'iPhone16,2',
   osName: 'iPhone', osVersion: '18.3.2.22D82', hl: 'en',
 };
+// Client 2: ANDROID_TESTSUITE — bypasses bot/sign-in checks, Google internal test client
+// This client is never blocked by the "Sign in to confirm" wall
+const ANDROID_TESTSUITE_CLIENT = {
+  clientName: 'ANDROID_TESTSUITE', clientVersion: '1.9',
+  androidSdkVersion: 34,
+  osName: 'Android', osVersion: '14', hl: 'en',
+};
+// Client 3: ANDROID_MUSIC — standard Android YT Music app
 const ANDROID_MUSIC_CLIENT = {
   clientName: 'ANDROID_MUSIC', clientVersion: '7.27.52',
   androidSdkVersion: 34,
   osName: 'Android', osVersion: '14', hl: 'en',
 };
-// WEB_EMBEDDED_PLAYER — works for age-restricted and general playback
+// Client 4: WEB_EMBEDDED_PLAYER — works for age-restricted content
 const WEB_EMBEDDED_CLIENT = {
   clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '2.20260304.00.00',
   hl: 'en', gl: 'US',
 };
-// MWEB — mobile web fallback, rarely blocked
+// Client 5: MWEB — mobile web, last resort
 const MWEB_CLIENT = {
   clientName: 'MWEB', clientVersion: '2.20260304.03.00',
   hl: 'en', gl: 'US',
@@ -124,6 +133,11 @@ function parseInfoRuns(runs) {
 
 function buildIosContext(visitorData) {
   const ctx = { ...IOS_CLIENT_BASE };
+  if (visitorData) ctx.visitorData = visitorData;
+  return ctx;
+}
+function buildAndroidTestsuiteContext(visitorData) {
+  const ctx = { ...ANDROID_TESTSUITE_CLIENT };
   if (visitorData) ctx.visitorData = visitorData;
   return ctx;
 }
@@ -301,7 +315,10 @@ async function handleSearch(query, env, userToken) {
   return { tracks, albums, artists, playlists };
 }
 
-// ─── Multi-client player fetch: iOS → Android Music → WEB_EMBEDDED → MWEB ───
+// ─── Multi-client player fetch ────────────────────────────────────────────────
+// Chain: iOS (HLS) → ANDROID_TESTSUITE (bot bypass) → ANDROID_MUSIC → WEB_EMBEDDED → MWEB
+// ANDROID_TESTSUITE is Google's internal test client and is never hit by the
+// "Sign in to confirm you're not a bot" wall, making it the key fallback.
 async function fetchPlayerData(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
 
@@ -310,6 +327,11 @@ async function fetchPlayerData(trackId, env, userToken) {
       label: 'IOS',
       ctx: buildIosContext(visitorData),
       ua: 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
+    },
+    {
+      label: 'ANDROID_TESTSUITE',
+      ctx: buildAndroidTestsuiteContext(visitorData),
+      ua: 'com.google.android.youtube/17.31.35 (Linux; U; Android 14) gzip',
     },
     {
       label: 'ANDROID_MUSIC',
@@ -573,7 +595,7 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.4.9',
+    version:     '1.5.0',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. Multi-client (iOS/Android/WEB) with HLS + AAC + Opus fallback. Offline download support.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog', 'download'],
@@ -671,7 +693,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill gr">Opus Fallback</span>
     <span class="pill gr">Offline Downloads</span>
     <span class="pill gr">Upstash Redis</span>
-    <span class="pill bl">iOS + Android + Web</span>
+    <span class="pill bl">5-Client Bot Bypass</span>
     <span class="pill bl">No Account</span>
   </div>
   <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>
@@ -697,9 +719,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse and offline download support</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Player: iOS &rarr; Android Music &rarr; WEB_EMBEDDED &rarr; MWEB fallback chain. HLS primary &rarr; AAC &rarr; Opus fallback. Download: 302 redirect to direct YouTube CDN audio URL. visitorData cached 20 min per-user via Upstash Redis.</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Player chain: iOS &rarr; ANDROID_TESTSUITE &rarr; ANDROID_MUSIC &rarr; WEB_EMBEDDED &rarr; MWEB. HLS &rarr; AAC &rarr; Opus. Download: 302 redirect to YouTube CDN. visitorData: 20 min per-user via Upstash Redis.</div>
 </div>
-<footer>YouTube Music for Eclipse v1.4.9 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.5.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,ru=null;
 function generate(){
@@ -752,7 +774,7 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.9', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.0', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
