@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.8
+// author: ricky | version: 1.4.9
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -304,7 +304,6 @@ async function handleStream(trackId, env, userToken) {
       url: sd.hlsManifestUrl,
       format: 'hls',
       quality: 'high',
-      expiresAt: Math.floor(Date.now() / 1000) + 21600,
     };
   }
 
@@ -317,7 +316,6 @@ async function handleStream(trackId, env, userToken) {
       url: fmts[0].url,
       format: 'aac',
       quality: 'high',
-      expiresAt: Math.floor(Date.now() / 1000) + 21600,
     };
   }
 
@@ -490,13 +488,15 @@ function buildManifest() {
   return {
     id:          'com.ricky.youtube-music',
     name:        'YouTube Music',
-    version:     '1.4.7',
+    version:     '1.4.9',
     description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.',
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog', 'download'],
     types:       ['track', 'album', 'artist', 'playlist'],
     contentType: 'music',
     downloadUrl: '/download/{id}',
+    noPrefetch:  true,
+    noStreamCache: true,
   };
 }
 
