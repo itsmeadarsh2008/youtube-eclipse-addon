@@ -1,12 +1,12 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.7.0
+// author: ricky | version: 1.8.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 const VISITOR_TTL_SEC = 1200;
 
 // YouTube signed URLs expire in ~6 hours; tell Eclipse to refresh after 5h50m
-const STREAM_EXPIRES_SEC = 5 * 3600 + 50 * 60; // 21000 seconds
+const STREAM_EXPIRES_SEC = 5 * 3600 + 50 * 60;
 
 const WEB_REMIX_CONTEXT = {
   clientName: 'WEB_REMIX', clientVersion: '1.20260304.03.00', hl: 'en', gl: 'US',
@@ -27,6 +27,14 @@ const SEARCH_HEADERS = {
   'Content-Type': 'application/json',
   'Origin':  YTM_BASE, 'Referer': `${YTM_BASE}/`,
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+};
+// Headers used when proxying audio bytes from YouTube CDN
+const YT_CDN_HEADERS = {
+  'User-Agent':      'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
+  'Accept':          '*/*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Origin':          'https://music.youtube.com',
+  'Referer':         'https://music.youtube.com/',
 };
 
 async function upstashCmd(env, ...args) {
@@ -476,55 +484,64 @@ async function fetchPlayerData(trackId, env, userToken) {
 }
 
 function pickBestAudio(sd) {
-  // Returns the highest-bitrate direct audio/mp4 (AAC) URL — suitable for file downloads
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id}
-// Returns HLS manifest for live playback — Eclipse uses AVPlayer natively for this.
-// expiresAt tells Eclipse when to re-call /stream for a fresh URL.
+// /stream/{id} — HLS for live playback via AVPlayer
 async function handleStream(trackId, env, userToken) {
   const data=await fetchPlayerData(trackId,env,userToken);
   const sd=data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-
-  const expiresAt = Math.floor(Date.now() / 1000) + STREAM_EXPIRES_SEC;
-
-  // HLS preferred — adaptive quality, native iOS AVPlayer support
-  if (sd.hlsManifestUrl) {
-    return { url:sd.hlsManifestUrl, format:'hls', quality:'high', expiresAt };
-  }
-  // Direct AAC mp4 fallback when HLS unavailable
+  const expiresAt = Math.floor(Date.now()/1000) + STREAM_EXPIRES_SEC;
+  if (sd.hlsManifestUrl) return { url:sd.hlsManifestUrl, format:'hls', quality:'high', expiresAt };
   const best=pickBestAudio(sd);
   if (best) return { url:best.url, format:'aac', quality:'high', expiresAt };
-
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
 // /download/{id}
-// MUST return a direct audio/mp4 (AAC) URL — never HLS.
-// HLS is a text manifest, not a file. Eclipse downloads the raw bytes from this URL.
-// Eclipse stores the file and plays it offline without calling your server again.
-async function handleDownload(trackId, env, userToken) {
+// Proxies the raw AAC mp4 bytes through the Worker so Eclipse receives a real audio file.
+// YouTube signed CDN URLs reject direct client fetches (403/partial) without the right headers.
+// The Worker fetches with the iOS User-Agent and streams the response body straight to Eclipse.
+async function proxyDownload(trackId, incomingRequest, env, userToken) {
   const data=await fetchPlayerData(trackId,env,userToken);
   const sd=data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
 
-  // Always use direct AAC mp4 — never HLS for downloads
   const best=pickBestAudio(sd);
-  if (best) {
-    return {
-      url:     best.url,
-      format:  'aac',
-      quality: 'high',
-      // mimeType hint so Eclipse saves with the right extension
-      mimeType: 'audio/mp4',
-    };
+  if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
+
+  // Forward Range header if Eclipse is resuming a partial download
+  const reqHeaders = { ...YT_CDN_HEADERS };
+  const range = incomingRequest.headers.get('range');
+  if (range) reqHeaders['Range'] = range;
+
+  const upstream = await fetch(best.url, { headers: reqHeaders });
+  if (!upstream.ok && upstream.status !== 206) {
+    throw new Error(`${LOG_PREFIX} CDN fetch failed: ${upstream.status}`);
   }
 
-  throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
+  // Determine content-length from upstream for accurate progress bar in Eclipse
+  const contentLength = best.contentLength || upstream.headers.get('content-length') || null;
+
+  const resHeaders = {
+    'content-type':                  'audio/mp4',
+    'access-control-allow-origin':   '*',
+    'access-control-allow-methods':  'GET, OPTIONS',
+    'cache-control':                 'no-store',
+    // Hint filename so Eclipse labels it .m4a not .mp3
+    'content-disposition':           `attachment; filename="${trackId}.m4a"`,
+  };
+  if (contentLength)                         resHeaders['content-length']  = String(contentLength);
+  if (upstream.headers.get('content-range')) resHeaders['content-range']   = upstream.headers.get('content-range');
+  if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges']   = upstream.headers.get('accept-ranges');
+
+  return new Response(upstream.body, {
+    status:  upstream.status, // pass 206 through for Range requests
+    headers: resHeaders,
+  });
 }
 
 // ─── Browse helpers ──────────────────────────────────────────────────────────
@@ -685,23 +702,21 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'1.7.0', description:v.description,
+    id:v.id, name:v.name, version:'1.8.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-    // stream  = HLS manifest for live playback
-    // download = direct AAC mp4 for offline file saving (separate endpoint)
-    // catalog  = album/artist/playlist detail pages
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
     contentType:'music',
   };
 }
 
+// Download route needs access to the raw request for Range header passthrough,
+// so it is handled directly in the main fetch handler, not via handleRoute.
 async function handleRoute(rest, url, env, userToken, mode) {
   const q=url.searchParams.get('q')||url.searchParams.get('query')||'';
   if (rest==='/manifest.json'||rest==='/manifest') return jsonRes(buildManifest(mode));
   if (rest==='/search')              return jsonRes(await handleSearch(q,env,userToken,mode));
   if (rest.startsWith('/stream/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id,env,userToken)); }
-  if (rest.startsWith('/download/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleDownload(id,env,userToken)); }
   if (rest.startsWith('/album/'))    { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id,env,userToken)); }
   if (rest.startsWith('/artist/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id,env,userToken,mode)); }
   if (rest.startsWith('/playlist/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handlePlaylist(id,env,userToken)); }
@@ -715,7 +730,7 @@ function jsonRes(data, status) {
       'content-type':                'application/json; charset=utf-8',
       'access-control-allow-origin': '*',
       'access-control-allow-methods':'GET, POST, OPTIONS',
-      'access-control-allow-headers':'Content-Type',
+      'access-control-allow-headers':'Content-Type, Range',
       'cache-control':               'no-store',
     },
   });
@@ -780,7 +795,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill">Songs &middot; Videos</span>
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
     <span class="pill hi">HLS Streaming</span>
-    <span class="pill gr">AAC Downloads</span>
+    <span class="pill gr">Proxied AAC Downloads</span>
     <span class="pill gr">Offline Playback</span>
     <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
@@ -819,12 +834,12 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
   <div class="warn">
-    /stream &rarr; HLS manifest (live playback via AVPlayer)<br>
-    /download &rarr; direct AAC mp4 (real file saved for offline)<br>
-    resources: search &middot; stream &middot; download &middot; catalog
+    /stream &rarr; HLS manifest (AVPlayer live playback)<br>
+    /download &rarr; Worker proxies raw AAC mp4 bytes with iOS UA headers<br>
+    Range requests supported for accurate download progress
   </div>
 </div>
-<footer>YouTube Music for Eclipse v1.7.0 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.8.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -871,7 +886,7 @@ function copyText(text,btn){
 export default {
   async fetch(request, env) {
     const url=new URL(request.url), pathname=url.pathname;
-    if (request.method==='OPTIONS') return new Response(null,{status:204,headers:{'access-control-allow-origin':'*','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'Content-Type'}});
+    if (request.method==='OPTIONS') return new Response(null,{status:204,headers:{'access-control-allow-origin':'*','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'Content-Type, Range'}});
     try {
       if (pathname==='/') return htmlRes(buildPage());
       if (pathname==='/generate'&&request.method==='POST') {
@@ -884,12 +899,26 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'1.7.0',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'1.8.0',ts:new Date().toISOString()});
+
+      // Handle /download/ directly here so we have access to the raw request object
+      // (needed to forward Range header for accurate progress tracking)
       const tp=parseTokenPath(pathname);
       if (tp) {
         if (!isValidToken(tp.token)) return jsonRes({error:'Invalid token.'},400);
+        if (tp.rest.startsWith('/download/')) {
+          const id=lastSegment(tp.rest);
+          if (!id) return jsonRes({error:'Missing ID'},400);
+          return await proxyDownload(id,request,env,tp.token);
+        }
         const r=await handleRoute(tp.rest,url,env,tp.token,tp.mode);
         return r||jsonRes({error:'Not found',path:tp.rest},404);
+      }
+      // Tokenless path (direct /download/ without a token)
+      if (pathname.startsWith('/download/')) {
+        const id=lastSegment(pathname);
+        if (!id) return jsonRes({error:'Missing ID'},400);
+        return await proxyDownload(id,request,env,null);
       }
       const base=await handleRoute(pathname,url,env,null,'both');
       return base||jsonRes({error:'Not found'},404);
