@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.0.0
+// author: ricky | version: 2.1.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -511,33 +511,21 @@ function pickBestAudio(sd) {
 }
 
 // ─── /stream/{id} ────────────────────────────────────────────────────────────
-// Strategy:
-//   1. iOS client  → hlsManifestUrl  (works on iOS AVPlayer natively)
-//   2. iOS client  → adaptiveFormats AAC direct URL (fallback if no HLS)
-//   3. Android client → adaptiveFormats AAC direct URL (works on Android + Windows)
-//
-// Eclipse picks the right one based on platform. We return BOTH urls so the
-// client can choose: { url: hlsUrl, urlFallback: aacUrl }
-// If only one is available we still return what we have.
 async function handleStream(trackId, env, userToken) {
   const expiresAt = Math.floor(Date.now()/1000) + STREAM_EXPIRES_SEC;
 
-  // Fire both player requests in parallel
   const [iosResult, androidResult] = await Promise.allSettled([
     fetchPlayerDataIos(trackId, env, userToken),
     fetchPlayerDataAndroid(trackId),
   ]);
 
-  const iosSd  = iosResult.status     === 'fulfilled' ? iosResult.value?.streamingData     : null;
+  const iosSd     = iosResult.status     === 'fulfilled' ? iosResult.value?.streamingData     : null;
   const androidSd = androidResult.status === 'fulfilled' ? androidResult.value?.streamingData : null;
 
-  // Best direct AAC URL — prefer Android (no CDN auth issues), fall back to iOS adaptive
   const androidAac = pickBestAudio(androidSd);
   const iosAac     = pickBestAudio(iosSd);
   const directAac  = androidAac || iosAac;
-
-  // HLS manifest — iOS client only
-  const hlsUrl = iosSd?.hlsManifestUrl || null;
+  const hlsUrl     = iosSd?.hlsManifestUrl || null;
 
   if (!hlsUrl && !directAac) {
     const iosErr     = iosResult.status     === 'rejected' ? iosResult.reason?.message     : 'no stream data';
@@ -545,39 +533,23 @@ async function handleStream(trackId, env, userToken) {
     throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}. iOS: ${iosErr} | Android: ${androidErr}`);
   }
 
-  // Return HLS as primary (best for iOS), direct AAC as fallback (works everywhere else)
-  // Eclipse on iOS will use `url` (HLS), Eclipse on Android/Windows will use `urlFallback` (AAC)
-  if (hlsUrl && directAac) {
-    return { url: hlsUrl, urlFallback: directAac.url, format: 'hls', formatFallback: 'aac', quality: 'high', expiresAt };
-  }
-  if (hlsUrl) {
-    return { url: hlsUrl, format: 'hls', quality: 'high', expiresAt };
-  }
-  // No HLS — return direct AAC as primary (works on all platforms)
-  return { url: directAac.url, format: 'aac', quality: 'high', expiresAt };
+  if (hlsUrl && directAac) return { url:hlsUrl, urlFallback:directAac.url, format:'hls', formatFallback:'aac', quality:'high', expiresAt };
+  if (hlsUrl)              return { url:hlsUrl, format:'hls', quality:'high', expiresAt };
+  return                          { url:directAac.url, format:'aac', quality:'high', expiresAt };
 }
 
-// ─── /download/{id} ──────────────────────────────────────────────────────────
-// Uses Android client for direct CDN URL, then issues a 302 redirect.
-// A redirect works on ALL platforms (iOS, Android, Windows) — the device
-// fetches directly from YouTube CDN without the Worker proxying bytes.
+// ─── /download/{id} ─────────────────────────────────────────────────────────
+// Returns JSON { url, format, quality, expiresAt } — same shape as /stream/
+// Eclipse fetches the CDN URL itself on the client side.
+// Android client URLs are directly accessible without CDN auth tricks.
 async function handleDownload(trackId) {
+  const expiresAt = Math.floor(Date.now()/1000) + STREAM_EXPIRES_SEC;
   const data = await fetchPlayerDataAndroid(trackId);
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
-
   const best = pickBestAudio(sd);
   if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
-
-  // 302 redirect to CDN — device downloads directly, no Worker byte proxying
-  return new Response(null, {
-    status: 302,
-    headers: {
-      'Location': best.url,
-      'access-control-allow-origin': '*',
-      'cache-control': 'no-store',
-    },
-  });
+  return { url: best.url, format: 'aac', quality: 'high', expiresAt };
 }
 
 // ─── Browse helpers ──────────────────────────────────────────────────────────
@@ -738,7 +710,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.0.0', description:v.description,
+    id:v.id, name:v.name, version:'2.1.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -830,7 +802,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
     <span class="pill hi">HLS Streaming</span>
     <span class="pill gr">AAC Fallback</span>
-    <span class="pill gr">302 Redirect Downloads</span>
+    <span class="pill gr">JSON Download URL</span>
     <span class="pill gr">iOS &middot; Android &middot; Windows</span>
     <span class="pill bl">No Account</span>
   </div>
@@ -868,12 +840,11 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
   <div class="warn">
-    /stream &rarr; iOS: HLS manifest primary + AAC fallback in parallel<br>
-    /stream &rarr; Android/Windows: direct AAC URL (no HLS CDN auth issues)<br>
-    /download &rarr; 302 redirect to YouTube CDN (works on all platforms)
+    /stream → HLS primary (iOS) + direct AAC fallback (Android/Windows)<br>
+    /download → JSON { url, format, quality } — Eclipse fetches CDN directly
   </div>
 </div>
-<footer>YouTube Music for Eclipse v2.0.0 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v2.1.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -933,7 +904,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'2.0.0',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'2.1.0',ts:new Date().toISOString()});
 
       const tp=parseTokenPath(pathname);
       if (tp) {
@@ -941,7 +912,7 @@ export default {
         if (tp.rest.startsWith('/download/')) {
           const id=lastSegment(tp.rest);
           if (!id) return jsonRes({error:'Missing ID'},400);
-          return await handleDownload(id);
+          return jsonRes(await handleDownload(id));
         }
         const r=await handleRoute(tp.rest,url,env,tp.token,tp.mode);
         return r||jsonRes({error:'Not found',path:tp.rest},404);
@@ -949,7 +920,7 @@ export default {
       if (pathname.startsWith('/download/')) {
         const id=lastSegment(pathname);
         if (!id) return jsonRes({error:'Missing ID'},400);
-        return await handleDownload(id);
+        return jsonRes(await handleDownload(id));
       }
       const base=await handleRoute(pathname,url,env,null,'both');
       return base||jsonRes({error:'Not found'},404);
