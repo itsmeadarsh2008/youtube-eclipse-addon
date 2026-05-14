@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.4.9
+// author: ricky | version: 1.5.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -246,27 +246,37 @@ function getShelves(data) {
   ).map(s => s.musicShelfRenderer).filter(Boolean);
 }
 
-async function handleSearch(query, env, userToken) {
+// mode: 'both' | 'songs' | 'videos'
+async function handleSearch(query, env, userToken, mode) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
+  const m = mode || 'both';
+
+  const fetchSongs   = m === 'both' || m === 'songs';
+  const fetchVideos  = m === 'both' || m === 'videos';
+  const fetchCatalog = m !== 'videos'; // albums/artists/playlists only for songs or both
+
   const [songsR, videosR, albumsR, artistsR, plR] = await Promise.allSettled([
-    ytmSearch(query, SEARCH_PARAMS.songs,     env, userToken),
-    ytmSearch(query, SEARCH_PARAMS.videos,    env, userToken),
-    ytmSearch(query, SEARCH_PARAMS.albums,    env, userToken),
-    ytmSearch(query, SEARCH_PARAMS.artists,   env, userToken),
-    ytmSearch(query, SEARCH_PARAMS.playlists, env, userToken),
+    fetchSongs   ? ytmSearch(query, SEARCH_PARAMS.songs,     env, userToken) : Promise.resolve(null),
+    fetchVideos  ? ytmSearch(query, SEARCH_PARAMS.videos,    env, userToken) : Promise.resolve(null),
+    fetchCatalog ? ytmSearch(query, SEARCH_PARAMS.albums,    env, userToken) : Promise.resolve(null),
+    fetchCatalog ? ytmSearch(query, SEARCH_PARAMS.artists,   env, userToken) : Promise.resolve(null),
+    fetchCatalog ? ytmSearch(query, SEARCH_PARAMS.playlists, env, userToken) : Promise.resolve(null),
   ]);
+
   const tracks = [], albums = [], artists = [], playlists = [], seenIds = new Set();
   const addTrack = t => { if (t && !seenIds.has(t.id)) { seenIds.add(t.id); tracks.push(t); } };
-  if (songsR.status  === 'fulfilled') for (const s of getShelves(songsR.value))
+
+  if (songsR.status  === 'fulfilled' && songsR.value)  for (const s of getShelves(songsR.value))
     for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 20) break; }
-  if (videosR.status === 'fulfilled') for (const s of getShelves(videosR.value))
+  if (videosR.status === 'fulfilled' && videosR.value) for (const s of getShelves(videosR.value))
     for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 40) break; }
-  if (albumsR.status === 'fulfilled') for (const s of getShelves(albumsR.value))
+  if (albumsR.status === 'fulfilled' && albumsR.value)  for (const s of getShelves(albumsR.value))
     for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 10) albums.push(a); }
-  if (artistsR.status=== 'fulfilled') for (const s of getShelves(artistsR.value))
+  if (artistsR.status=== 'fulfilled' && artistsR.value) for (const s of getShelves(artistsR.value))
     for (const it of s.contents || []) { const a = parseArtistItem(it); if (a && artists.length < 8) artists.push(a); }
-  if (plR.status     === 'fulfilled') for (const s of getShelves(plR.value))
+  if (plR.status     === 'fulfilled' && plR.value)      for (const s of getShelves(plR.value))
     for (const it of s.contents || []) { const p = parsePlaylistItem(it); if (p && playlists.length < 8) playlists.push(p); }
+
   return { tracks, albums, artists, playlists };
 }
 
@@ -298,13 +308,8 @@ async function handleStream(trackId, env, userToken) {
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
-  // Playback-first: HLS is more reliable for client playback from Eclipse.
   if (sd.hlsManifestUrl) {
-    return {
-      url: sd.hlsManifestUrl,
-      format: 'hls',
-      quality: 'high',
-    };
+    return { url: sd.hlsManifestUrl, format: 'hls', quality: 'high' };
   }
 
   const fmts = (sd.adaptiveFormats || [])
@@ -312,11 +317,7 @@ async function handleStream(trackId, env, userToken) {
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
   if (fmts.length) {
-    return {
-      url: fmts[0].url,
-      format: 'aac',
-      quality: 'high',
-    };
+    return { url: fmts[0].url, format: 'aac', quality: 'high' };
   }
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
@@ -327,9 +328,6 @@ async function handleDownload(trackId, env, userToken) {
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
 
-  // Skip HLS — segmented streams cannot be saved as a file.
-  // Redirect directly to the YouTube CDN audio URL so Eclipse downloads
-  // the file without the Worker having to proxy the bytes (avoids CF timeouts).
   const fmts = (sd.adaptiveFormats || [])
     .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -478,18 +476,30 @@ function generateToken() {
   return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
 }
 function isValidToken(t) { return typeof t === 'string' && /^[a-f0-9]{28}$/.test(t); }
+
+// Matches /u/{token}/songs/... or /u/{token}/videos/... or /u/{token}/...
 function parseTokenPath(p) {
-  const m = p.match(new RegExp("^/u/([a-f0-9]{28})(/.*)?$"));
-  return m ? { token: m[1], rest: m[2] || '/' } : null;
+  const m = p.match(/^\/u\/([a-f0-9]{28})\/(songs|videos)(\/.*)?$/);
+  if (m) return { token: m[1], mode: m[2], rest: m[3] || '/' };
+  const m2 = p.match(/^\/u\/([a-f0-9]{28})(\/.*)?$/);
+  return m2 ? { token: m2[1], mode: 'both', rest: m2[2] || '/' } : null;
 }
 function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || ''; }
 
-function buildManifest() {
+// mode: 'both' | 'songs' | 'videos'
+function buildManifest(mode) {
+  const m = mode || 'both';
+  const variants = {
+    both:   { id: 'com.ricky.youtube-music',        name: 'YouTube Music',                description: 'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.' },
+    songs:  { id: 'com.ricky.youtube-music-songs',  name: 'YouTube Music — Songs',        description: 'Stream from YouTube Music — Songs tab only. Albums, Artists & Playlists included. HLS playback with AAC fallback.' },
+    videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos',       description: 'Stream from YouTube Music — Videos tab only. HLS playback with AAC fallback. Offline download support.' },
+  };
+  const v = variants[m] || variants.both;
   return {
-    id:          'com.ricky.youtube-music',
-    name:        'YouTube Music',
-    version:     '1.4.9',
-    description: 'Stream from YouTube Music — Songs, Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.',
+    id:          v.id,
+    name:        v.name,
+    version:     '1.5.0',
+    description: v.description,
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog', 'download'],
     types:       ['track', 'album', 'artist', 'playlist'],
@@ -500,10 +510,10 @@ function buildManifest() {
   };
 }
 
-async function handleRoute(rest, url, env, userToken) {
+async function handleRoute(rest, url, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
-  if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest());
-  if (rest === '/search')            return jsonRes(await handleSearch(q, env, userToken));
+  if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
+  if (rest === '/search')            return jsonRes(await handleSearch(q, env, userToken, mode));
   if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return await handleDownload(id, env, userToken); }
   if (rest.startsWith('/stream/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id, env, userToken)); }
   if (rest.startsWith('/album/'))    { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id, env, userToken)); }
@@ -579,7 +589,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </svg>
   <h1>YouTube Music for Eclipse</h1>
   <p class="sub">Full YouTube Music catalog &mdash; Songs, Videos, Albums, Artists &amp; Playlists. No account required.</p>
-  <div class="tip"><b>Save your URL.</b> Paste it below any time to copy it again without reinstalling.</div>
+  <div class="tip"><b>Save your URLs.</b> Paste one below any time to copy it again without reinstalling.</div>
   <div class="pills">
     <span class="pill">Songs &middot; Videos</span>
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
@@ -589,11 +599,21 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
   </div>
-  <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>
+  <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URLs</button>
   <div class="box" id="genBox">
-    <div class="blbl">Your addon URL &mdash; paste into Eclipse</div>
+    <div class="blbl">Songs &amp; Videos (both) &mdash; paste into Eclipse</div>
     <div class="burl" id="genUrl"></div>
-    <button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button>
+    <button class="bd" id="copyGenBtn" onclick="copyGen()">Copy Both URL</button>
+  </div>
+  <div class="box" id="genBoxSongs">
+    <div class="blbl">Songs tab only &mdash; paste into Eclipse</div>
+    <div class="burl" id="genUrlSongs"></div>
+    <button class="bd" id="copyGenBtnSongs" onclick="copyGenSongs()">Copy Songs URL</button>
+  </div>
+  <div class="box" id="genBoxVideos">
+    <div class="blbl">Videos tab only &mdash; paste into Eclipse</div>
+    <div class="burl" id="genUrlVideos"></div>
+    <button class="bd" id="copyGenBtnVideos" onclick="copyGenVideos()">Copy Videos URL</button>
   </div>
   <hr>
   <h2>Refresh existing URL</h2>
@@ -607,27 +627,34 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <hr>
   <div class="steps">
-    <div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>
+    <div class="step"><div class="sn">1</div><div class="st">Generate and copy any URL above</div></div>
     <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
-    <div class="step"><div class="sn">4</div><div class="st">Search returns Songs, Videos, Albums, Artists &amp; Playlists with full browse and offline download support</div></div>
+    <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream: HLS primary &rarr; AAC fallback. Download: 302 redirect to direct YouTube CDN audio URL for reliable offline saves. visitorData cached 20 min via Upstash Redis (per-user token).</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Modes: <code>/u/{token}/</code> both &bull; <code>/u/{token}/songs/</code> songs only &bull; <code>/u/{token}/videos/</code> videos only<br>Stream: HLS primary &rarr; AAC fallback. Download: 302 redirect to direct YouTube CDN audio URL. visitorData cached 20 min via Upstash Redis (per-user token).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.4.7 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.5.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
-var gu=null,ru=null;
+var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
   var btn=document.getElementById('genBtn');btn.disabled=true;btn.textContent='Generating...';
   fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
     .then(function(r){return r.json()}).then(function(d){
-      if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Generate My Addon URL';return;}
-      gu=d.manifestUrl;document.getElementById('genUrl').textContent=gu;
+      if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Generate My Addon URLs';return;}
+      gu=d.manifestUrl;guSongs=d.manifestUrlSongs;guVideos=d.manifestUrlVideos;
+      document.getElementById('genUrl').textContent=gu;
+      document.getElementById('genUrlSongs').textContent=guSongs;
+      document.getElementById('genUrlVideos').textContent=guVideos;
       document.getElementById('genBox').style.display='block';
-      btn.disabled=false;btn.textContent='Generate New URL';
-    }).catch(function(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate My Addon URL'});
+      document.getElementById('genBoxSongs').style.display='block';
+      document.getElementById('genBoxVideos').style.display='block';
+      btn.disabled=false;btn.textContent='Generate New URLs';
+    }).catch(function(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate My Addon URLs'});
 }
 function copyGen(){if(gu)copyText(gu,document.getElementById('copyGenBtn'));}
+function copyGenSongs(){if(guSongs)copyText(guSongs,document.getElementById('copyGenBtnSongs'));}
+function copyGenVideos(){if(guVideos)copyText(guVideos,document.getElementById('copyGenBtnVideos'));}
 function doRefresh(){
   var eu=document.getElementById('existingUrl').value.trim();
   if(!eu){alert('Paste your existing addon URL first.');return;}
@@ -659,7 +686,12 @@ export default {
       if (pathname === '/')                                                  return htmlRes(buildPage());
       if (pathname === '/generate' && request.method === 'POST') {
         const token = generateToken();
-        return jsonRes({ token, manifestUrl: `${url.origin}/u/${token}/manifest.json` });
+        return jsonRes({
+          token,
+          manifestUrl:       `${url.origin}/u/${token}/manifest.json`,
+          manifestUrlSongs:  `${url.origin}/u/${token}/songs/manifest.json`,
+          manifestUrlVideos: `${url.origin}/u/${token}/videos/manifest.json`,
+        });
       }
       if (pathname === '/refresh'  && request.method === 'POST') {
         let body; try { body = await request.json(); } catch {}
@@ -667,15 +699,15 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.4.7', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.0', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
         if (!isValidToken(tp.token)) return jsonRes({ error: 'Invalid token.' }, 400);
-        const r = await handleRoute(tp.rest, url, env, tp.token);
+        const r = await handleRoute(tp.rest, url, env, tp.token, tp.mode);
         return r || jsonRes({ error: 'Not found', path: tp.rest }, 404);
       }
-      const base = await handleRoute(pathname, url, env, null);
+      const base = await handleRoute(pathname, url, env, null, 'both');
       return base || jsonRes({ error: 'Not found' }, 404);
     } catch (err) {
       console.error(LOG_PREFIX, err);
