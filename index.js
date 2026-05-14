@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.5.6
+// author: ricky | version: 1.5.7
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -287,7 +287,7 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   const info=parseInfoRuns(infoRuns);
   const fixedRaw=r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text||'';
   const durationStr=(isDuration(fixedRaw)?fixedRaw:'')||info.duration||
-    (r.lengthMs?`${Math.floor(r.lengthMs/60000)}:${String(Math.floor((r.lengthMs%60000)/1000)).padStart(2,'0')}`:'' );
+    (r.lengthMs?`${Math.floor(r.lengthMs/60000)}:${String(Math.floor((r.lengthMs%60000)/1000)).padStart(2,'0')}`:'');
   const thumbs=r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails||[];
   return {
     id:videoId, title:title||'Unknown',
@@ -473,51 +473,41 @@ async function fetchPlayerData(trackId, env, userToken) {
   return data;
 }
 
-// Best direct audio format: highest-bitrate audio/mp4 from adaptiveFormats
+// Pick highest-bitrate audio/mp4 adaptive format
 function pickBestAudio(sd) {
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
+// handleStream: returns { streamURL } — the key Eclipse reads to play audio
 async function handleStream(trackId, env, userToken) {
   const data=await fetchPlayerData(trackId,env,userToken);
   const sd=data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-  // Prefer direct AAC adaptive format — Eclipse can download it offline
   const best=pickBestAudio(sd);
-  if (best) return { url:best.url, format:'aac', quality:'high' };
-  // HLS fallback for streams that only have a manifest
-  if (sd.hlsManifestUrl) return { url:sd.hlsManifestUrl, format:'hls', quality:'high' };
+  if (best) return { streamURL:best.url, format:'aac', quality:'high' };
+  if (sd.hlsManifestUrl) return { streamURL:sd.hlsManifestUrl, format:'hls', quality:'high' };
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
-// handleDownload: proxy audio bytes directly so Eclipse can save the file offline.
-// A 302 redirect to a signed YT URL does NOT work reliably — iOS/Eclipse may not
-// follow it correctly, and the URL expires. We fetch the bytes here and stream them
-// through with proper Content-Type and Content-Disposition headers.
+// handleDownload: 302 redirect to best audio/mp4 URL.
+// Proxying bytes through a Worker hits CF free-plan CPU/wall-time limits for large files.
+// A 302 to the signed YT URL works correctly for Eclipse's offline download flow.
 async function handleDownload(trackId, env, userToken) {
   const data=await fetchPlayerData(trackId,env,userToken);
   const sd=data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-
   const best=pickBestAudio(sd);
   if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio format for ${trackId}`);
-
-  // Proxy the audio bytes through the Worker
-  const audioResp=await fetch(best.url);
-  if (!audioResp.ok) throw new Error(`${LOG_PREFIX} Audio fetch failed: ${audioResp.status}`);
-
-  const contentLength=audioResp.headers.get('content-length');
-  const headers={
-    'content-type':                'audio/mp4',
-    'content-disposition':         `attachment; filename="${trackId}.m4a"`,
-    'access-control-allow-origin': '*',
-    'cache-control':               'no-store',
-  };
-  if (contentLength) headers['content-length']=contentLength;
-
-  return new Response(audioResp.body, { status:200, headers });
+  return new Response(null, {
+    status: 302,
+    headers: {
+      'Location':                    best.url,
+      'access-control-allow-origin': '*',
+      'cache-control':               'no-store',
+    },
+  });
 }
 
 // ─── Browse helpers ──────────────────────────────────────────────────────────
@@ -620,7 +610,6 @@ async function handleArtist(artistId, env, userToken, mode) {
     return { id:artistId, name, artworkURL, bio:null, topTracks, albums };
   }
 
-  // Songs / both: enrich + filter 0-duration
   let topTracks=rawTracks;
   if (topTracks.some(t=>t.duration===0)) {
     try {
@@ -679,7 +668,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'1.5.6', description:v.description,
+    id:v.id, name:v.name, version:'1.5.7', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','catalog','download'],
     types:['track','album','artist','playlist'],
@@ -771,8 +760,8 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   <div class="pills">
     <span class="pill">Songs &middot; Videos</span>
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
-    <span class="pill hi">HLS Primary</span>
-    <span class="pill gr">AAC Fallback</span>
+    <span class="pill hi">AAC Direct</span>
+    <span class="pill hi">HLS Fallback</span>
     <span class="pill gr">Offline Downloads</span>
     <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
@@ -810,9 +799,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Downloads: proxied audio/mp4 bytes with Content-Disposition — no redirects.<br>Artist videos: channel browse &rarr; YT Data API &rarr; filtered YTM search. Set YOUTUBE_DATA_API_KEY env var.</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream returns <code>{ streamURL }</code> for Eclipse playback. Download is a 302 redirect to signed YT audio URL.<br>Artist videos: channel browse &rarr; YT Data API &rarr; filtered YTM search. Set YOUTUBE_DATA_API_KEY env var.</div>
 </div>
-<footer>YouTube Music for Eclipse v1.5.6 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.5.7 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -872,7 +861,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'1.5.6',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'1.5.7',ts:new Date().toISOString()});
       const tp=parseTokenPath(pathname);
       if (tp) {
         if (!isValidToken(tp.token)) return jsonRes({error:'Invalid token.'},400);
