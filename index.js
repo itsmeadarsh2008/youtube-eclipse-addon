@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.5.2
+// author: ricky | version: 1.5.3
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -131,6 +131,24 @@ async function ytmSearch(query, params, env, userToken) {
   return ytmPost(`/youtubei/v1/search?key=${YTM_API_KEY}`, body, env, userToken);
 }
 
+// Search YouTube Data API v3 for channels matching query — fallback for YT-only artists
+// Returns array of { id: 'UC...', name, artworkURL }
+async function ytDataChannelSearch(query, env) {
+  const apiKey = env?.YOUTUBE_DATA_API_KEY;
+  if (!apiKey) return [];
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=5&q=${encodeURIComponent(query)}&key=${apiKey}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return (data.items || []).map(item => ({
+      id:         item.snippet?.channelId || item.id?.channelId || '',
+      name:       item.snippet?.title || '',
+      artworkURL: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '',
+    })).filter(a => a.id && a.name);
+  } catch (e) { console.log(LOG_PREFIX, 'ytDataChannelSearch failed:', e.message); return []; }
+}
+
 function getVideoId(r) {
   if (!r) return null;
   return (
@@ -174,26 +192,21 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   };
 }
 
-// Only accept items whose browseId looks like a real album/EP (MPRE...)
-// Reject anything that has a watchEndpoint (those are tracks, not albums)
+// Only accept real album browseIds (MPRE prefix), reject tracks/watchEndpoints
 function parseAlbumItem(item) {
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
-    // Skip items that are tracks (have a watchEndpoint)
     const hasWatch = !!(
       r2.overlay?.musicItemThumbnailOverlayRenderer?.content
         ?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId ||
       r2.navigationEndpoint?.watchEndpoint
     );
     if (hasWatch) return null;
-
     const id =
       r2.navigationEndpoint?.browseEndpoint?.browseId ||
       r2.overlay?.musicItemThumbnailOverlayRenderer?.content
         ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
-    // Only keep real album browseIds (MPRE prefix)
     if (!id || !id.startsWith('MPRE')) return null;
-
     const title  = r2.title?.runs?.[0]?.text || '';
     const skip   = new Set(['Album','EP','Single','Compilation','Podcast']);
     const artist = (r2.subtitle?.runs || [])
@@ -204,10 +217,7 @@ function parseAlbumItem(item) {
   }
   const r = item?.musicResponsiveListItemRenderer;
   if (r) {
-    // Skip items that have a watchEndpoint (they're tracks)
-    const hasWatch = !!(getVideoId(r));
-    if (hasWatch) return null;
-
+    if (getVideoId(r)) return null; // it's a track
     const id =
       r.navigationEndpoint?.browseEndpoint?.browseId ||
       r.overlay?.musicItemThumbnailOverlayRenderer?.content
@@ -215,7 +225,6 @@ function parseAlbumItem(item) {
       (r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [])
         .map(run => run.navigationEndpoint?.browseEndpoint?.browseId).find(Boolean);
     if (!id || !id.startsWith('MPRE')) return null;
-
     const title = runsText(r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs);
     const info  = parseInfoRuns(r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []);
     return { id, title, artist: info.artist,
@@ -233,8 +242,7 @@ function parseArtistItem(item) {
   return { id, name, artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
 }
 
-// Extract artist cards from an unfiltered broad search response
-// Looks for browseIds starting with UC (YouTube channel = artist page)
+// Extract UC... channel IDs from an unfiltered broad YTM search (niche artist fallback)
 function parseArtistItemBroad(item) {
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
@@ -285,43 +293,23 @@ function getShelves(data) {
   ).map(s => s.musicShelfRenderer).filter(Boolean);
 }
 
-// For videos mode: synthesize fake album cards from video tracks grouped by artist
-function groupVideosIntoFakeAlbums(tracks) {
-  const byArtist = new Map();
-  for (const t of tracks) {
-    const key = t.artist || 'Unknown';
-    if (!byArtist.has(key)) byArtist.set(key, []);
-    byArtist.get(key).push(t);
-  }
-  const albums = [];
-  for (const [artist, vids] of byArtist) {
-    if (vids.length < 1) continue;
-    albums.push({
-      id:         vids[0].id,
-      title:      `${artist} — Videos`,
-      artist,
-      artworkURL: vids[0].artworkURL,
-    });
-    if (albums.length >= 10) break;
-  }
-  return albums;
-}
-
 // mode: 'both' | 'songs' | 'videos'
 async function handleSearch(query, env, userToken, mode) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
   const m = mode || 'both';
 
-  const fetchSongs   = m === 'both' || m === 'songs';
-  const fetchVideos  = m === 'both' || m === 'videos';
+  const fetchSongs  = m === 'both' || m === 'songs';
+  const fetchVideos = m === 'both' || m === 'videos';
+  // Albums: never fetch for videos-only mode
+  const fetchAlbums = m !== 'videos';
 
   const [songsR, videosR, albumsR, artistsR, plR, broadR] = await Promise.allSettled([
     fetchSongs  ? ytmSearch(query, SEARCH_PARAMS.songs,     env, userToken) : Promise.resolve(null),
     fetchVideos ? ytmSearch(query, SEARCH_PARAMS.videos,    env, userToken) : Promise.resolve(null),
-    ytmSearch(query, SEARCH_PARAMS.albums,    env, userToken),
+    fetchAlbums ? ytmSearch(query, SEARCH_PARAMS.albums,    env, userToken) : Promise.resolve(null),
     ytmSearch(query, SEARCH_PARAMS.artists,   env, userToken),
     ytmSearch(query, SEARCH_PARAMS.playlists, env, userToken),
-    // Broad unfiltered search — used as artist fallback for niche/small artists
+    // Broad unfiltered search — artist fallback for niche artists
     ytmSearch(query, null, env, userToken),
   ]);
 
@@ -333,15 +321,13 @@ async function handleSearch(query, env, userToken, mode) {
   if (videosR.status === 'fulfilled' && videosR.value) for (const s of getShelves(videosR.value))
     for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 100) break; }
 
-  if (albumsR.status === 'fulfilled' && albumsR.value) {
+  // Albums — skipped entirely in videos mode
+  if (fetchAlbums && albumsR.status === 'fulfilled' && albumsR.value) {
     for (const s of getShelves(albumsR.value))
       for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); }
   }
-  if (m === 'videos' && albums.length === 0 && tracks.length > 0) {
-    albums.push(...groupVideosIntoFakeAlbums(tracks));
-  }
 
-  // Primary artist search
+  // Primary artist search (YTM filtered artists tab)
   const seenArtistIds = new Set();
   if (artistsR.status === 'fulfilled' && artistsR.value) for (const s of getShelves(artistsR.value))
     for (const it of s.contents || []) {
@@ -349,7 +335,7 @@ async function handleSearch(query, env, userToken, mode) {
       if (a && !seenArtistIds.has(a.id) && artists.length < 12) { seenArtistIds.add(a.id); artists.push(a); }
     }
 
-  // Fallback: scan broad search for artist cards (catches niche artists not in filtered results)
+  // Fallback 1: broad YTM search — picks up UC... channel IDs for niche YTM artists
   if (broadR.status === 'fulfilled' && broadR.value) {
     for (const s of getShelves(broadR.value)) {
       for (const it of s.contents || []) {
@@ -357,19 +343,31 @@ async function handleSearch(query, env, userToken, mode) {
         if (a && !seenArtistIds.has(a.id) && artists.length < 12) { seenArtistIds.add(a.id); artists.push(a); }
       }
     }
-    // Also check top-level cardShelfRenderer / musicCardShelfRenderer which YTM uses for top results
+    // musicCardShelfRenderer — YTM top-result card (often used for exact artist name matches)
     const tabs = broadR.value?.contents?.tabbedSearchResultsRenderer?.tabs?.[0]
       ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
     for (const sec of tabs) {
       const card = sec.musicCardShelfRenderer;
       if (!card) continue;
-      const id = card.onTap?.watchEndpoint?.browseId ||
+      const id =
         card.header?.musicCardShelfHeaderBasicRenderer?.title?.runs?.[0]
           ?.navigationEndpoint?.browseEndpoint?.browseId;
       if (id && id.startsWith('UC') && !seenArtistIds.has(id) && artists.length < 12) {
         const name = card.header?.musicCardShelfHeaderBasicRenderer?.title?.runs?.[0]?.text || '';
         const artworkURL = bestThumbnail(card.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []);
         if (name) { seenArtistIds.add(id); artists.push({ id, name, artworkURL }); }
+      }
+    }
+  }
+
+  // Fallback 2: YouTube Data API channel search — catches YouTube-only artists not on YTM at all
+  // Only fires if we still have no artists after YTM searches
+  if (artists.length === 0) {
+    const ytChannels = await ytDataChannelSearch(query, env);
+    for (const ch of ytChannels) {
+      if (!seenArtistIds.has(ch.id) && artists.length < 12) {
+        seenArtistIds.add(ch.id);
+        artists.push(ch);
       }
     }
   }
@@ -521,7 +519,6 @@ async function handleArtist(artistId, env, userToken, mode) {
       if (t && rawTracks.length < 15) rawTracks.push(t);
     }
     if (carousel) for (const it of carousel.contents || []) {
-      // Only add real album browse items (MPRE prefix), skip tracks
       const a = parseAlbumItem(it);
       if (a && albums.length < 30) albums.push({ ...a, artist: a.artist || name });
     }
@@ -530,7 +527,6 @@ async function handleArtist(artistId, env, userToken, mode) {
   const isVideosMode = mode === 'videos';
 
   if (isVideosMode) {
-    // Videos mode: fetch video search results for this artist and use as topTracks
     const topTracks = [];
     try {
       const vr = await ytmSearch(name, SEARCH_PARAMS.videos, env, userToken);
@@ -546,9 +542,7 @@ async function handleArtist(artistId, env, userToken, mode) {
     return { id: artistId, name, artworkURL, bio: null, topTracks, albums };
   }
 
-  // Songs / both mode:
-  // 1. Filter out any tracks that still have duration=0 after browse (no fixed columns in artist shelf)
-  // 2. Enrich durations from songs search tab
+  // Songs / both: enrich durations, then filter out any still at 0
   let topTracks = rawTracks;
   if (topTracks.some(t => t.duration === 0)) {
     try {
@@ -571,7 +565,6 @@ async function handleArtist(artistId, env, userToken, mode) {
       }
     } catch (e) { console.log(LOG_PREFIX, 'artist duration enrich failed:', e.message); }
   }
-  // Remove any tracks that still have 0 duration after enrichment attempt
   topTracks = topTracks.filter(t => t.duration > 0);
 
   return { id: artistId, name, artworkURL, bio: null, topTracks, albums };
@@ -616,13 +609,13 @@ function buildManifest(mode) {
   const variants = {
     both:   { id: 'com.ricky.youtube-music',        name: 'YouTube Music',          description: 'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.' },
     songs:  { id: 'com.ricky.youtube-music-songs',  name: 'YouTube Music — Songs',  description: 'Stream from YouTube Music — Songs tab only. Albums, Artists & Playlists included. HLS playback with AAC fallback.' },
-    videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos', description: 'Stream from YouTube Music — Videos tab. Artists, Albums & Playlists included. HLS playback with AAC fallback.' },
+    videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos', description: 'Stream from YouTube Music — Videos tab. Artists & Playlists included. HLS playback with AAC fallback.' },
   };
   const v = variants[m] || variants.both;
   return {
     id:          v.id,
     name:        v.name,
-    version:     '1.5.2',
+    version:     '1.5.3',
     description: v.description,
     icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:   ['search', 'stream', 'catalog', 'download'],
@@ -756,9 +749,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Modes: <code>/u/{token}/</code> both &bull; <code>/u/{token}/songs/</code> songs only &bull; <code>/u/{token}/videos/</code> videos only<br>Stream: HLS primary &rarr; AAC fallback. Download: 302 redirect to direct YouTube CDN audio URL. visitorData cached 20 min via Upstash Redis (per-user token).</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Modes: <code>/u/{token}/</code> both &bull; <code>/u/{token}/songs/</code> songs only &bull; <code>/u/{token}/videos/</code> videos only<br>Stream: HLS primary &rarr; AAC fallback. Artist fallback: YouTube Data API channel search (set YOUTUBE_DATA_API_KEY env var).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.5.2 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.5.3 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -823,7 +816,7 @@ export default {
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.2', ts: new Date().toISOString() });
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.3', ts: new Date().toISOString() });
 
       const tp = parseTokenPath(pathname);
       if (tp) {
