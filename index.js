@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.5.8
+// author: ricky | version: 1.5.9
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -494,23 +494,16 @@ async function handleStream(trackId, env, userToken) {
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
-// handleDownload: 302 redirect to best audio/mp4 URL.
-// Proxying bytes through a Worker hits CF free-plan CPU/wall-time limits.
-// Eclipse follows the redirect correctly for offline download.
+// handleDownload: Eclipse docs spec — /download must return { url, format, quality }
+// Returns the highest-bitrate AAC mp4 direct URL for Eclipse to fetch offline.
+// We deliberately skip HLS here — HLS manifests are not suitable for offline download.
 async function handleDownload(trackId, env, userToken) {
   const data=await fetchPlayerData(trackId,env,userToken);
   const sd=data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
   const best=pickBestAudio(sd);
   if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio format for ${trackId}`);
-  return new Response(null, {
-    status: 302,
-    headers: {
-      'Location':                    best.url,
-      'access-control-allow-origin': '*',
-      'cache-control':               'no-store',
-    },
-  });
+  return { url:best.url, format:'aac', quality:'high' };
 }
 
 // ─── Browse helpers ──────────────────────────────────────────────────────────
@@ -672,7 +665,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'1.5.8', description:v.description,
+    id:v.id, name:v.name, version:'1.5.9', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','catalog','download'],
     types:['track','album','artist','playlist'],
@@ -685,7 +678,7 @@ async function handleRoute(rest, url, env, userToken, mode) {
   const q=url.searchParams.get('q')||url.searchParams.get('query')||'';
   if (rest==='/manifest.json'||rest==='/manifest') return jsonRes(buildManifest(mode));
   if (rest==='/search')            return jsonRes(await handleSearch(q,env,userToken,mode));
-  if (rest.startsWith('/download/')){ const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return handleDownload(id,env,userToken); }
+  if (rest.startsWith('/download/')){ const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleDownload(id,env,userToken)); }
   if (rest.startsWith('/stream/'))  { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id,env,userToken)); }
   if (rest.startsWith('/album/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id,env,userToken)); }
   if (rest.startsWith('/artist/'))  { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id,env,userToken,mode)); }
@@ -803,9 +796,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream returns <code>{ url, format, quality }</code> per Eclipse docs spec. HLS preferred, AAC mp4 fallback.<br>Download is a 302 redirect to signed YT audio URL — no byte proxying.</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Stream + Download both return <code>{ url, format, quality }</code> per Eclipse docs spec.<br>Stream: HLS preferred, AAC mp4 fallback. Download: AAC mp4 direct URL (no HLS for offline).</div>
 </div>
-<footer>YouTube Music for Eclipse v1.5.8 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.5.9 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -865,7 +858,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'1.5.8',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'1.5.9',ts:new Date().toISOString()});
       const tp=parseTokenPath(pathname);
       if (tp) {
         if (!isValidToken(tp.token)) return jsonRes({error:'Invalid token.'},400);
