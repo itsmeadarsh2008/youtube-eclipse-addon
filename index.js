@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.6.0
+// author: ricky | version: 1.7.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -476,14 +476,15 @@ async function fetchPlayerData(trackId, env, userToken) {
 }
 
 function pickBestAudio(sd) {
+  // Returns the highest-bitrate direct audio/mp4 (AAC) URL — suitable for file downloads
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id} — Eclipse docs spec: { url, format, quality, expiresAt }
-// expiresAt tells Eclipse when to call /stream again for a fresh URL (offline download support).
-// HLS preferred for live playback; direct AAC mp4 fallback.
+// /stream/{id}
+// Returns HLS manifest for live playback — Eclipse uses AVPlayer natively for this.
+// expiresAt tells Eclipse when to re-call /stream for a fresh URL.
 async function handleStream(trackId, env, userToken) {
   const data=await fetchPlayerData(trackId,env,userToken);
   const sd=data.streamingData;
@@ -491,15 +492,39 @@ async function handleStream(trackId, env, userToken) {
 
   const expiresAt = Math.floor(Date.now() / 1000) + STREAM_EXPIRES_SEC;
 
-  // Strategy 1: HLS manifest — preferred, native iOS AVPlayer
+  // HLS preferred — adaptive quality, native iOS AVPlayer support
   if (sd.hlsManifestUrl) {
     return { url:sd.hlsManifestUrl, format:'hls', quality:'high', expiresAt };
   }
-  // Strategy 2: Direct AAC mp4 fallback
+  // Direct AAC mp4 fallback when HLS unavailable
   const best=pickBestAudio(sd);
   if (best) return { url:best.url, format:'aac', quality:'high', expiresAt };
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
+}
+
+// /download/{id}
+// MUST return a direct audio/mp4 (AAC) URL — never HLS.
+// HLS is a text manifest, not a file. Eclipse downloads the raw bytes from this URL.
+// Eclipse stores the file and plays it offline without calling your server again.
+async function handleDownload(trackId, env, userToken) {
+  const data=await fetchPlayerData(trackId,env,userToken);
+  const sd=data.streamingData;
+  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
+
+  // Always use direct AAC mp4 — never HLS for downloads
+  const best=pickBestAudio(sd);
+  if (best) {
+    return {
+      url:     best.url,
+      format:  'aac',
+      quality: 'high',
+      // mimeType hint so Eclipse saves with the right extension
+      mimeType: 'audio/mp4',
+    };
+  }
+
+  throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
 }
 
 // ─── Browse helpers ──────────────────────────────────────────────────────────
@@ -660,11 +685,12 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'1.6.0', description:v.description,
+    id:v.id, name:v.name, version:'1.7.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-    // "catalog" enables album/artist/playlist detail pages in Eclipse
-    // "download" is NOT a valid Eclipse resource — removed
-    resources:['search','stream','catalog'],
+    // stream  = HLS manifest for live playback
+    // download = direct AAC mp4 for offline file saving (separate endpoint)
+    // catalog  = album/artist/playlist detail pages
+    resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
     contentType:'music',
   };
@@ -673,11 +699,12 @@ function buildManifest(mode) {
 async function handleRoute(rest, url, env, userToken, mode) {
   const q=url.searchParams.get('q')||url.searchParams.get('query')||'';
   if (rest==='/manifest.json'||rest==='/manifest') return jsonRes(buildManifest(mode));
-  if (rest==='/search')            return jsonRes(await handleSearch(q,env,userToken,mode));
-  if (rest.startsWith('/stream/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id,env,userToken)); }
-  if (rest.startsWith('/album/'))  { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id,env,userToken)); }
-  if (rest.startsWith('/artist/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id,env,userToken,mode)); }
-  if (rest.startsWith('/playlist/')){ const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handlePlaylist(id,env,userToken)); }
+  if (rest==='/search')              return jsonRes(await handleSearch(q,env,userToken,mode));
+  if (rest.startsWith('/stream/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id,env,userToken)); }
+  if (rest.startsWith('/download/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleDownload(id,env,userToken)); }
+  if (rest.startsWith('/album/'))    { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id,env,userToken)); }
+  if (rest.startsWith('/artist/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id,env,userToken,mode)); }
+  if (rest.startsWith('/playlist/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handlePlaylist(id,env,userToken)); }
   return null;
 }
 
@@ -752,9 +779,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   <div class="pills">
     <span class="pill">Songs &middot; Videos</span>
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
-    <span class="pill hi">HLS Primary</span>
-    <span class="pill gr">AAC Fallback</span>
-    <span class="pill gr">Offline Downloads</span>
+    <span class="pill hi">HLS Streaming</span>
+    <span class="pill gr">AAC Downloads</span>
+    <span class="pill gr">Offline Playback</span>
     <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
   </div>
@@ -791,9 +818,13 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
-  <div class="warn">resources: search · stream · catalog (Eclipse spec)<br>Stream: <code>{ url, format, quality, expiresAt }</code> — HLS preferred, AAC mp4 fallback.<br>expiresAt tells Eclipse when to refresh for offline downloads. No fake /download endpoint.</div>
+  <div class="warn">
+    /stream &rarr; HLS manifest (live playback via AVPlayer)<br>
+    /download &rarr; direct AAC mp4 (real file saved for offline)<br>
+    resources: search &middot; stream &middot; download &middot; catalog
+  </div>
 </div>
-<footer>YouTube Music for Eclipse v1.6.0 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.7.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -853,7 +884,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'1.6.0',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'1.7.0',ts:new Date().toISOString()});
       const tp=parseTokenPath(pathname);
       if (tp) {
         if (!isValidToken(tp.token)) return jsonRes({error:'Invalid token.'},400);
