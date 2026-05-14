@@ -1,5 +1,5 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.5.4
+// author: ricky | version: 1.5.5
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
@@ -64,9 +64,16 @@ function tryRefreshVisitor(data, env, userToken) {
   if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
 }
 
+// Parse duration from multiple formats: "3:45", "1:23:45", or ISO 8601 "PT3M45S"
 function parseDuration(text) {
   if (!text) return 0;
-  const parts = String(text).trim().split(':').map(Number);
+  const s = String(text).trim();
+  // ISO 8601 from YouTube Data API
+  const iso = s.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+  if (iso) {
+    return (parseInt(iso[1] || 0) * 3600) + (parseInt(iso[2] || 0) * 60) + parseInt(iso[3] || 0);
+  }
+  const parts = s.split(':').map(Number);
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
   return parts[0] || 0;
@@ -94,12 +101,8 @@ function parseInfoRuns(runs) {
     else cur += (run.text || '');
   }
   if (cur.trim()) parts.push(cur.trim());
-
   let duration = '';
-  if (parts.length && isDuration(parts[parts.length - 1])) {
-    duration = parts.pop();
-  }
-
+  if (parts.length && isDuration(parts[parts.length - 1])) duration = parts.pop();
   const typeLabels = new Set(['Song','Video','EP','Single','Podcast','Album','Playlist','Compilation']);
   let idx = 0;
   if (parts.length > 1 && typeLabels.has(parts[0])) idx = 1;
@@ -131,39 +134,115 @@ async function ytmSearch(query, params, env, userToken) {
   return ytmPost(`/youtubei/v1/search?key=${YTM_API_KEY}`, body, env, userToken);
 }
 
-// Browse a YouTube channel's Videos tab directly.
-// YTM uses the same browse endpoint — we browse the UC... channel ID,
-// then navigate into the "Videos" tab via its params token.
+// ─── YouTube Data API helpers ────────────────────────────────────────────────
+
+// Search for channels and return sorted by subscriber count (most subscribers first)
+// so the "right" artist (most popular matching channel) is always first.
+async function ytDataChannelSearch(query, env) {
+  const apiKey = env?.YOUTUBE_DATA_API_KEY;
+  if (!apiKey) return [];
+  try {
+    // Step 1: search for channels
+    const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=5&q=${encodeURIComponent(query)}&key=${apiKey}`;
+    const sr = await fetch(searchUrl);
+    if (!sr.ok) return [];
+    const sd = await sr.json();
+    const items = sd.items || [];
+    if (!items.length) return [];
+
+    const channelIds = items.map(i => i.snippet?.channelId || i.id?.channelId).filter(Boolean);
+
+    // Step 2: fetch channel statistics to get subscriber counts for disambiguation
+    const statsUrl = `https://www.googleapis.com/youtube/v3/channels?part=statistics,snippet&id=${channelIds.join(',')}&key=${apiKey}`;
+    const cr = await fetch(statsUrl);
+    const statsMap = new Map();
+    if (cr.ok) {
+      const cd = await cr.json();
+      for (const ch of cd.items || []) {
+        statsMap.set(ch.id, {
+          subscribers: parseInt(ch.statistics?.subscriberCount || '0'),
+          thumb: ch.snippet?.thumbnails?.high?.url || ch.snippet?.thumbnails?.default?.url || '',
+          title: ch.snippet?.title || '',
+        });
+      }
+    }
+
+    return channelIds
+      .map(id => {
+        const s = statsMap.get(id);
+        const fallback = items.find(i => (i.snippet?.channelId || i.id?.channelId) === id);
+        return {
+          id,
+          name:        s?.title || fallback?.snippet?.title || '',
+          artworkURL:  s?.thumb || fallback?.snippet?.thumbnails?.high?.url || '',
+          subscribers: s?.subscribers || 0,
+        };
+      })
+      .filter(a => a.id && a.name)
+      // Sort by subscriber count descending so best match is first
+      .sort((a, b) => b.subscribers - a.subscribers)
+      .map(({ id, name, artworkURL }) => ({ id, name, artworkURL }));
+  } catch (e) { console.log(LOG_PREFIX, 'ytDataChannelSearch failed:', e.message); return []; }
+}
+
+// Fetch up to 20 public videos from a YouTube channel via Data API v3
+// Used as fallback for YT-only channels that can't be browsed via YTM
+async function ytDataChannelVideos(channelId, artistName, env) {
+  const apiKey = env?.YOUTUBE_DATA_API_KEY;
+  if (!apiKey) return [];
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&type=video&order=date&maxResults=20&key=${apiKey}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const videoIds = (data.items || []).map(i => i.id?.videoId).filter(Boolean);
+    if (!videoIds.length) return [];
+
+    // Fetch video details for duration
+    const detUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${videoIds.join(',')}&key=${apiKey}`;
+    const dr = await fetch(detUrl);
+    if (!dr.ok) return videoIds.map((id, i) => ({
+      id, title: data.items[i]?.snippet?.title || 'Unknown',
+      artist: artistName, album: '', duration: 0,
+      artworkURL: data.items[i]?.snippet?.thumbnails?.high?.url || '', format: 'aac',
+    }));
+
+    const dd = await dr.json();
+    return (dd.items || []).map(v => ({
+      id:         v.id,
+      title:      v.snippet?.title || 'Unknown',
+      artist:     artistName,
+      album:      '',
+      duration:   parseDuration(v.contentDetails?.duration || ''),
+      artworkURL: v.snippet?.thumbnails?.high?.url || v.snippet?.thumbnails?.default?.url || '',
+      format:     'aac',
+    })).filter(t => t.id && t.title);
+  } catch (e) { console.log(LOG_PREFIX, 'ytDataChannelVideos failed:', e.message); return []; }
+}
+
+// ─── Channel browse helpers ──────────────────────────────────────────────────
+
 async function browseChannelVideos(channelId, env, userToken) {
-  // Step 1: browse the channel to get its tab list
   const channelData = await ytmPost(
     `/youtubei/v1/browse?key=${YTM_API_KEY}`,
     { context: { client: WEB_REMIX_CONTEXT }, browseId: channelId },
     env, userToken
   );
-
-  // Find the "Videos" tab params token
   const tabs = channelData?.contents?.twoColumnBrowseResultsRenderer?.tabs ||
                channelData?.contents?.singleColumnBrowseResultsRenderer?.tabs || [];
   let videosParams = null;
   let videosBrowseId = channelId;
   for (const tab of tabs) {
     const tr = tab?.tabRenderer;
-    const title = runsText(tr?.title?.runs) || tr?.title || '';
-    if (typeof title === 'string' && title.toLowerCase() === 'videos') {
-      videosParams = tr?.endpoint?.browseEndpoint?.params;
+    const title = (typeof tr?.title === 'string' ? tr.title : runsText(tr?.title?.runs)).toLowerCase();
+    if (title === 'videos') {
+      videosParams  = tr?.endpoint?.browseEndpoint?.params;
       videosBrowseId = tr?.endpoint?.browseEndpoint?.browseId || channelId;
-      if (tr?.selected) {
-        // Already on videos tab — parse directly
-        return channelData;
-      }
+      if (tr?.selected) return channelData;
       break;
     }
   }
-
-  if (!videosParams) return channelData; // fall back to whatever browse returned
-
-  // Step 2: browse the Videos tab specifically
+  if (!videosParams) return channelData;
   return ytmPost(
     `/youtubei/v1/browse?key=${YTM_API_KEY}`,
     { context: { client: WEB_REMIX_CONTEXT }, browseId: videosBrowseId, params: videosParams },
@@ -171,80 +250,71 @@ async function browseChannelVideos(channelId, env, userToken) {
   );
 }
 
-// Extract video tracks from a channel browse result.
-// Handles gridRenderer, richGridRenderer, and musicShelfRenderer layouts.
+// Parse video tracks from channel browse response.
+// Handles richGridRenderer, gridRenderer, and musicShelfRenderer layouts.
+// Pulls duration from lengthText.simpleText ("3:45") or accessibility strings.
 function extractChannelVideoTracks(data, fallbackArtist) {
   const tracks = [];
   const seenIds = new Set();
 
-  const addFromRenderer = (r) => {
+  const pushVideo = (videoId, title, durText, thumbs) => {
+    if (!videoId || seenIds.has(videoId) || !title) return;
+    // durText may be "3:45", "1:23:45", or an accessibility label like "3 minutes, 45 seconds"
+    let dur = parseDuration(durText);
+    if (!dur) {
+      // Try parsing accessibility label "X minutes, Y seconds"
+      const acc = String(durText || '');
+      const m = acc.match(/(\d+)\s*minute/i);
+      const s = acc.match(/(\d+)\s*second/i);
+      if (m || s) dur = (parseInt(m?.[1] || 0) * 60) + parseInt(s?.[1] || 0);
+    }
+    seenIds.add(videoId);
+    tracks.push({ id: videoId, title, artist: fallbackArtist || '', album: '', duration: dur, artworkURL: bestThumbnail(thumbs) || '', format: 'aac' });
+  };
+
+  const addFromMRLIR = (r) => {
     if (!r) return;
     const t = parseTrackRenderer(r, fallbackArtist, '', '');
     if (t && !seenIds.has(t.id)) { seenIds.add(t.id); tracks.push(t); }
   };
 
-  // richGridRenderer (modern YTM channel layout)
-  const richGrid = data?.contents?.twoColumnBrowseResultsRenderer?.tabs
-    ?.find(t => t?.tabRenderer?.selected)?.tabRenderer?.content?.richGridRenderer
-    || data?.contents?.singleColumnBrowseResultsRenderer?.tabs
-    ?.find(t => t?.tabRenderer?.selected)?.tabRenderer?.content?.richGridRenderer;
-
-  if (richGrid) {
-    for (const item of richGrid.contents || []) {
-      const r = item?.richItemRenderer?.content?.videoRenderer
-        || item?.richItemRenderer?.content?.musicVideoRenderer;
-      if (r) {
-        // videoRenderer uses different shape — extract manually
-        const videoId = r.videoId;
-        if (!videoId || seenIds.has(videoId)) continue;
-        const title = runsText(r.title?.runs);
-        const dur = r.lengthText?.simpleText || '';
-        const thumbs = r.thumbnail?.thumbnails || [];
-        if (title) {
-          seenIds.add(videoId);
-          tracks.push({
-            id: videoId, title,
-            artist: fallbackArtist || '',
-            album: '', duration: parseDuration(dur),
-            artworkURL: bestThumbnail(thumbs) || '',
-            format: 'aac',
-          });
-        }
-      }
-      // also try musicResponsiveListItemRenderer inside richItem
-      const mr = item?.richItemRenderer?.content?.musicResponsiveListItemRenderer;
-      if (mr) addFromRenderer(mr);
-      if (tracks.length >= 30) break;
-    }
-  }
-
-  // gridRenderer fallback
-  const tabs2 = data?.contents?.twoColumnBrowseResultsRenderer?.tabs ||
-                data?.contents?.singleColumnBrowseResultsRenderer?.tabs || [];
-  for (const tab of tabs2) {
+  // richGridRenderer (modern YTM/YT layout)
+  const allTabs = [
+    ...(data?.contents?.twoColumnBrowseResultsRenderer?.tabs || []),
+    ...(data?.contents?.singleColumnBrowseResultsRenderer?.tabs || []),
+  ];
+  for (const tab of allTabs) {
     const content = tab?.tabRenderer?.content;
-    const grid = content?.gridRenderer || content?.sectionListRenderer;
-    if (!grid) continue;
-    const items = grid.items || grid.contents || [];
-    for (const item of items) {
-      const gvr = item?.gridVideoRenderer;
-      if (gvr?.videoId && !seenIds.has(gvr.videoId)) {
-        const title = runsText(gvr.title?.runs);
-        const dur   = gvr.lengthText?.simpleText || '';
-        const thumbs = gvr.thumbnail?.thumbnails || [];
-        if (title) {
-          seenIds.add(gvr.videoId);
-          tracks.push({
-            id: gvr.videoId, title,
-            artist: fallbackArtist || '',
-            album: '', duration: parseDuration(dur),
-            artworkURL: bestThumbnail(thumbs) || '',
-            format: 'aac',
-          });
+    const richGrid = content?.richGridRenderer;
+    if (richGrid) {
+      for (const item of richGrid.contents || []) {
+        const vr = item?.richItemRenderer?.content?.videoRenderer
+          || item?.richItemRenderer?.content?.musicVideoRenderer;
+        if (vr) {
+          const durText = vr.lengthText?.simpleText
+            || vr.lengthText?.accessibility?.accessibilityData?.label
+            || vr.thumbnailOverlays?.find(o => o.thumbnailOverlayTimeStatusRenderer)
+              ?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText
+            || '';
+          pushVideo(vr.videoId, runsText(vr.title?.runs) || vr.title?.simpleText, durText, vr.thumbnail?.thumbnails || []);
         }
+        const mr = item?.richItemRenderer?.content?.musicResponsiveListItemRenderer;
+        if (mr) addFromMRLIR(mr);
+        if (tracks.length >= 30) break;
+      }
+    }
+    // gridRenderer / sectionListRenderer fallback
+    const grid = content?.gridRenderer;
+    const secList = content?.sectionListRenderer;
+    for (const item of (grid?.items || secList?.contents || [])) {
+      const gvr = item?.gridVideoRenderer;
+      if (gvr) {
+        const durText = gvr.lengthText?.simpleText
+          || gvr.lengthText?.accessibility?.accessibilityData?.label || '';
+        pushVideo(gvr.videoId, runsText(gvr.title?.runs) || gvr.title?.simpleText, durText, gvr.thumbnail?.thumbnails || []);
       }
       const mr = item?.musicResponsiveListItemRenderer;
-      if (mr) addFromRenderer(mr);
+      if (mr) addFromMRLIR(mr);
       if (tracks.length >= 30) break;
     }
   }
@@ -253,10 +323,8 @@ function extractChannelVideoTracks(data, fallbackArtist) {
   const sections = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
     ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
   for (const sec of sections) {
-    const shelf = sec.musicShelfRenderer;
-    if (!shelf) continue;
-    for (const it of shelf.contents || []) {
-      addFromRenderer(it.musicResponsiveListItemRenderer);
+    for (const it of sec.musicShelfRenderer?.contents || []) {
+      addFromMRLIR(it.musicResponsiveListItemRenderer);
       if (tracks.length >= 30) break;
     }
   }
@@ -264,22 +332,7 @@ function extractChannelVideoTracks(data, fallbackArtist) {
   return tracks;
 }
 
-// Search YouTube Data API v3 for channels — fallback for YT-only artists
-async function ytDataChannelSearch(query, env) {
-  const apiKey = env?.YOUTUBE_DATA_API_KEY;
-  if (!apiKey) return [];
-  try {
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=5&q=${encodeURIComponent(query)}&key=${apiKey}`;
-    const resp = await fetch(url);
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return (data.items || []).map(item => ({
-      id:         item.snippet?.channelId || item.id?.channelId || '',
-      name:       item.snippet?.title || '',
-      artworkURL: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '',
-    })).filter(a => a.id && a.name);
-  } catch (e) { console.log(LOG_PREFIX, 'ytDataChannelSearch failed:', e.message); return []; }
-}
+// ─── Core parsers ────────────────────────────────────────────────────────────
 
 function getVideoId(r) {
   if (!r) return null;
@@ -298,33 +351,25 @@ function parseTrackRenderer(r, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   if (!r) return null;
   const videoId = getVideoId(r);
   if (!videoId) return null;
-
   const title = runsText(r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs);
   const infoRuns = r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
   const info = parseInfoRuns(infoRuns);
-
-  const fixedRaw = r.fixedColumns?.[0]
-    ?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
+  const fixedRaw = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
   const durationStr =
     (isDuration(fixedRaw) ? fixedRaw : '') ||
     info.duration ||
-    (r.lengthMs
-      ? `${Math.floor(r.lengthMs / 60000)}:${String(Math.floor((r.lengthMs % 60000) / 1000)).padStart(2, '0')}`
-      : '');
-
+    (r.lengthMs ? `${Math.floor(r.lengthMs/60000)}:${String(Math.floor((r.lengthMs%60000)/1000)).padStart(2,'0')}` : '');
   const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
   return {
-    id:         videoId,
-    title:      title || 'Unknown',
-    artist:     info.artist     || fallbackArtist || '',
-    album:      info.album      || fallbackAlbum  || '',
+    id: videoId, title: title || 'Unknown',
+    artist: info.artist || fallbackArtist || '',
+    album:  info.album  || fallbackAlbum  || '',
     duration:   parseDuration(durationStr),
     artworkURL: bestThumbnail(thumbs) || fallbackArtwork || '',
-    format:     'aac',
+    format: 'aac',
   };
 }
 
-// Only accept real album browseIds (MPRE prefix), reject tracks/watchEndpoints
 function parseAlbumItem(item) {
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
@@ -334,24 +379,21 @@ function parseAlbumItem(item) {
       r2.navigationEndpoint?.watchEndpoint
     );
     if (hasWatch) return null;
-    const id =
-      r2.navigationEndpoint?.browseEndpoint?.browseId ||
+    const id = r2.navigationEndpoint?.browseEndpoint?.browseId ||
       r2.overlay?.musicItemThumbnailOverlayRenderer?.content
         ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
     if (!id || !id.startsWith('MPRE')) return null;
-    const title  = r2.title?.runs?.[0]?.text || '';
-    const skip   = new Set(['Album','EP','Single','Compilation','Podcast']);
+    const title = r2.title?.runs?.[0]?.text || '';
+    const skip  = new Set(['Album','EP','Single','Compilation','Podcast']);
     const artist = (r2.subtitle?.runs || [])
       .filter(r => !isBullet(r.text) && !/^\d{4}$/.test(r.text.trim()) && !skip.has(r.text.trim()))
       .map(r => r.text.trim()).filter(Boolean).join(' ').trim();
-    return { id, title, artist,
-      artworkURL: bestThumbnail(r2.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
+    return { id, title, artist, artworkURL: bestThumbnail(r2.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
   }
   const r = item?.musicResponsiveListItemRenderer;
   if (r) {
     if (getVideoId(r)) return null;
-    const id =
-      r.navigationEndpoint?.browseEndpoint?.browseId ||
+    const id = r.navigationEndpoint?.browseEndpoint?.browseId ||
       r.overlay?.musicItemThumbnailOverlayRenderer?.content
         ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId ||
       (r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [])
@@ -359,8 +401,7 @@ function parseAlbumItem(item) {
     if (!id || !id.startsWith('MPRE')) return null;
     const title = runsText(r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs);
     const info  = parseInfoRuns(r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []);
-    return { id, title, artist: info.artist,
-      artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
+    return { id, title, artist: info.artist, artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
   }
   return null;
 }
@@ -368,7 +409,7 @@ function parseAlbumItem(item) {
 function parseArtistItem(item) {
   const r = item?.musicResponsiveListItemRenderer;
   if (!r) return null;
-  const id = r.navigationEndpoint?.browseEndpoint?.browseId;
+  const id   = r.navigationEndpoint?.browseEndpoint?.browseId;
   const name = runsText(r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs);
   if (!id || !name) return null;
   return { id, name, artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
@@ -395,24 +436,20 @@ function parseArtistItemBroad(item) {
 function parsePlaylistItem(item) {
   const r2 = item?.musicTwoRowItemRenderer;
   if (r2) {
-    const id =
-      r2.navigationEndpoint?.browseEndpoint?.browseId ||
+    const id = r2.navigationEndpoint?.browseEndpoint?.browseId ||
       r2.overlay?.musicItemThumbnailOverlayRenderer?.content
         ?.musicPlayButtonRenderer?.playNavigationEndpoint?.browseEndpoint?.browseId;
     if (!id) return null;
     const title   = r2.title?.runs?.[0]?.text || '';
     const creator = (r2.subtitle?.runs || []).filter(r => !isBullet(r.text))
       .map(r => r.text.trim()).filter(Boolean)[0] || '';
-    return { id, title, creator,
-      artworkURL: bestThumbnail(r2.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
+    return { id, title, creator, artworkURL: bestThumbnail(r2.thumbnailRenderer?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
   }
   const r = item?.musicResponsiveListItemRenderer;
   if (r) {
     const id = r.navigationEndpoint?.browseEndpoint?.browseId;
     if (!id) return null;
-    return { id,
-      title: runsText(r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs),
-      artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
+    return { id, title: runsText(r.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs), artworkURL: bestThumbnail(r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []) };
   }
   return null;
 }
@@ -424,11 +461,11 @@ function getShelves(data) {
   ).map(s => s.musicShelfRenderer).filter(Boolean);
 }
 
-// mode: 'both' | 'songs' | 'videos'
+// ─── Search ──────────────────────────────────────────────────────────────────
+
 async function handleSearch(query, env, userToken, mode) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
   const m = mode || 'both';
-
   const fetchSongs  = m === 'both' || m === 'songs';
   const fetchVideos = m === 'both' || m === 'videos';
   const fetchAlbums = m !== 'videos';
@@ -450,10 +487,9 @@ async function handleSearch(query, env, userToken, mode) {
   if (videosR.status === 'fulfilled' && videosR.value) for (const s of getShelves(videosR.value))
     for (const it of s.contents || []) { addTrack(parseTrackRenderer(it.musicResponsiveListItemRenderer)); if (tracks.length >= 100) break; }
 
-  if (fetchAlbums && albumsR.status === 'fulfilled' && albumsR.value) {
+  if (fetchAlbums && albumsR.status === 'fulfilled' && albumsR.value)
     for (const s of getShelves(albumsR.value))
       for (const it of s.contents || []) { const a = parseAlbumItem(it); if (a && albums.length < 15) albums.push(a); }
-  }
 
   const seenArtistIds = new Set();
   if (artistsR.status === 'fulfilled' && artistsR.value) for (const s of getShelves(artistsR.value))
@@ -474,9 +510,8 @@ async function handleSearch(query, env, userToken, mode) {
     for (const sec of tabs) {
       const card = sec.musicCardShelfRenderer;
       if (!card) continue;
-      const id =
-        card.header?.musicCardShelfHeaderBasicRenderer?.title?.runs?.[0]
-          ?.navigationEndpoint?.browseEndpoint?.browseId;
+      const id = card.header?.musicCardShelfHeaderBasicRenderer?.title?.runs?.[0]
+        ?.navigationEndpoint?.browseEndpoint?.browseId;
       if (id && id.startsWith('UC') && !seenArtistIds.has(id) && artists.length < 12) {
         const name = card.header?.musicCardShelfHeaderBasicRenderer?.title?.runs?.[0]?.text || '';
         const artworkURL = bestThumbnail(card.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || []);
@@ -485,6 +520,8 @@ async function handleSearch(query, env, userToken, mode) {
     }
   }
 
+  // Fallback: YouTube Data API channel search, sorted by subscriber count so the
+  // most popular (most likely correct) channel comes first
   if (artists.length === 0) {
     const ytChannels = await ytDataChannelSearch(query, env);
     for (const ch of ytChannels) {
@@ -500,6 +537,8 @@ async function handleSearch(query, env, userToken, mode) {
 
   return { tracks, albums, artists, playlists };
 }
+
+// ─── Player / stream / download ──────────────────────────────────────────────
 
 async function fetchPlayerData(trackId, env, userToken) {
   const visitorData = await getVisitorData(env, userToken);
@@ -528,19 +567,11 @@ async function handleStream(trackId, env, userToken) {
   const data = await fetchPlayerData(trackId, env, userToken);
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-
-  if (sd.hlsManifestUrl) {
-    return { url: sd.hlsManifestUrl, format: 'hls', quality: 'high' };
-  }
-
+  if (sd.hlsManifestUrl) return { url: sd.hlsManifestUrl, format: 'hls', quality: 'high' };
   const fmts = (sd.adaptiveFormats || [])
     .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-  if (fmts.length) {
-    return { url: fmts[0].url, format: 'aac', quality: 'high' };
-  }
-
+  if (fmts.length) return { url: fmts[0].url, format: 'aac', quality: 'high' };
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
 }
 
@@ -548,29 +579,23 @@ async function handleDownload(trackId, env, userToken) {
   const data = await fetchPlayerData(trackId, env, userToken);
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-
   const fmts = (sd.adaptiveFormats || [])
     .filter(f => f.mimeType?.startsWith('audio/mp4') && f.url)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
   if (!fmts.length) throw new Error(`${LOG_PREFIX} No downloadable audio format for ${trackId}`);
-
   return new Response(null, {
     status: 302,
-    headers: {
-      'Location': fmts[0].url,
-      'access-control-allow-origin': '*',
-      'cache-control': 'no-store',
-    },
+    headers: { 'Location': fmts[0].url, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
   });
 }
+
+// ─── Browse helpers ──────────────────────────────────────────────────────────
 
 function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArtwork) {
   const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
   if (!twoCol) return [];
-  const sections = twoCol?.secondaryContents?.sectionListRenderer?.contents || [];
   const tracks = [];
-  for (const s of sections) {
+  for (const s of twoCol?.secondaryContents?.sectionListRenderer?.contents || []) {
     const shelf = s.musicShelfRenderer || s.musicPlaylistShelfRenderer;
     if (!shelf) continue;
     for (const item of shelf.contents || []) {
@@ -583,20 +608,18 @@ function extractSecondaryTracks(data, fallbackArtist, fallbackAlbum, fallbackArt
 
 function extractResponsiveHeader(data) {
   const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
-  const tabSection = twoCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0];
-  const rhr = tabSection?.musicResponsiveHeaderRenderer;
+  const rhr = twoCol?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.musicResponsiveHeaderRenderer;
   if (rhr) return rhr;
-  return data?.header?.musicImmersiveHeaderRenderer
-    || data?.header?.musicDetailHeaderRenderer
-    || null;
+  return data?.header?.musicImmersiveHeaderRenderer || data?.header?.musicDetailHeaderRenderer || null;
 }
+
+// ─── Route handlers ──────────────────────────────────────────────────────────
 
 async function handleAlbum(albumId, env, userToken) {
   const data = await ytmBrowse(albumId, env, userToken);
   const hdr  = extractResponsiveHeader(data) || {};
-
   const albumTitle = runsText(hdr.title?.runs);
-  let albumArtist  = '';
+  let albumArtist = '';
   for (const run of hdr.subtitle?.runs || []) {
     if (run.navigationEndpoint?.browseEndpoint) { albumArtist = run.text; break; }
   }
@@ -608,15 +631,12 @@ async function handleAlbum(albumId, env, userToken) {
       if (t && !isBullet(t) && !skip.has(t) && !/^\d{4}$/.test(t)) { albumArtist = t; break; }
     }
   }
-
   const artworkURL = bestThumbnail(
     hdr.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
     hdr.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
-
   const tracks = extractSecondaryTracks(data, albumArtist, albumTitle, artworkURL);
   tracks.forEach((t, i) => { t.album = albumTitle; t.trackNumber = i + 1; if (!t.artworkURL) t.artworkURL = artworkURL; });
-
   return { id: albumId, title: albumTitle, artist: albumArtist, artworkURL, trackCount: tracks.length, tracks };
 }
 
@@ -632,7 +652,6 @@ async function handleArtist(artistId, env, userToken, mode) {
 
   const sections = data?.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]
     ?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-
   const rawTracks = [], albums = [];
   for (const section of sections) {
     const shelf    = section.musicShelfRenderer;
@@ -647,21 +666,24 @@ async function handleArtist(artistId, env, userToken, mode) {
     }
   }
 
-  const isVideosMode = mode === 'videos';
-
-  if (isVideosMode) {
-    // Browse the artist's actual channel Videos tab — not a generic name search.
-    // artistId is a UC... channel ID, so we can browse it directly.
+  if (mode === 'videos') {
     let topTracks = [];
+
+    // Primary: browse the artist's actual UC channel Videos tab
     try {
       const channelData = await browseChannelVideos(artistId, env, userToken);
       topTracks = extractChannelVideoTracks(channelData, name);
-    } catch (e) {
-      console.log(LOG_PREFIX, 'channel video browse failed:', e.message);
+    } catch (e) { console.log(LOG_PREFIX, 'channel browse failed:', e.message); }
+
+    // Fallback 1: if channel browse returned nothing, try YT Data API videos list
+    // (covers YT-only artists whose channel doesn't serve YTM browse)
+    if (topTracks.length === 0 && env?.YOUTUBE_DATA_API_KEY) {
+      try {
+        topTracks = await ytDataChannelVideos(artistId, name, env);
+      } catch (e) { console.log(LOG_PREFIX, 'ytData videos fallback failed:', e.message); }
     }
 
-    // Fallback: if channel browse gave nothing, try YTM videos search filtered to this artist name
-    // but then filter results to only keep tracks where artist field matches
+    // Fallback 2: YTM videos search filtered strictly to this artist
     if (topTracks.length === 0) {
       try {
         const vr = await ytmSearch(name, SEARCH_PARAMS.videos, env, userToken);
@@ -671,22 +693,20 @@ async function handleArtist(artistId, env, userToken, mode) {
           for (const it of shelf.contents || []) {
             const t = parseTrackRenderer(it.musicResponsiveListItemRenderer, name, '', '');
             if (t && !seenIds.has(t.id)) {
-              // Only include if the track's artist field actually matches this artist
               if (!t.artist || t.artist.toLowerCase().includes(nameLower) || nameLower.includes(t.artist.toLowerCase())) {
-                seenIds.add(t.id);
-                topTracks.push(t);
+                seenIds.add(t.id); topTracks.push(t);
               }
             }
             if (topTracks.length >= 20) break;
           }
         }
-      } catch (e) { console.log(LOG_PREFIX, 'artist video search fallback failed:', e.message); }
+      } catch (e) { console.log(LOG_PREFIX, 'video search fallback failed:', e.message); }
     }
 
     return { id: artistId, name, artworkURL, bio: null, topTracks, albums };
   }
 
-  // Songs / both: enrich durations, then filter out any still at 0
+  // Songs / both: enrich + filter 0-duration tracks
   let topTracks = rawTracks;
   if (topTracks.some(t => t.duration === 0)) {
     try {
@@ -696,18 +716,16 @@ async function handleArtist(artistId, env, userToken, mode) {
         for (const it of shelf.contents || []) {
           const r = it.musicResponsiveListItemRenderer;
           if (!r) continue;
-          const vid  = getVideoId(r);
+          const vid = getVideoId(r);
           if (!vid) continue;
-          const info = parseInfoRuns(r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []);
+          const info   = parseInfoRuns(r.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || []);
           const fixRaw = r.fixedColumns?.[0]?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text || '';
-          const dur  = (isDuration(fixRaw) ? fixRaw : '') || info.duration;
+          const dur    = (isDuration(fixRaw) ? fixRaw : '') || info.duration;
           if (vid && dur) dMap.set(vid, parseDuration(dur));
         }
       }
-      for (const t of topTracks) {
-        if (t.duration === 0 && dMap.has(t.id)) t.duration = dMap.get(t.id);
-      }
-    } catch (e) { console.log(LOG_PREFIX, 'artist duration enrich failed:', e.message); }
+      for (const t of topTracks) if (t.duration === 0 && dMap.has(t.id)) t.duration = dMap.get(t.id);
+    } catch (e) { console.log(LOG_PREFIX, 'duration enrich failed:', e.message); }
   }
   topTracks = topTracks.filter(t => t.duration > 0);
 
@@ -717,7 +735,6 @@ async function handleArtist(artistId, env, userToken, mode) {
 async function handlePlaylist(playlistId, env, userToken) {
   const browseId = playlistId.startsWith('VL') ? playlistId : 'VL' + playlistId;
   const data = await ytmBrowse(browseId, env, userToken);
-
   const hdr = extractResponsiveHeader(data) || {};
   const title    = runsText(hdr.title?.runs) || 'Playlist';
   const creator  = (hdr.subtitle?.runs || [])
@@ -727,11 +744,10 @@ async function handlePlaylist(playlistId, env, userToken) {
     hdr.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
     hdr.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails || []
   );
-
-  const tracks = extractSecondaryTracks(data);
-
-  return { id: playlistId, title, creator, artworkURL, trackCount: tracks.length, tracks };
+  return { id: playlistId, title, creator, artworkURL, trackCount: (extractSecondaryTracks(data)).length, tracks: extractSecondaryTracks(data) };
 }
+
+// ─── Token / routing ─────────────────────────────────────────────────────────
 
 function generateToken() {
   const arr = new Uint8Array(14);
@@ -739,7 +755,6 @@ function generateToken() {
   return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
 }
 function isValidToken(t) { return typeof t === 'string' && /^[a-f0-9]{28}$/.test(t); }
-
 function parseTokenPath(p) {
   const m = p.match(/^\/u\/([a-f0-9]{28})\/(songs|videos)(\/.*)?$/);
   if (m) return { token: m[1], mode: m[2], rest: m[3] || '/' };
@@ -751,23 +766,18 @@ function lastSegment(rest) { return rest.split('/').filter(Boolean).pop() || '';
 function buildManifest(mode) {
   const m = mode || 'both';
   const variants = {
-    both:   { id: 'com.ricky.youtube-music',        name: 'YouTube Music',          description: 'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. HLS playback with AAC fallback. Offline download support.' },
-    songs:  { id: 'com.ricky.youtube-music-songs',  name: 'YouTube Music — Songs',  description: 'Stream from YouTube Music — Songs tab only. Albums, Artists & Playlists included. HLS playback with AAC fallback.' },
-    videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos', description: 'Stream from YouTube Music — Videos tab. Artists & Playlists included. HLS playback with AAC fallback.' },
+    both:   { id: 'com.ricky.youtube-music',        name: 'YouTube Music',          description: 'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. HLS + AAC. Offline downloads.' },
+    songs:  { id: 'com.ricky.youtube-music-songs',  name: 'YouTube Music — Songs',  description: 'Stream from YouTube Music — Songs tab only. Albums, Artists & Playlists. HLS + AAC.' },
+    videos: { id: 'com.ricky.youtube-music-videos', name: 'YouTube Music — Videos', description: 'Stream from YouTube Music — Videos tab. Artists & Playlists. HLS + AAC.' },
   };
   const v = variants[m] || variants.both;
   return {
-    id:          v.id,
-    name:        v.name,
-    version:     '1.5.4',
-    description: v.description,
-    icon:        'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-    resources:   ['search', 'stream', 'catalog', 'download'],
-    types:       ['track', 'album', 'artist', 'playlist'],
-    contentType: 'music',
-    downloadUrl: '/download/{id}',
-    noPrefetch:  true,
-    noStreamCache: true,
+    id: v.id, name: v.name, version: '1.5.5', description: v.description,
+    icon: 'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
+    resources: ['search','stream','catalog','download'],
+    types: ['track','album','artist','playlist'],
+    contentType: 'music', downloadUrl: '/download/{id}',
+    noPrefetch: true, noStreamCache: true,
   };
 }
 
@@ -775,7 +785,7 @@ async function handleRoute(rest, url, env, userToken, mode) {
   const q = url.searchParams.get('q') || url.searchParams.get('query') || '';
   if (rest === '/manifest.json' || rest === '/manifest') return jsonRes(buildManifest(mode));
   if (rest === '/search')            return jsonRes(await handleSearch(q, env, userToken, mode));
-  if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return await handleDownload(id, env, userToken); }
+  if (rest.startsWith('/download/')) { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return handleDownload(id, env, userToken); }
   if (rest.startsWith('/stream/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id, env, userToken)); }
   if (rest.startsWith('/album/'))    { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id, env, userToken)); }
   if (rest.startsWith('/artist/'))   { const id = lastSegment(rest); if (!id) return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id, env, userToken, mode)); }
@@ -787,11 +797,11 @@ function jsonRes(data, status) {
   return new Response(JSON.stringify(data, null, 2), {
     status: status || 200,
     headers: {
-      'content-type':                'application/json; charset=utf-8',
+      'content-type': 'application/json; charset=utf-8',
       'access-control-allow-origin': '*',
-      'access-control-allow-methods':'GET, POST, OPTIONS',
-      'access-control-allow-headers':'Content-Type',
-      'cache-control':               'no-store',
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'Content-Type',
+      'cache-control': 'no-store',
     },
   });
 }
@@ -893,9 +903,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
-  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Modes: <code>/u/{token}/</code> both &bull; <code>/u/{token}/songs/</code> songs only &bull; <code>/u/{token}/videos/</code> videos only<br>Artist videos: channel browse (primary) → filtered name search (fallback). Artist fallback: YouTube Data API channel search (set YOUTUBE_DATA_API_KEY env var).</div>
+  <div class="warn">Endpoints: <code>search</code> &bull; <code>stream/:id</code> &bull; <code>download/:id</code> &bull; <code>album/:id</code> &bull; <code>artist/:id</code> &bull; <code>playlist/:id</code><br>Modes: <code>/u/{token}/</code> both &bull; <code>/u/{token}/songs/</code> songs &bull; <code>/u/{token}/videos/</code> videos<br>Artist videos: channel browse → YT Data API videos → filtered YTM search. Channel search sorted by subscriber count. Set YOUTUBE_DATA_API_KEY env var.</div>
 </div>
-<footer>YouTube Music for Eclipse v1.5.4 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v1.5.5 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -944,7 +954,7 @@ export default {
     const url = new URL(request.url), pathname = url.pathname;
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { 'access-control-allow-origin':'*','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'Content-Type' } });
     try {
-      if (pathname === '/')                                                  return htmlRes(buildPage());
+      if (pathname === '/') return htmlRes(buildPage());
       if (pathname === '/generate' && request.method === 'POST') {
         const token = generateToken();
         return jsonRes({
@@ -954,14 +964,13 @@ export default {
           manifestUrlVideos: `${url.origin}/u/${token}/videos/manifest.json`,
         });
       }
-      if (pathname === '/refresh'  && request.method === 'POST') {
+      if (pathname === '/refresh' && request.method === 'POST') {
         let body; try { body = await request.json(); } catch {}
         const m = String(body?.existingUrl||'').match(/[a-f0-9]{28}/);
         if (!m) return jsonRes({ error: 'Paste your full addon URL — must contain a valid token' }, 400);
         return jsonRes({ token: m[0], manifestUrl: `${url.origin}/u/${m[0]}/manifest.json`, refreshed: true });
       }
-      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.4', ts: new Date().toISOString() });
-
+      if (pathname === '/health') return jsonRes({ status:'ok', version:'1.5.5', ts: new Date().toISOString() });
       const tp = parseTokenPath(pathname);
       if (tp) {
         if (!isValidToken(tp.token)) return jsonRes({ error: 'Invalid token.' }, 400);
