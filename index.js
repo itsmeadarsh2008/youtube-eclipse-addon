@@ -1,23 +1,22 @@
 // ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.9.0
+// author: ricky | version: 2.0.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 const VISITOR_TTL_SEC = 1200;
-
 const STREAM_EXPIRES_SEC = 5 * 3600 + 50 * 60;
 
 const WEB_REMIX_CONTEXT = {
   clientName: 'WEB_REMIX', clientVersion: '1.20260304.03.00', hl: 'en', gl: 'US',
 };
-// iOS client — used for /stream (returns hlsManifestUrl)
+// iOS client — used for /stream (returns hlsManifestUrl for AVPlayer on iOS/macOS)
 const IOS_CLIENT_BASE = {
   clientName: 'IOS', clientVersion: '20.10.01',
   deviceMake: 'Apple', deviceModel: 'iPhone16,2',
   osName: 'iPhone', osVersion: '18.3.2.22D82', hl: 'en',
 };
-// Android Music client — used for /download
-// Its adaptiveFormats URLs are directly fetchable server-side without CDN header tricks
+// Android Music client — used for /download redirect + AAC fallback in /stream
+// Its signed CDN URLs are directly fetchable by clients (no server proxy needed)
 const ANDROID_MUSIC_CLIENT = {
   clientName: 'ANDROID_MUSIC', clientVersion: '7.27.0',
   androidSdkVersion: 34, hl: 'en', gl: 'US',
@@ -36,6 +35,8 @@ const SEARCH_HEADERS = {
 };
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
 const IOS_UA           = 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)';
+
+// ─── Upstash Redis ───────────────────────────────────────────────────────────
 
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
@@ -74,6 +75,8 @@ function tryRefreshVisitor(data, env, userToken) {
   const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
   if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function parseDuration(text) {
   if (!text) return 0;
@@ -114,6 +117,8 @@ function buildIosContext(visitorData) {
   if (visitorData) ctx.visitorData=visitorData;
   return ctx;
 }
+
+// ─── YTM API ─────────────────────────────────────────────────────────────────
 
 async function ytmPost(path, body, env, userToken) {
   const resp = await fetch(`${YTM_BASE}${path}`, {
@@ -466,28 +471,26 @@ async function handleSearch(query, env, userToken, mode) {
 
 // ─── Player ──────────────────────────────────────────────────────────────────
 
-// iOS client — for /stream (gives hlsManifestUrl)
-async function fetchPlayerData(trackId, env, userToken) {
+// iOS client player — gives hlsManifestUrl (needed for iOS/macOS AVPlayer)
+async function fetchPlayerIos(trackId, env, userToken) {
   const visitorData=await getVisitorData(env,userToken);
   const resp=await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`,{
     method:'POST',
     headers:{ 'Content-Type':'application/json', 'User-Agent': IOS_UA },
     body:JSON.stringify({ context:{client:buildIosContext(visitorData)}, videoId:trackId, contentCheckOk:true, racyCheckOk:true }),
   });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} iOS player HTTP ${resp.status}`);
   const data=await resp.json();
   if (data?.playabilityStatus?.status!=='OK') {
     const key=userToken?`ytm:visitor:${userToken}`:'ytm:visitor';
     upstashCmd(env,'DEL',key);
-    throw new Error(`${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason||'unknown'}`);
+    throw new Error(`${LOG_PREFIX} iOS blocked: ${data?.playabilityStatus?.reason||'unknown'}`);
   }
   return data;
 }
 
-// Android Music client — for /download
-// ANDROID_MUSIC adaptiveFormats URLs are directly fetchable server-side;
-// no CDN signature mismatch, no &alr= or &cpn= requirements.
-async function fetchPlayerDataAndroid(trackId) {
+// Android Music client player — gives direct CDN URLs (fetchable by any client)
+async function fetchPlayerAndroid(trackId) {
   const resp=await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`,{
     method:'POST',
     headers:{ 'Content-Type':'application/json', 'User-Agent': ANDROID_MUSIC_UA, 'X-Goog-Api-Format-Version': '2' },
@@ -512,69 +515,76 @@ function pickBestAudio(sd) {
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id} — HLS for live playback via AVPlayer
+// ─── /stream/{id} ────────────────────────────────────────────────────────────
+// Strategy: fetch BOTH clients in parallel.
+// Return hlsManifestUrl (iOS/macOS AVPlayer) + direct AAC url (Android/Windows/Web).
+// Eclipse picks whichever format it supports — HLS on Apple, AAC everywhere else.
 async function handleStream(trackId, env, userToken) {
-  const data=await fetchPlayerData(trackId,env,userToken);
-  const sd=data.streamingData;
-  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
   const expiresAt = Math.floor(Date.now()/1000) + STREAM_EXPIRES_SEC;
-  if (sd.hlsManifestUrl) return { url:sd.hlsManifestUrl, format:'hls', quality:'high', expiresAt };
-  const best=pickBestAudio(sd);
-  if (best) return { url:best.url, format:'aac', quality:'high', expiresAt };
-  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
+
+  const [iosResult, androidResult] = await Promise.allSettled([
+    fetchPlayerIos(trackId, env, userToken),
+    fetchPlayerAndroid(trackId),
+  ]);
+
+  let hlsUrl = null;
+  let aacUrl = null;
+
+  if (iosResult.status === 'fulfilled') {
+    const sd = iosResult.value.streamingData;
+    if (sd?.hlsManifestUrl) hlsUrl = sd.hlsManifestUrl;
+    if (!aacUrl) {
+      const best = pickBestAudio(sd);
+      if (best) aacUrl = best.url;
+    }
+  }
+
+  if (androidResult.status === 'fulfilled') {
+    const sd = androidResult.value.streamingData;
+    const best = pickBestAudio(sd);
+    // Android AAC URL is more reliable for non-Apple clients — prefer it
+    if (best) aacUrl = best.url;
+    if (!hlsUrl && sd?.hlsManifestUrl) hlsUrl = sd.hlsManifestUrl;
+  }
+
+  if (!hlsUrl && !aacUrl) {
+    throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
+  }
+
+  // Return both so Eclipse can pick:
+  // - url / format: primary (HLS if available — iOS AVPlayer loves it)
+  // - alternateUrl / alternateFormat: AAC direct URL for Android/Windows
+  if (hlsUrl && aacUrl) {
+    return { url: hlsUrl, format: 'hls', quality: 'high', expiresAt, alternateUrl: aacUrl, alternateFormat: 'aac' };
+  }
+  if (hlsUrl) {
+    return { url: hlsUrl, format: 'hls', quality: 'high', expiresAt };
+  }
+  return { url: aacUrl, format: 'aac', quality: 'high', expiresAt };
 }
 
-// /download/{id}
-// Uses the Android Music client whose CDN URLs are directly fetchable server-side.
-// Validates that the upstream response is actually audio before streaming to Eclipse.
-async function proxyDownload(trackId, incomingRequest, env, userToken) {
-  // Fetch player data with Android client (URLs work without CDN header tricks)
-  const data = await fetchPlayerDataAndroid(trackId);
+// ─── /download/{id} ──────────────────────────────────────────────────────────
+// Strategy: 302 redirect to the Android CDN URL.
+// NO proxying — avoids Cloudflare Worker 128 MB / CPU limits that truncate files.
+// Android Music CDN URLs are directly accessible by Eclipse without special headers.
+async function handleDownload(trackId) {
+  const data = await fetchPlayerAndroid(trackId);
   const sd = data.streamingData;
-  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
+  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for ${trackId}`);
 
   const best = pickBestAudio(sd);
   if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
 
-  // Append &alr=yes which tells YouTube CDN this is an allowed range request
-  const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
-
-  const reqHeaders = {
-    'User-Agent':      ANDROID_MUSIC_UA,
-    'Accept':          '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Origin':          'https://music.youtube.com',
-    'Referer':         'https://music.youtube.com/',
-  };
-  const range = incomingRequest.headers.get('range');
-  if (range) reqHeaders['Range'] = range;
-
-  const upstream = await fetch(cdnUrl, { headers: reqHeaders });
-
-  // Guard: if YouTube returned an error body (HTML/JSON ~30KB) instead of audio, fail loudly
-  const upstreamCT = upstream.headers.get('content-type') || '';
-  if (!upstream.ok && upstream.status !== 206) {
-    throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for ${trackId}`);
-  }
-  if (!upstreamCT.includes('audio') && !upstreamCT.includes('octet-stream') && !upstreamCT.includes('video')) {
-    const preview = await upstream.text();
-    throw new Error(`${LOG_PREFIX} CDN returned non-audio content-type "${upstreamCT}" — body: ${preview.slice(0,200)}`);
-  }
-
-  const contentLength = best.contentLength || upstream.headers.get('content-length') || null;
-
-  const resHeaders = {
-    'content-type':                 'audio/mp4',
-    'access-control-allow-origin':  '*',
-    'access-control-allow-methods': 'GET, OPTIONS',
-    'cache-control':                'no-store',
-    'content-disposition':          `attachment; filename="${trackId}.m4a"`,
-  };
-  if (contentLength)                         resHeaders['content-length'] = String(contentLength);
-  if (upstream.headers.get('content-range')) resHeaders['content-range']  = upstream.headers.get('content-range');
-  if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges']  = upstream.headers.get('accept-ranges');
-
-  return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+  // 302 → Eclipse fetches directly from YouTube CDN
+  return new Response(null, {
+    status: 302,
+    headers: {
+      'location':                      best.url,
+      'access-control-allow-origin':   '*',
+      'access-control-allow-methods':  'GET, OPTIONS',
+      'cache-control':                 'no-store',
+    },
+  });
 }
 
 // ─── Browse helpers ──────────────────────────────────────────────────────────
@@ -653,12 +663,10 @@ async function handleArtist(artistId, env, userToken, mode) {
       const channelData=await browseChannelVideos(artistId,env,userToken);
       topTracks=extractChannelVideoTracks(channelData,name);
     } catch(e){ console.log(LOG_PREFIX,'channel browse failed:',e.message); }
-
     if (topTracks.length===0&&env?.YOUTUBE_DATA_API_KEY) {
       try { topTracks=await ytDataChannelVideos(artistId,name,env); }
       catch(e){ console.log(LOG_PREFIX,'ytData videos fallback failed:',e.message); }
     }
-
     if (topTracks.length===0) {
       try {
         const vr=await ytmSearch(name,SEARCH_PARAMS.videos,env,userToken);
@@ -735,7 +743,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'1.9.0', description:v.description,
+    id:v.id, name:v.name, version:'2.0.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -825,9 +833,9 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   <div class="pills">
     <span class="pill">Songs &middot; Videos</span>
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
-    <span class="pill hi">HLS Streaming</span>
-    <span class="pill gr">Proxied AAC Downloads</span>
-    <span class="pill gr">Offline Playback</span>
+    <span class="pill hi">HLS &amp; AAC Streaming</span>
+    <span class="pill gr">302 Redirect Downloads</span>
+    <span class="pill gr">iOS &middot; Android &middot; Windows</span>
     <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
   </div>
@@ -865,12 +873,12 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
     <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
   </div>
   <div class="warn">
-    /stream &rarr; iOS client, HLS manifest (AVPlayer live playback)<br>
-    /download &rarr; Android Music client, proxied AAC mp4 bytes<br>
-    content-type validated before streaming — no silent garbage files
+    /stream &rarr; HLS (iOS/macOS) + AAC direct URL (Android/Windows) returned together<br>
+    /download &rarr; 302 redirect to Android Music CDN &mdash; no Worker proxy, no truncation<br>
+    Both player clients fetched in parallel for lowest latency
   </div>
 </div>
-<footer>YouTube Music for Eclipse v1.9.0 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse v2.0.0 &bull; by ricky &bull; Cloudflare Workers</footer>
 <script>
 var gu=null,guSongs=null,guVideos=null,ru=null;
 function generate(){
@@ -930,7 +938,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'1.9.0',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'2.0.0',ts:new Date().toISOString()});
 
       const tp=parseTokenPath(pathname);
       if (tp) {
@@ -938,7 +946,7 @@ export default {
         if (tp.rest.startsWith('/download/')) {
           const id=lastSegment(tp.rest);
           if (!id) return jsonRes({error:'Missing ID'},400);
-          return await proxyDownload(id,request,env,tp.token);
+          return await handleDownload(id);
         }
         const r=await handleRoute(tp.rest,url,env,tp.token,tp.mode);
         return r||jsonRes({error:'Not found',path:tp.rest},404);
@@ -946,7 +954,7 @@ export default {
       if (pathname.startsWith('/download/')) {
         const id=lastSegment(pathname);
         if (!id) return jsonRes({error:'Missing ID'},400);
-        return await proxyDownload(id,request,env,null);
+        return await handleDownload(id);
       }
       const base=await handleRoute(pathname,url,env,null,'both');
       return base||jsonRes({error:'Not found'},404);
