@@ -1,4 +1,4 @@
-// ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
+// ─── YouTube hiut Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
 // author: ricky | version: 1.9.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
