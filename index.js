@@ -519,84 +519,42 @@ async function fetchPlayerDataAndroid(trackId) {
   return data;
 }
 
-async function fetchPlayerDataTV(trackId) {
-  const resp = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': TVHTML5_UA,
-      'Origin': 'https://www.youtube.com',
-      'Referer': 'https://www.youtube.com/',
-    },
-    body: JSON.stringify({
-      videoId: trackId,
-      context: {
-        client: TVHTML5_CLIENT,
-        thirdParty: { embedUrl: 'https://www.youtube.com' },
-      },
-      playbackContext: { contentPlaybackContext: { signatureTimestamp: 0 } },
-    }),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} TV player HTTP ${resp.status}`);
-  const data = await resp.json();
-  const status = data?.playabilityStatus?.status;
-  if (status === 'LOGIN_REQUIRED') throw new Error(`${LOG_PREFIX} TV blocked: LOGIN_REQUIRED`);
-  if (status === 'ERROR' || status === 'UNPLAYABLE') throw new Error(`${LOG_PREFIX} TV blocked: ${status}`);
-  return data;
-}
-
 function pickBestAudio(sd) {
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id} — proxies audio bytes via TVHTML5 client.
-// TVHTML5 is the most permissive YouTube client: no auth required, no datacenter IP blocks,
-// returns direct adaptiveFormats URLs. Falls back to Android Music client on failure.
+// /stream/{id} — uses iOS client to get hlsManifestUrl, returns 302 redirect.
+// Eclipse/AVPlayer handles HLS natively. The iOS client returns a signed HLS URL
+// that works directly from the client device (not from Cloudflare's IP).
 async function handleStream(trackId, incomingRequest, env, userToken) {
-  let data;
-  try {
-    data = await fetchPlayerDataTV(trackId);
-  } catch (tvErr) {
-    console.warn(`${LOG_PREFIX} TV client failed (${tvErr.message}), falling back to Android`);
-    data = await fetchPlayerDataAndroid(trackId);
+  const data = await fetchPlayerData(trackId, env, userToken);
+  const sd = data?.streamingData;
+  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for ${trackId}`);
+  if (sd.hlsManifestUrl) {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        'location': sd.hlsManifestUrl,
+        'access-control-allow-origin': '*',
+        'cache-control': 'no-store',
+      },
+    });
   }
-  const sd = data.streamingData;
-  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for stream`);
+  // Fallback: pick best adaptive format and redirect to it directly
   const best = pickBestAudio(sd);
-  if (!best) throw new Error(`${LOG_PREFIX} No streamable audio for ${trackId}`);
-  const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
-  const reqHeaders = {
-    'User-Agent': ANDROID_MUSIC_UA,
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://music.youtube.com',
-    'Referer': 'https://music.youtube.com/',
-  };
-  const range = incomingRequest.headers.get('range');
-  if (range) reqHeaders['Range'] = range;
-  const upstream = await fetch(cdnUrl, { headers: reqHeaders });
-  const upstreamCT = upstream.headers.get('content-type') || '';
-  if (!upstream.ok && upstream.status !== 206) {
-    throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for stream ${trackId}`);
-  }
-  if (!upstreamCT.includes('audio') && !upstreamCT.includes('octet-stream') && !upstreamCT.includes('video')) {
-    const preview = await upstream.text();
-    throw new Error(`${LOG_PREFIX} CDN returned non-audio content-type "${upstreamCT}" — body: ${preview.slice(0,200)}`);
-  }
-  const contentLength = best.contentLength || upstream.headers.get('content-length') || null;
-  const resHeaders = {
-    'content-type': 'audio/mp4',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, OPTIONS',
-    'cache-control': 'no-store',
-  };
-  if (contentLength) resHeaders['content-length'] = String(contentLength);
-  if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
-  if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
-  return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+  if (!best) throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      'location': best.url,
+      'access-control-allow-origin': '*',
+      'cache-control': 'no-store',
+    },
+  });
 }
+
 
 // /download/{id}
 // Uses the Android Music client whose CDN URLs are directly fetchable server-side.
