@@ -2,8 +2,11 @@
 // author: ricky | version: 1.9.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
-const YTM_API_KEY = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
-const VISITOR_TTL_SEC = 1200;
+// YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
+// Falls back to the public key if the env secret is not set.
+const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
+function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
+const VISITOR_TTL_SEC = 300;
 
 const STREAM_EXPIRES_SEC = 5 * 3600 + 50 * 60;
 
@@ -35,7 +38,7 @@ const SEARCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 };
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
-const IOS_UA           = 'com.google.ios.youtube/20.10.01 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)';
+const IOS_UA           = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
 
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
@@ -58,16 +61,23 @@ async function getVisitorData(env, userToken) {
 }
 async function fetchFreshVisitorData(env, userToken) {
   const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
-  try {
-    const resp = await fetch(`${YTM_BASE}/youtubei/v1/visitor_id?key=${YTM_API_KEY}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT } }),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const vd = (await resp.json())?.responseContext?.visitorData || null;
-    if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
-    return vd;
-  } catch (e) { console.log(LOG_PREFIX, 'visitorData failed:', e.message); return null; }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = await fetch(`${YTM_BASE}/youtubei/v1/visitor_id?key=${getApiKey(env)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ context: { client: WEB_REMIX_CONTEXT } }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const vd = (await resp.json())?.responseContext?.visitorData || null;
+      if (vd) { upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC); return vd; }
+      throw new Error('empty visitorData');
+    } catch (e) {
+      console.log(LOG_PREFIX, `visitorData attempt ${attempt} failed:`, e.message);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 300 * attempt));
+    }
+  }
+  // Return empty string so buildIosContext still produces a valid context object
+  return '';
 }
 function tryRefreshVisitor(data, env, userToken) {
   const vd = data?.responseContext?.visitorData;
@@ -125,13 +135,13 @@ async function ytmPost(path, body, env, userToken) {
   return data;
 }
 async function ytmBrowse(browseId, env, userToken) {
-  return ytmPost(`/youtubei/v1/browse?key=${YTM_API_KEY}`,
+  return ytmPost(`/youtubei/v1/browse?key=${getApiKey(env)}`,
     { context:{client:WEB_REMIX_CONTEXT}, browseId }, env, userToken);
 }
 async function ytmSearch(query, params, env, userToken) {
   const body={context:{client:WEB_REMIX_CONTEXT}, query};
   if (params) body.params=params;
-  return ytmPost(`/youtubei/v1/search?key=${YTM_API_KEY}`, body, env, userToken);
+  return ytmPost(`/youtubei/v1/search?key=${getApiKey(env)}`, body, env, userToken);
 }
 
 // ─── YouTube Data API helpers ────────────────────────────────────────────────
@@ -192,7 +202,7 @@ async function ytDataChannelVideos(channelId, artistName, env) {
 // ─── Channel browse helpers ──────────────────────────────────────────────────
 
 async function browseChannelVideos(channelId, env, userToken) {
-  const channelData=await ytmPost(`/youtubei/v1/browse?key=${YTM_API_KEY}`,
+  const channelData=await ytmPost(`/youtubei/v1/browse?key=${getApiKey(env)}`,
     { context:{client:WEB_REMIX_CONTEXT}, browseId:channelId }, env, userToken);
   const tabs=channelData?.contents?.twoColumnBrowseResultsRenderer?.tabs||
              channelData?.contents?.singleColumnBrowseResultsRenderer?.tabs||[];
@@ -208,7 +218,7 @@ async function browseChannelVideos(channelId, env, userToken) {
     }
   }
   if (!videosParams) return channelData;
-  return ytmPost(`/youtubei/v1/browse?key=${YTM_API_KEY}`,
+  return ytmPost(`/youtubei/v1/browse?key=${getApiKey(env)}`,
     { context:{client:WEB_REMIX_CONTEXT}, browseId:videosBrowseId, params:videosParams }, env, userToken);
 }
 
@@ -477,8 +487,11 @@ async function fetchPlayerData(trackId, env, userToken) {
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
   const data=await resp.json();
   if (data?.playabilityStatus?.status!=='OK') {
-    const key=userToken?`ytm:visitor:${userToken}`:'ytm:visitor';
-    upstashCmd(env,'DEL',key);
+    // Only invalidate cached visitorData if we had one — avoids cascade failures on transient IP blocks
+    if (visitorData) {
+      const key=userToken?`ytm:visitor:${userToken}`:'ytm:visitor';
+      upstashCmd(env,'DEL',key);
+    }
     throw new Error(`${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason||'unknown'}`);
   }
   return data;
