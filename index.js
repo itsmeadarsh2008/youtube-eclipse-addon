@@ -525,16 +525,46 @@ function pickBestAudio(sd) {
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id} — HLS for live playback via AVPlayer
-async function handleStream(trackId, env, userToken) {
-  const data=await fetchPlayerData(trackId,env,userToken);
-  const sd=data.streamingData;
-  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data`);
-  const expiresAt = Math.floor(Date.now()/1000) + STREAM_EXPIRES_SEC;
-  if (sd.hlsManifestUrl) return { url:sd.hlsManifestUrl, format:'hls', quality:'high', expiresAt };
-  const best=pickBestAudio(sd);
-  if (best) return { url:best.url, format:'aac', quality:'high', expiresAt };
-  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
+// /stream/{id} — proxies audio bytes via Android Music client.
+// The iOS client returns CDN URLs signed for Cloudflare's IP, which Eclipse
+// cannot play directly. Android Music client URLs are fetchable server-side,
+// so we proxy the bytes through the Worker instead.
+async function handleStream(trackId, incomingRequest, env, userToken) {
+  const data = await fetchPlayerDataAndroid(trackId);
+  const sd = data.streamingData;
+  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for stream`);
+  const best = pickBestAudio(sd);
+  if (!best) throw new Error(`${LOG_PREFIX} No streamable audio for ${trackId}`);
+  const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
+  const reqHeaders = {
+    'User-Agent': ANDROID_MUSIC_UA,
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': 'https://music.youtube.com',
+    'Referer': 'https://music.youtube.com/',
+  };
+  const range = incomingRequest.headers.get('range');
+  if (range) reqHeaders['Range'] = range;
+  const upstream = await fetch(cdnUrl, { headers: reqHeaders });
+  const upstreamCT = upstream.headers.get('content-type') || '';
+  if (!upstream.ok && upstream.status !== 206) {
+    throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for stream ${trackId}`);
+  }
+  if (!upstreamCT.includes('audio') && !upstreamCT.includes('octet-stream') && !upstreamCT.includes('video')) {
+    const preview = await upstream.text();
+    throw new Error(`${LOG_PREFIX} CDN returned non-audio content-type "${upstreamCT}" — body: ${preview.slice(0,200)}`);
+  }
+  const contentLength = best.contentLength || upstream.headers.get('content-length') || null;
+  const resHeaders = {
+    'content-type': 'audio/mp4',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, OPTIONS',
+    'cache-control': 'no-store',
+  };
+  if (contentLength) resHeaders['content-length'] = String(contentLength);
+  if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
+  if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
+  return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
 }
 
 // /download/{id}
@@ -756,11 +786,12 @@ function buildManifest(mode) {
   };
 }
 
-async function handleRoute(rest, url, env, userToken, mode) {
+async function handleRoute(rest, url, request, env, userToken, mode) {
   const q=url.searchParams.get('q')||url.searchParams.get('query')||'';
   if (rest==='/manifest.json'||rest==='/manifest') return jsonRes(buildManifest(mode));
   if (rest==='/search')              return jsonRes(await handleSearch(q,env,userToken,mode));
-  if (rest.startsWith('/stream/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleStream(id,env,userToken)); }
+  if (rest.startsWith('/stream/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return await handleStream(id,request,env,userToken); }
+  if (rest.startsWith('/download/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return await proxyDownload(id,request,env,userToken); }
   if (rest.startsWith('/album/'))    { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id,env,userToken)); }
   if (rest.startsWith('/artist/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id,env,userToken,mode)); }
   if (rest.startsWith('/playlist/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handlePlaylist(id,env,userToken)); }
@@ -953,7 +984,7 @@ export default {
           if (!id) return jsonRes({error:'Missing ID'},400);
           return await proxyDownload(id,request,env,tp.token);
         }
-        const r=await handleRoute(tp.rest,url,env,tp.token,tp.mode);
+        const r=await handleRoute(tp.rest,url,request,env,tp.token,tp.mode);
         return r||jsonRes({error:'Not found',path:tp.rest},404);
       }
       if (pathname.startsWith('/download/')) {
@@ -961,7 +992,7 @@ export default {
         if (!id) return jsonRes({error:'Missing ID'},400);
         return await proxyDownload(id,request,env,null);
       }
-      const base=await handleRoute(pathname,url,env,null,'both');
+      const base=await handleRoute(pathname,url,request,env,null,'both');
       return base||jsonRes({error:'Not found'},404);
     } catch(err) {
       console.error(LOG_PREFIX,err);
