@@ -519,18 +519,49 @@ async function fetchPlayerDataAndroid(trackId) {
   return data;
 }
 
+async function fetchPlayerDataTV(trackId) {
+  const resp = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': TVHTML5_UA,
+      'Origin': 'https://www.youtube.com',
+      'Referer': 'https://www.youtube.com/',
+    },
+    body: JSON.stringify({
+      videoId: trackId,
+      context: {
+        client: TVHTML5_CLIENT,
+        thirdParty: { embedUrl: 'https://www.youtube.com' },
+      },
+      playbackContext: { contentPlaybackContext: { signatureTimestamp: 0 } },
+    }),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} TV player HTTP ${resp.status}`);
+  const data = await resp.json();
+  const status = data?.playabilityStatus?.status;
+  if (status === 'LOGIN_REQUIRED') throw new Error(`${LOG_PREFIX} TV blocked: LOGIN_REQUIRED`);
+  if (status === 'ERROR' || status === 'UNPLAYABLE') throw new Error(`${LOG_PREFIX} TV blocked: ${status}`);
+  return data;
+}
+
 function pickBestAudio(sd) {
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id} — proxies audio bytes via Android Music client.
-// The iOS client returns CDN URLs signed for Cloudflare's IP, which Eclipse
-// cannot play directly. Android Music client URLs are fetchable server-side,
-// so we proxy the bytes through the Worker instead.
+// /stream/{id} — proxies audio bytes via TVHTML5 client.
+// TVHTML5 is the most permissive YouTube client: no auth required, no datacenter IP blocks,
+// returns direct adaptiveFormats URLs. Falls back to Android Music client on failure.
 async function handleStream(trackId, incomingRequest, env, userToken) {
-  const data = await fetchPlayerDataAndroid(trackId);
+  let data;
+  try {
+    data = await fetchPlayerDataTV(trackId);
+  } catch (tvErr) {
+    console.warn(`${LOG_PREFIX} TV client failed (${tvErr.message}), falling back to Android`);
+    data = await fetchPlayerDataAndroid(trackId);
+  }
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for stream`);
   const best = pickBestAudio(sd);
