@@ -1,5 +1,5 @@
 // ─── YouTube hiut Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 1.9.0
+// author: ricky | version: 2.0.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 // YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
@@ -15,9 +15,9 @@ const WEB_REMIX_CONTEXT = {
 };
 // iOS client — used for /stream (returns hlsManifestUrl)
 const IOS_CLIENT_BASE = {
-  clientName: 'IOS', clientVersion: '20.10.01',
-  deviceMake: 'Apple', deviceModel: 'iPhone16,2',
-  osName: 'iPhone', osVersion: '18.3.2.22D82', hl: 'en',
+  clientName: 'IOS', clientVersion: '20.12.4',
+  deviceMake: 'Apple', deviceModel: 'iPhone17,3',
+  osName: 'iPhone', osVersion: '18.4.1.22E252', hl: 'en',
 };
 // Android Music client — used for /download
 // Its adaptiveFormats URLs are directly fetchable server-side without CDN header tricks
@@ -25,6 +25,17 @@ const ANDROID_MUSIC_CLIENT = {
   clientName: 'ANDROID_MUSIC', clientVersion: '7.27.0',
   androidSdkVersion: 34, hl: 'en', gl: 'US',
 };
+
+// Android VR client — fallback for /stream when iOS client is blocked
+// Flow (A-EDev/Flow) identifies this as the most reliable fast-direct client
+const ANDROID_VR_CLIENT = {
+  clientName: 'ANDROID_VR',
+  clientVersion: '1.61.48',
+  androidSdkVersion: 34,
+  hl: 'en',
+  gl: 'US',
+};
+const ANDROID_VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US) gzip';
 const SEARCH_PARAMS = {
   songs:     'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
   videos:    'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D',
@@ -487,12 +498,17 @@ async function fetchPlayerData(trackId, env, userToken) {
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
   const data=await resp.json();
   if (data?.playabilityStatus?.status!=='OK') {
-    // Only invalidate cached visitorData if we had one — avoids cascade failures on transient IP blocks
-    if (visitorData) {
-      const key=userToken?`ytm:visitor:${userToken}`:'ytm:visitor';
-      upstashCmd(env,'DEL',key);
+    const reason = data?.playabilityStatus?.reason || '';
+    const status = data?.playabilityStatus?.status || '';
+    // Only wipe visitorData on definitive bot/auth challenges, not transient errors
+    const hardBlock = ['BOT_CHALLENGE', 'LOGIN_REQUIRED', 'UNPLAYABLE'].includes(status) ||
+                      reason.toLowerCase().includes('bot') ||
+                      reason.toLowerCase().includes('sign in');
+    if (visitorData && hardBlock) {
+      const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
+      upstashCmd(env, 'DEL', key);
     }
-    throw new Error(`${LOG_PREFIX} Blocked: ${data?.playabilityStatus?.reason||'unknown'}`);
+    throw new Error(`${LOG_PREFIX} Blocked: ${reason || status || 'unknown'}`);
   }
   return data;
 }
@@ -519,6 +535,31 @@ async function fetchPlayerDataAndroid(trackId) {
   return data;
 }
 
+
+// Android VR client player fetch — returns adaptiveFormats with direct URLs
+// Used as fallback in /stream when iOS hlsManifestUrl is unavailable
+async function fetchPlayerDataAndroidVR(trackId) {
+  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': ANDROID_VR_UA,
+      'X-Goog-Api-Format-Version': '2',
+    },
+    body: JSON.stringify({
+      context: { client: ANDROID_VR_CLIENT },
+      videoId: trackId,
+      contentCheckOk: true,
+      racyCheckOk: true,
+    }),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidVR player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') {
+    throw new Error(`${LOG_PREFIX} AndroidVR blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
+  }
+  return data;
+}
 function pickBestAudio(sd) {
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
@@ -529,10 +570,19 @@ function pickBestAudio(sd) {
 // Eclipse/AVPlayer handles HLS natively. The iOS client returns a signed HLS URL
 // that works directly from the client device (not from Cloudflare's IP).
 async function handleStream(trackId, incomingRequest, env, userToken) {
-  const data = await fetchPlayerData(trackId, env, userToken);
+  // Try iOS client first — returns hlsManifestUrl for native AVPlayer/ExoPlayer HLS
+  let data = null;
+  let usedFallback = false;
+  try {
+    data = await fetchPlayerData(trackId, env, userToken);
+  } catch (iosErr) {
+    console.log(LOG_PREFIX, `iOS client failed for ${trackId}: ${iosErr.message} — trying AndroidVR fallback`);
+    // Fall through to AndroidVR below
+  }
+
+  // If iOS gave us an HLS URL, use it immediately
   const sd = data?.streamingData;
-  if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for ${trackId}`);
-  if (sd.hlsManifestUrl) {
+  if (sd?.hlsManifestUrl) {
     return new Response(null, {
       status: 302,
       headers: {
@@ -542,9 +592,24 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
       },
     });
   }
-  // Fallback: pick best adaptive format and redirect to it directly
-  const best = pickBestAudio(sd);
-  if (!best) throw new Error(`${LOG_PREFIX} No playable audio for ${trackId}`);
+
+  // iOS succeeded but no hlsManifestUrl, or iOS failed — try AndroidVR direct URL
+  let vrData = null;
+  try {
+    vrData = await fetchPlayerDataAndroidVR(trackId);
+    usedFallback = true;
+  } catch (vrErr) {
+    console.log(LOG_PREFIX, `AndroidVR fallback also failed for ${trackId}: ${vrErr.message}`);
+  }
+
+  // Try adaptiveFormats from VR client first, then iOS as last resort
+  const best = pickBestAudio(vrData?.streamingData) || pickBestAudio(sd);
+  if (!best) throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
+
+  if (usedFallback) {
+    console.log(LOG_PREFIX, `Using AndroidVR adaptive URL for ${trackId}`);
+  }
+
   return new Response(null, {
     status: 302,
     headers: {
@@ -767,7 +832,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'1.9.0', description:v.description,
+    id:v.id, name:v.name, version:'2.0.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -963,7 +1028,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'1.9.0',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'2.0.0',ts:new Date().toISOString()});
 
       const tp=parseTokenPath(pathname);
       if (tp) {
