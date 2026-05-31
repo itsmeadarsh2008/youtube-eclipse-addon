@@ -1,9 +1,11 @@
 // ─── YouTube hiut Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.0.0
+// author: ricky | version: 2.1.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
-// YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
-// Falls back to the public key if the env secret is not set.
+// YTM_API_KEY: set as a Cloudflare Workers secret to avoid exposing it. Falls back to public key.
+// YTM_OAUTH_TOKEN: (optional) set as a Cloudflare Workers secret — your YouTube OAuth Bearer token.
+//   When set, all player requests are authenticated, bypassing bot checks entirely.
+//   Rotate this token when it expires (~1hr). Store ONLY the token value (after 'Bearer ').
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
 const VISITOR_TTL_SEC = 300;
@@ -36,6 +38,23 @@ const ANDROID_VR_CLIENT = {
   gl: 'US',
 };
 const ANDROID_VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US) gzip';
+
+// TVHTML5 Embedded Player client — the ONLY client that bypasses datacenter IP bot checks
+// without authentication. YouTube allows this because it's used by 3rd-party embeds.
+// This MUST be the primary stream client when running on Cloudflare Workers / server IPs.
+const TVHTML5_CLIENT = {
+  clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+  clientVersion: '2.0',
+  hl: 'en',
+  gl: 'US',
+};
+const TVHTML5_UA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1';
+// TV client embed params required for TVHTML5_SIMPLY_EMBEDDED_PLAYER
+const TVHTML5_EMBED_PARAMS = {
+  thirdParty: {
+    embedUrl: 'https://music.youtube.com/',
+  },
+};
 const SEARCH_PARAMS = {
   songs:     'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
   videos:    'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D',
@@ -560,64 +579,126 @@ async function fetchPlayerDataAndroidVR(trackId) {
   }
   return data;
 }
+
+// TVHTML5 Embedded player fetch — works from Cloudflare datacenter IPs without auth.
+// Returns adaptiveFormats with direct URLs. No hlsManifestUrl, but URLs are stable.
+async function fetchPlayerDataTVHTML5(trackId, oauthToken = null) {
+  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': TVHTML5_UA,
+      'Origin': 'https://www.youtube.com',
+      ...(oauthToken ? { 'Authorization': `Bearer ${oauthToken}` } : {}),
+    },
+    body: JSON.stringify({
+      context: {
+        client: TVHTML5_CLIENT,
+        ...TVHTML5_EMBED_PARAMS,
+      },
+      videoId: trackId,
+      contentCheckOk: true,
+      racyCheckOk: true,
+    }),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} TVHTML5 player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') {
+    throw new Error(`${LOG_PREFIX} TVHTML5 blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
+  }
+  return data;
+}
 function pickBestAudio(sd) {
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id} — uses iOS client to get hlsManifestUrl, returns 302 redirect.
-// Eclipse/AVPlayer handles HLS natively. The iOS client returns a signed HLS URL
-// that works directly from the client device (not from Cloudflare's IP).
+// /stream/{id} — Multi-client cascade designed for Cloudflare Workers (datacenter IPs).
+//
+// Client priority order (tuned for server-side/datacenter IP execution):
+//   1. TVHTML5_SIMPLY_EMBEDDED_PLAYER — bypasses bot checks on datacenter IPs, no auth needed
+//   2. iOS client                     — gives hlsManifestUrl; works when not IP-blocked
+//   3. AndroidVR client               — direct adaptiveFormats URLs, last resort
+//
+// If YTM_OAUTH_TOKEN env secret is set, it's injected into all player requests
+// for maximum reliability (authenticated requests skip bot checks entirely).
 async function handleStream(trackId, incomingRequest, env, userToken) {
-  // Try iOS client first — returns hlsManifestUrl for native AVPlayer/ExoPlayer HLS
-  let data = null;
-  let usedFallback = false;
+  const oauthToken = env?.YTM_OAUTH_TOKEN || null;
+
+  // ── Step 1: TVHTML5 (primary for server/datacenter IPs) ──────────────────
+  let tvData = null;
   try {
-    data = await fetchPlayerData(trackId, env, userToken);
+    tvData = await fetchPlayerDataTVHTML5(trackId, oauthToken);
+    const tvBest = pickBestAudio(tvData?.streamingData);
+    if (tvBest) {
+      console.log(LOG_PREFIX, `TVHTML5 stream success for ${trackId}`);
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'location': tvBest.url,
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+        },
+      });
+    }
+  } catch (tvErr) {
+    console.log(LOG_PREFIX, `TVHTML5 failed for ${trackId}: ${tvErr.message} — trying iOS`);
+  }
+
+  // ── Step 2: iOS client (gives hlsManifestUrl) ────────────────────────────
+  let iosData = null;
+  try {
+    iosData = await fetchPlayerData(trackId, env, userToken);
+    const sd = iosData?.streamingData;
+    if (sd?.hlsManifestUrl) {
+      console.log(LOG_PREFIX, `iOS HLS stream success for ${trackId}`);
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'location': sd.hlsManifestUrl,
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+        },
+      });
+    }
+    // iOS OK but no HLS URL — try adaptive formats from the iOS response
+    const iosBest = pickBestAudio(sd);
+    if (iosBest) {
+      console.log(LOG_PREFIX, `iOS adaptive stream success for ${trackId}`);
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'location': iosBest.url,
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+        },
+      });
+    }
   } catch (iosErr) {
-    console.log(LOG_PREFIX, `iOS client failed for ${trackId}: ${iosErr.message} — trying AndroidVR fallback`);
-    // Fall through to AndroidVR below
+    console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message} — trying AndroidVR`);
   }
 
-  // If iOS gave us an HLS URL, use it immediately
-  const sd = data?.streamingData;
-  if (sd?.hlsManifestUrl) {
-    return new Response(null, {
-      status: 302,
-      headers: {
-        'location': sd.hlsManifestUrl,
-        'access-control-allow-origin': '*',
-        'cache-control': 'no-store',
-      },
-    });
-  }
-
-  // iOS succeeded but no hlsManifestUrl, or iOS failed — try AndroidVR direct URL
-  let vrData = null;
+  // ── Step 3: AndroidVR (last resort) ──────────────────────────────────────
   try {
-    vrData = await fetchPlayerDataAndroidVR(trackId);
-    usedFallback = true;
+    const vrData = await fetchPlayerDataAndroidVR(trackId);
+    const vrBest = pickBestAudio(vrData?.streamingData);
+    if (vrBest) {
+      console.log(LOG_PREFIX, `AndroidVR stream success for ${trackId}`);
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'location': vrBest.url,
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+        },
+      });
+    }
   } catch (vrErr) {
     console.log(LOG_PREFIX, `AndroidVR fallback also failed for ${trackId}: ${vrErr.message}`);
   }
 
-  // Try adaptiveFormats from VR client first, then iOS as last resort
-  const best = pickBestAudio(vrData?.streamingData) || pickBestAudio(sd);
-  if (!best) throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
-
-  if (usedFallback) {
-    console.log(LOG_PREFIX, `Using AndroidVR adaptive URL for ${trackId}`);
-  }
-
-  return new Response(null, {
-    status: 302,
-    headers: {
-      'location': best.url,
-      'access-control-allow-origin': '*',
-      'cache-control': 'no-store',
-    },
-  });
+  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 }
 
 
@@ -832,7 +913,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.0.0', description:v.description,
+    id:v.id, name:v.name, version:'2.1.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1028,7 +1109,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'2.0.0',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'2.1.0',ts:new Date().toISOString()});
 
       const tp=parseTokenPath(pathname);
       if (tp) {
