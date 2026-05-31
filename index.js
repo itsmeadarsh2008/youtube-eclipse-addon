@@ -1,11 +1,9 @@
 // ─── YouTube hiut Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.1.0
+// author: ricky | version: 2.0.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
-// YTM_API_KEY: set as a Cloudflare Workers secret to avoid exposing it. Falls back to public key.
-// YTM_OAUTH_TOKEN: (optional) set as a Cloudflare Workers secret — your YouTube OAuth Bearer token.
-//   When set, all player requests are authenticated, bypassing bot checks entirely.
-//   Rotate this token when it expires (~1hr). Store ONLY the token value (after 'Bearer ').
+// YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
+// Falls back to the public key if the env secret is not set.
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
 const VISITOR_TTL_SEC = 300;
@@ -38,23 +36,6 @@ const ANDROID_VR_CLIENT = {
   gl: 'US',
 };
 const ANDROID_VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US) gzip';
-
-// TVHTML5 Embedded Player client — the ONLY client that bypasses datacenter IP bot checks
-// without authentication. YouTube allows this because it's used by 3rd-party embeds.
-// This MUST be the primary stream client when running on Cloudflare Workers / server IPs.
-const TVHTML5_CLIENT = {
-  clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-  clientVersion: '2.0',
-  hl: 'en',
-  gl: 'US',
-};
-const TVHTML5_UA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1';
-// TV client embed params required for TVHTML5_SIMPLY_EMBEDDED_PLAYER
-const TVHTML5_EMBED_PARAMS = {
-  thirdParty: {
-    embedUrl: 'https://music.youtube.com/',
-  },
-};
 const SEARCH_PARAMS = {
   songs:     'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
   videos:    'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D',
@@ -579,123 +560,133 @@ async function fetchPlayerDataAndroidVR(trackId) {
   }
   return data;
 }
-
-// TVHTML5 Embedded player fetch — works from Cloudflare datacenter IPs without auth.
-// Returns adaptiveFormats with direct URLs. No hlsManifestUrl, but URLs are stable.
-async function fetchPlayerDataTVHTML5(trackId, oauthToken = null) {
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': TVHTML5_UA,
-      'Origin': 'https://www.youtube.com',
-      ...(oauthToken ? { 'Authorization': `Bearer ${oauthToken}` } : {}),
-    },
-    body: JSON.stringify({
-      context: {
-        client: TVHTML5_CLIENT,
-        ...TVHTML5_EMBED_PARAMS,
-      },
-      videoId: trackId,
-      contentCheckOk: true,
-      racyCheckOk: true,
-    }),
-  });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} TVHTML5 player HTTP ${resp.status}`);
-  const data = await resp.json();
-  if (data?.playabilityStatus?.status !== 'OK') {
-    throw new Error(`${LOG_PREFIX} TVHTML5 blocked: ${data?.playabilityStatus?.reason || 'unknown'}`);
-  }
-  return data;
-}
 function pickBestAudio(sd) {
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
     .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0]||null;
 }
 
-// /stream/{id} — Multi-client cascade designed for Cloudflare Workers (datacenter IPs).
+// /stream/{id}
 //
-// Client priority order (tuned for server-side/datacenter IP execution):
-//   1. TVHTML5_SIMPLY_EMBEDDED_PLAYER — bypasses bot checks on datacenter IPs, no auth needed
-//   2. iOS client                     — gives hlsManifestUrl; works when not IP-blocked
-//   3. AndroidVR client               — direct adaptiveFormats URLs, last resort
-//
-// If YTM_OAUTH_TOKEN env secret is set, it's injected into all player requests
-// for maximum reliability (authenticated requests skip bot checks entirely).
+// Strategy:
+//   1. Try iOS client first — if it returns hlsManifestUrl, redirect to it (HLS URLs
+//      are NOT IP-locked; Eclipse/AVPlayer handles HLS natively on the device).
+//   2. If no HLS URL available (iOS gave adaptiveFormats OR iOS failed entirely):
+//      proxy the audio through the worker using ANDROID_MUSIC client.
+//      CRITICAL: adaptiveFormats URLs from iOS/VR are IP-locked to the Cloudflare
+//      datacenter IP that requested them. A 302 redirect to those URLs will 403 on
+//      the device. We MUST proxy them through the worker, exactly like /download does.
+//   3. Proxied streams support Range requests so seeking works in Eclipse.
 async function handleStream(trackId, incomingRequest, env, userToken) {
-  const oauthToken = env?.YTM_OAUTH_TOKEN || null;
 
-  // ── Step 1: TVHTML5 (primary for server/datacenter IPs) ──────────────────
-  let tvData = null;
-  try {
-    tvData = await fetchPlayerDataTVHTML5(trackId, oauthToken);
-    const tvBest = pickBestAudio(tvData?.streamingData);
-    if (tvBest) {
-      console.log(LOG_PREFIX, `TVHTML5 stream success for ${trackId}`);
-      return new Response(null, {
-        status: 302,
-        headers: {
-          'location': tvBest.url,
-          'access-control-allow-origin': '*',
-          'cache-control': 'no-store',
-        },
-      });
-    }
-  } catch (tvErr) {
-    console.log(LOG_PREFIX, `TVHTML5 failed for ${trackId}: ${tvErr.message} — trying iOS`);
-  }
-
-  // ── Step 2: iOS client (gives hlsManifestUrl) ────────────────────────────
+  // ── Step 1: iOS → try to get hlsManifestUrl (safe device-side redirect) ──
   let iosData = null;
   try {
     iosData = await fetchPlayerData(trackId, env, userToken);
-    const sd = iosData?.streamingData;
-    if (sd?.hlsManifestUrl) {
-      console.log(LOG_PREFIX, `iOS HLS stream success for ${trackId}`);
+    const hlsUrl = iosData?.streamingData?.hlsManifestUrl;
+    if (hlsUrl) {
+      console.log(LOG_PREFIX, `iOS HLS stream for ${trackId}`);
       return new Response(null, {
         status: 302,
         headers: {
-          'location': sd.hlsManifestUrl,
+          'location': hlsUrl,
           'access-control-allow-origin': '*',
           'cache-control': 'no-store',
         },
       });
     }
-    // iOS OK but no HLS URL — try adaptive formats from the iOS response
-    const iosBest = pickBestAudio(sd);
-    if (iosBest) {
-      console.log(LOG_PREFIX, `iOS adaptive stream success for ${trackId}`);
-      return new Response(null, {
-        status: 302,
-        headers: {
-          'location': iosBest.url,
-          'access-control-allow-origin': '*',
-          'cache-control': 'no-store',
-        },
-      });
-    }
+    // iOS succeeded but returned adaptiveFormats only — do NOT redirect, fall to proxy
+    console.log(LOG_PREFIX, `iOS returned no HLS for ${trackId} — proxying via Android client`);
   } catch (iosErr) {
-    console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message} — trying AndroidVR`);
+    console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message} — proxying via Android client`);
   }
 
-  // ── Step 3: AndroidVR (last resort) ──────────────────────────────────────
+  // ── Step 2: Proxy through worker using ANDROID_MUSIC client ──────────────
+  // ANDROID_MUSIC adaptive URLs work correctly when fetched from the same
+  // Cloudflare IP that requested them (the worker proxies the bytes to Eclipse).
+  // This is identical to how /download works and is the correct pattern for
+  // any non-HLS stream served from a server-side worker.
+  try {
+    const androidData = await fetchPlayerDataAndroid(trackId);
+    const sd = androidData?.streamingData;
+    if (!sd) throw new Error('no streamingData from Android client');
+
+    const best = pickBestAudio(sd);
+    if (!best) throw new Error('no audio format from Android client');
+
+    const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
+    const reqHeaders = {
+      'User-Agent': ANDROID_MUSIC_UA,
+      'Accept': '*/*',
+      'Origin': 'https://music.youtube.com',
+      'Referer': 'https://music.youtube.com/',
+    };
+    const range = incomingRequest.headers.get('range');
+    if (range) reqHeaders['Range'] = range;
+
+    const upstream = await fetch(cdnUrl, { headers: reqHeaders });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      throw new Error(`CDN ${upstream.status}`);
+    }
+
+    const upstreamCT = upstream.headers.get('content-type') || '';
+    if (!upstreamCT.includes('audio') && !upstreamCT.includes('octet-stream') && !upstreamCT.includes('video')) {
+      throw new Error(`CDN returned non-audio content-type: ${upstreamCT}`);
+    }
+
+    console.log(LOG_PREFIX, `Android proxied stream for ${trackId} (${upstream.status})`);
+
+    const resHeaders = {
+      'content-type': 'audio/mp4',
+      'access-control-allow-origin': '*',
+      'cache-control': 'no-store',
+    };
+    const contentLength = best.contentLength || upstream.headers.get('content-length');
+    if (contentLength) resHeaders['content-length'] = String(contentLength);
+    if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
+    if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
+
+    return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+
+  } catch (androidErr) {
+    console.log(LOG_PREFIX, `Android proxy failed for ${trackId}: ${androidErr.message}`);
+  }
+
+  // ── Step 3: Last resort — AndroidVR proxy ────────────────────────────────
   try {
     const vrData = await fetchPlayerDataAndroidVR(trackId);
-    const vrBest = pickBestAudio(vrData?.streamingData);
-    if (vrBest) {
-      console.log(LOG_PREFIX, `AndroidVR stream success for ${trackId}`);
-      return new Response(null, {
-        status: 302,
-        headers: {
-          'location': vrBest.url,
-          'access-control-allow-origin': '*',
-          'cache-control': 'no-store',
-        },
-      });
-    }
+    const best = pickBestAudio(vrData?.streamingData);
+    if (!best) throw new Error('no audio format from VR client');
+
+    const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
+    const reqHeaders = {
+      'User-Agent': ANDROID_VR_UA,
+      'Accept': '*/*',
+      'Origin': 'https://www.youtube.com',
+    };
+    const range = incomingRequest.headers.get('range');
+    if (range) reqHeaders['Range'] = range;
+
+    const upstream = await fetch(cdnUrl, { headers: reqHeaders });
+    if (!upstream.ok && upstream.status !== 206) throw new Error(`VR CDN ${upstream.status}`);
+
+    console.log(LOG_PREFIX, `AndroidVR proxied stream for ${trackId} (${upstream.status})`);
+
+    const resHeaders = {
+      'content-type': 'audio/mp4',
+      'access-control-allow-origin': '*',
+      'cache-control': 'no-store',
+    };
+    const contentLength = best.contentLength || upstream.headers.get('content-length');
+    if (contentLength) resHeaders['content-length'] = String(contentLength);
+    if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
+    if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
+
+    return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+
   } catch (vrErr) {
-    console.log(LOG_PREFIX, `AndroidVR fallback also failed for ${trackId}: ${vrErr.message}`);
+    console.log(LOG_PREFIX, `VR proxy also failed for ${trackId}: ${vrErr.message}`);
   }
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
@@ -913,7 +904,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.1.0', description:v.description,
+    id:v.id, name:v.name, version:'2.0.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1109,7 +1100,7 @@ export default {
         if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
         return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
       }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'2.1.0',ts:new Date().toISOString()});
+      if (pathname==='/health') return jsonRes({status:'ok',version:'2.0.0',ts:new Date().toISOString()});
 
       const tp=parseTokenPath(pathname);
       if (tp) {
