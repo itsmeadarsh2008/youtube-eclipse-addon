@@ -1,5 +1,5 @@
-// ─── YouTube hiut Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.1.0
+// ─── YouTube Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
+// author: ricky | version: 2.2.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 // YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
@@ -37,26 +37,41 @@ const ANDROID_VR_CLIENT = {
 };
 const ANDROID_VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US) gzip';
 
-// TVHTML5_SIMPLY_EMBEDDED_PLAYER — best for server-side extraction from Cloudflare IPs.
-// YouTube whitelists this client (used for embedded iframes on 3rd-party sites).
-// Returns hlsManifestUrl reliably without IP-based bot detection.
-const TVHTML5_CLIENT = {
-  clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-  clientVersion: '2.0',
+// ── MWEB client — PRIMARY server-side streaming client (replaces dead TVHTML5)
+// Mobile web is significantly harder for YouTube to block from datacenter IPs
+// than the TVHTML5_SIMPLY_EMBEDDED_PLAYER client which now returns
+// "YouTube is no longer supported in this application or device."
+// Returns hlsManifestUrl reliably and has lower bot-detection risk.
+//
+// Secrets to set:
+//   wrangler secret put YT_PO_TOKEN       (from music.youtube.com DevTools → Network → v1/player → serviceIntegrityDimensions.poToken)
+//   wrangler secret put YT_VISITOR_DATA   (from same request → context.client.visitorData)
+//   wrangler secret put YT_COOKIE         (optional — __Secure-3PSID + SAPISID from youtube.com cookies, fixes Android "Please sign in")
+const MWEB_CLIENT = {
+  clientName: 'MWEB',
+  clientVersion: '2.20260530.07.00',
   hl: 'en',
   gl: 'US',
 };
-// The embed origin tricks YouTube into treating this as a legitimate embedded player
-const TVHTML5_EMBED_URL = 'https://www.youtube.com/embed/';
+const MWEB_UA = 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
 
-// WEB_EMBEDDED_PLAYER — secondary web client for server-side use
-// Lower bot-detection risk than mobile clients from datacenter IPs
+// WEB_CREATOR — secondary client, less blocked than TVHTML5 from datacenter IPs
+const WEB_CREATOR_CLIENT = {
+  clientName: 'WEB_CREATOR',
+  clientVersion: '1.20260530.01.00',
+  clientScreen: 'EMBED',
+  hl: 'en',
+  gl: 'US',
+};
+
+// WEB_EMBEDDED_PLAYER — tertiary web client for server-side use
 const WEB_EMBEDDED_CLIENT = {
   clientName: 'WEB_EMBEDDED_PLAYER',
   clientVersion: '2.20260530.01.00',
   hl: 'en',
   gl: 'US',
 };
+
 const SEARCH_PARAMS = {
   songs:     'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D',
   videos:    'EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D',
@@ -83,9 +98,16 @@ const IOS_UA           = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS
 //   3. Copy "serviceIntegrityDimensions.poToken"  → set as YT_PO_TOKEN secret
 //   4. Copy "context.client.visitorData"           → set as YT_VISITOR_DATA secret
 //
+// How to get your cookie (fixes Android "Please sign in"):
+//   1. Open youtube.com in Chrome → DevTools → Application → Cookies → youtube.com
+//   2. Copy the value of __Secure-3PSID and SAPISID
+//   3. Format as: "__Secure-3PSID=VALUE; SAPISID=VALUE"
+//   4. wrangler secret put YT_COOKIE
+//
 // Deploy secrets:
 //   wrangler secret put YT_PO_TOKEN
 //   wrangler secret put YT_VISITOR_DATA
+//   wrangler secret put YT_COOKIE        (optional but recommended)
 //
 // Tokens expire after a few hours. Re-run the steps above to rotate them.
 // For fully automated rotation, deploy iv-org/youtube-trusted-session-generator on
@@ -599,7 +621,6 @@ async function fetchPlayerData(trackId, env, userToken) {
   if (data?.playabilityStatus?.status!=='OK') {
     const reason = data?.playabilityStatus?.reason || '';
     const status = data?.playabilityStatus?.status || '';
-    // Only wipe visitorData on definitive bot/auth challenges, not transient errors
     const hardBlock = ['BOT_CHALLENGE', 'LOGIN_REQUIRED', 'UNPLAYABLE'].includes(status) ||
                       reason.toLowerCase().includes('bot') ||
                       reason.toLowerCase().includes('sign in');
@@ -607,24 +628,29 @@ async function fetchPlayerData(trackId, env, userToken) {
       const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
       upstashCmd(env, 'DEL', key);
     }
-    throw new Error(`${LOG_PREFIX} Blocked: ${reason || status || 'unknown'}`);
+    throw new Error(`${LOG_PREFIX} iOS blocked: ${reason || status || 'unknown'}`);
   }
   return data;
 }
 
 // Android Music client — for /download
-// ANDROID_MUSIC adaptiveFormats URLs are directly fetchable server-side;
-// no CDN signature mismatch, no &alr= or &cpn= requirements.
 async function fetchPlayerDataAndroid(trackId, env) {
+  const cookie = env?.YT_COOKIE || '';
   const baseBody = {
     context:{ client: ANDROID_MUSIC_CLIENT },
     videoId: trackId,
     contentCheckOk: true,
     racyCheckOk: true,
   };
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': ANDROID_MUSIC_UA,
+    'X-Goog-Api-Format-Version': '2',
+  };
+  if (cookie) headers['Cookie'] = cookie;
   const resp=await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`,{
     method:'POST',
-    headers:{ 'Content-Type':'application/json', 'User-Agent': ANDROID_MUSIC_UA, 'X-Goog-Api-Format-Version': '2' },
+    headers,
     body:JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Android player HTTP ${resp.status}`);
@@ -635,15 +661,13 @@ async function fetchPlayerDataAndroid(trackId, env) {
   return data;
 }
 
-
-// TVHTML5_SIMPLY_EMBEDDED_PLAYER — primary server-side client
-// The `embedUrl` context field is required; without it YouTube rejects the request.
-// Returns hlsManifestUrl reliably from Cloudflare datacenter IPs.
-async function fetchPlayerDataTV(trackId, env) {
+// MWEB client — PRIMARY streaming client (replaces dead TVHTML5)
+// Mobile web is far less aggressively blocked from Cloudflare datacenter IPs.
+// Returns hlsManifestUrl. PO token injected automatically if YT_PO_TOKEN is set.
+async function fetchPlayerDataMWeb(trackId, env) {
   const baseBody = {
     context: {
-      client: TVHTML5_CLIENT,
-      thirdParty: { embedUrl: TVHTML5_EMBED_URL + trackId },
+      client: MWEB_CLIENT,
     },
     videoId: trackId,
     contentCheckOk: true,
@@ -653,21 +677,52 @@ async function fetchPlayerDataTV(trackId, env) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1',
-      'Origin': 'https://www.youtube.com',
-      'Referer': 'https://www.youtube.com/',
+      'User-Agent': MWEB_UA,
+      'Origin': 'https://m.youtube.com',
+      'Referer': 'https://m.youtube.com/',
+      'X-Youtube-Client-Name': '2',
+      'X-Youtube-Client-Version': MWEB_CLIENT.clientVersion,
     },
     body: JSON.stringify(await withPoToken(baseBody, env)),
   });
-  if (!resp.ok) throw new Error(`${LOG_PREFIX} TV player HTTP ${resp.status}`);
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} MWEB player HTTP ${resp.status}`);
   const data = await resp.json();
   if (data?.playabilityStatus?.status !== 'OK') {
-    throw new Error(`${LOG_PREFIX} TV blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
+    throw new Error(`${LOG_PREFIX} MWEB blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
   }
   return data;
 }
 
-// WEB_EMBEDDED_PLAYER — secondary server-side client
+// WEB_CREATOR client — secondary streaming client
+async function fetchPlayerDataWebCreator(trackId, env) {
+  const baseBody = {
+    context: {
+      client: WEB_CREATOR_CLIENT,
+      thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` },
+    },
+    videoId: trackId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
+  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      'Origin': 'https://www.youtube.com',
+      'Referer': `https://www.youtube.com/embed/${trackId}`,
+    },
+    body: JSON.stringify(await withPoToken(baseBody, env)),
+  });
+  if (!resp.ok) throw new Error(`${LOG_PREFIX} WebCreator player HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (data?.playabilityStatus?.status !== 'OK') {
+    throw new Error(`${LOG_PREFIX} WebCreator blocked: ${data?.playabilityStatus?.reason || data?.playabilityStatus?.status || 'unknown'}`);
+  }
+  return data;
+}
+
+// WEB_EMBEDDED_PLAYER — tertiary web client
 async function fetchPlayerDataWebEmbedded(trackId, env) {
   const baseBody = {
     context: {
@@ -697,7 +752,6 @@ async function fetchPlayerDataWebEmbedded(trackId, env) {
 }
 
 // Android VR client player fetch — returns adaptiveFormats with direct URLs
-// Used as fallback in /stream when iOS hlsManifestUrl is unavailable
 async function fetchPlayerDataAndroidVR(trackId, env) {
   const baseBody = {
     context: { client: ANDROID_VR_CLIENT },
@@ -721,6 +775,7 @@ async function fetchPlayerDataAndroidVR(trackId, env) {
   }
   return data;
 }
+
 function pickBestAudio(sd) {
   return (sd?.adaptiveFormats||[])
     .filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.url)
@@ -729,18 +784,17 @@ function pickBestAudio(sd) {
 
 // /stream/{id}
 //
-// Cascade strategy — designed for Cloudflare datacenter IPs where mobile clients
-// get bot-blocked. TVHTML5_SIMPLY_EMBEDDED_PLAYER is whitelisted by YouTube for
-// embedded iframe use and bypasses IP-based bot detection reliably.
+// Cascade strategy — TVHTML5 is dead from Cloudflare IPs (returns "no longer supported").
+// New cascade uses clients that are harder to bot-detect from datacenter IPs:
 //
-// HLS redirect (302) is safe for device-side playback — HLS URLs are NOT IP-locked.
-// adaptiveFormats URLs ARE IP-locked to the requesting IP, so they must be proxied,
-// never 302-redirected to the device.
+//  1. MWEB          → hlsManifestUrl → 302 redirect  (primary: mobile web, lowest block rate)
+//  2. WEB_CREATOR   → hlsManifestUrl → 302, else proxy adaptiveFormats
+//  3. iOS           → hlsManifestUrl → 302 redirect
+//  4. WebEmbedded   → hlsManifestUrl → 302, else proxy adaptiveFormats
+//  5. Android VR    → proxy adaptiveFormats           (last resort)
 //
-//  1. TVHTML5  → hlsManifestUrl → 302 redirect  (best: bypasses bot detection)
-//  2. iOS      → hlsManifestUrl → 302 redirect  (good: if TV client is blocked)
-//  3. WebEmbedded → hlsManifestUrl → 302, else proxy adaptiveFormats
-//  4. Android Music → proxy adaptiveFormats     (last resort)
+// HLS redirect (302) is safe — HLS URLs are NOT IP-locked.
+// adaptiveFormats URLs ARE IP-locked and must be proxied, never 302-redirected.
 async function handleStream(trackId, incomingRequest, env, userToken) {
 
   // Helper: proxy an adaptiveFormats URL through the worker (range-aware)
@@ -767,30 +821,50 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
   }
 
-  // ── Step 1: TVHTML5_SIMPLY_EMBEDDED_PLAYER → hlsManifestUrl ─────────────
-  // This client is whitelisted by YouTube for embedded use and is the most
-  // reliable client from Cloudflare datacenter IPs. Returns hlsManifestUrl.
+  // ── Step 1: MWEB → hlsManifestUrl ────────────────────────────────────────
+  // Mobile web client — primary replacement for dead TVHTML5.
+  // Lower bot-detection risk from datacenter IPs. Returns hlsManifestUrl.
   try {
-    const tvData = await fetchPlayerDataTV(trackId, env);
-    const hlsUrl = tvData?.streamingData?.hlsManifestUrl;
+    const mwebData = await fetchPlayerDataMWeb(trackId, env);
+    const hlsUrl = mwebData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
-      console.log(LOG_PREFIX, `TV HLS stream for ${trackId}`);
+      console.log(LOG_PREFIX, `MWEB HLS stream for ${trackId}`);
       return new Response(null, {
         status: 302,
         headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
       });
     }
-    // TV client responded OK but no HLS — try proxying its adaptiveFormats
-    const best = pickBestAudio(tvData?.streamingData);
+    // MWEB responded OK but no HLS — try proxying adaptiveFormats
+    const best = pickBestAudio(mwebData?.streamingData);
     if (best) {
-      console.log(LOG_PREFIX, `TV adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1', 'https://www.youtube.com');
+      console.log(LOG_PREFIX, `MWEB adaptive proxy for ${trackId}`);
+      return await proxyAdaptiveUrl(best, MWEB_UA, 'https://m.youtube.com');
     }
-  } catch (tvErr) {
-    console.log(LOG_PREFIX, `TV client failed for ${trackId}: ${tvErr.message}`);
+  } catch (mwebErr) {
+    console.log(LOG_PREFIX, `MWEB failed for ${trackId}: ${mwebErr.message}`);
   }
 
-  // ── Step 2: iOS → hlsManifestUrl ─────────────────────────────────────────
+  // ── Step 2: WEB_CREATOR → hlsManifestUrl or proxy ────────────────────────
+  try {
+    const creatorData = await fetchPlayerDataWebCreator(trackId, env);
+    const hlsUrl = creatorData?.streamingData?.hlsManifestUrl;
+    if (hlsUrl) {
+      console.log(LOG_PREFIX, `WebCreator HLS stream for ${trackId}`);
+      return new Response(null, {
+        status: 302,
+        headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
+      });
+    }
+    const best = pickBestAudio(creatorData?.streamingData);
+    if (best) {
+      console.log(LOG_PREFIX, `WebCreator adaptive proxy for ${trackId}`);
+      return await proxyAdaptiveUrl(best, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36', 'https://www.youtube.com');
+    }
+  } catch (creatorErr) {
+    console.log(LOG_PREFIX, `WebCreator failed for ${trackId}: ${creatorErr.message}`);
+  }
+
+  // ── Step 3: iOS → hlsManifestUrl ─────────────────────────────────────────
   try {
     const iosData = await fetchPlayerData(trackId, env, userToken);
     const hlsUrl = iosData?.streamingData?.hlsManifestUrl;
@@ -806,7 +880,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message}`);
   }
 
-  // ── Step 3: WEB_EMBEDDED_PLAYER → HLS or proxy ───────────────────────────
+  // ── Step 4: WEB_EMBEDDED_PLAYER → HLS or proxy ───────────────────────────
   try {
     const webData = await fetchPlayerDataWebEmbedded(trackId, env);
     const hlsUrl = webData?.streamingData?.hlsManifestUrl;
@@ -826,17 +900,17 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     console.log(LOG_PREFIX, `WebEmbedded failed for ${trackId}: ${webErr.message}`);
   }
 
-  // ── Step 4: Android Music proxy — last resort ─────────────────────────────
+  // ── Step 5: Android VR proxy — last resort ────────────────────────────────
   try {
-    const androidData = await fetchPlayerDataAndroid(trackId, env);
-    const best = pickBestAudio(androidData?.streamingData);
+    const vrData = await fetchPlayerDataAndroidVR(trackId, env);
+    const best = pickBestAudio(vrData?.streamingData);
     if (best) {
-      console.log(LOG_PREFIX, `Android adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, ANDROID_MUSIC_UA, 'https://music.youtube.com');
+      console.log(LOG_PREFIX, `AndroidVR adaptive proxy for ${trackId}`);
+      return await proxyAdaptiveUrl(best, ANDROID_VR_UA, 'https://www.youtube.com');
     }
-    throw new Error('no audio format from Android client');
-  } catch (androidErr) {
-    console.log(LOG_PREFIX, `Android failed for ${trackId}: ${androidErr.message}`);
+    throw new Error('no audio format from AndroidVR client');
+  } catch (vrErr) {
+    console.log(LOG_PREFIX, `AndroidVR failed for ${trackId}: ${vrErr.message}`);
   }
 
   throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
@@ -847,7 +921,6 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
 // Uses the Android Music client whose CDN URLs are directly fetchable server-side.
 // Validates that the upstream response is actually audio before streaming to Eclipse.
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
-  // Fetch player data with Android client (URLs work without CDN header tricks)
   const data = await fetchPlayerDataAndroid(trackId, env);
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
@@ -855,7 +928,6 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
   const best = pickBestAudio(sd);
   if (!best) throw new Error(`${LOG_PREFIX} No downloadable audio for ${trackId}`);
 
-  // Append &alr=yes which tells YouTube CDN this is an allowed range request
   const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
 
   const reqHeaders = {
@@ -865,12 +937,12 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
     'Origin':          'https://music.youtube.com',
     'Referer':         'https://music.youtube.com/',
   };
+  if (env?.YT_COOKIE) reqHeaders['Cookie'] = env.YT_COOKIE;
   const range = incomingRequest.headers.get('range');
   if (range) reqHeaders['Range'] = range;
 
   const upstream = await fetch(cdnUrl, { headers: reqHeaders });
 
-  // Guard: if YouTube returned an error body (HTML/JSON ~30KB) instead of audio, fail loudly
   const upstreamCT = upstream.headers.get('content-type') || '';
   if (!upstream.ok && upstream.status !== 206) {
     throw new Error(`${LOG_PREFIX} CDN ${upstream.status} for ${trackId}`);
@@ -1054,7 +1126,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.1.0', description:v.description,
+    id:v.id, name:v.name, version:'2.2.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1174,7 +1246,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.1.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.2.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
