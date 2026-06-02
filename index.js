@@ -1,5 +1,5 @@
 // ─── YouTube hiut Music — Eclipse Addon (Cloudflare Workers) ─────────────────────
-// author: ricky | version: 2.0.0
+// author: ricky | version: 2.1.0
 const LOG_PREFIX  = '[YTMusic]';
 const YTM_BASE    = 'https://music.youtube.com';
 // YTM_API_KEY: set this as a Cloudflare Workers secret (YTM_API_KEY) to avoid exposing it.
@@ -71,6 +71,78 @@ const SEARCH_HEADERS = {
 };
 const ANDROID_MUSIC_UA = 'com.google.android.apps.youtube.music/7.27.0 (Linux; U; Android 14; en_US) gzip';
 const IOS_UA           = 'com.google.ios.youtube/20.12.4 (iPhone17,3; U; CPU iOS 18_4_1 like Mac OS X)';
+
+// ─── PO Token helpers ─────────────────────────────────────────────────────────
+//
+// PO tokens authenticate the player request to YouTube, bypassing bot/sign-in errors.
+// They cannot be generated server-side (require a real browser via BotGuard/DroidGuard).
+//
+// How to get your tokens:
+//   1. Open music.youtube.com in Chrome → DevTools → Network tab → filter: "v1/player"
+//   2. Play any song — click the player request → Payload tab
+//   3. Copy "serviceIntegrityDimensions.poToken"  → set as YT_PO_TOKEN secret
+//   4. Copy "context.client.visitorData"           → set as YT_VISITOR_DATA secret
+//
+// Deploy secrets:
+//   wrangler secret put YT_PO_TOKEN
+//   wrangler secret put YT_VISITOR_DATA
+//
+// Tokens expire after a few hours. Re-run the steps above to rotate them.
+// For fully automated rotation, deploy iv-org/youtube-trusted-session-generator on
+// Oracle Cloud Free Tier and point YT_PO_TOKEN_GENERATOR_URL at it.
+
+async function getPoToken(env) {
+  // 1. Try Upstash cache (populated by auto-rotation if configured)
+  const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
+  if (cached && typeof cached === 'string' && cached.length > 4) return cached;
+  // 2. Fall back to static secret
+  return env?.YT_PO_TOKEN || null;
+}
+
+async function getPoVisitorData(env) {
+  const cached = await upstashCmd(env, 'GET', 'ytm:po_visitor_data');
+  if (cached && typeof cached === 'string' && cached.length > 4) return cached;
+  return env?.YT_VISITOR_DATA || null;
+}
+
+// Injects poToken + optional visitorData into any player request body.
+// Safe to call even when no token is configured — returns body unchanged.
+async function withPoToken(body, env) {
+  const poToken = await getPoToken(env);
+  if (!poToken) return body;
+  const enriched = { ...body };
+  enriched.serviceIntegrityDimensions = { poToken };
+  const poVisitorData = await getPoVisitorData(env);
+  if (poVisitorData && enriched.context?.client) {
+    enriched.context = {
+      ...enriched.context,
+      client: { ...enriched.context.client, visitorData: poVisitorData },
+    };
+  }
+  return enriched;
+}
+
+// Optional: auto-rotate PO tokens from a self-hosted generator (e.g. Oracle Cloud).
+// Set YT_PO_TOKEN_GENERATOR_URL to enable. Generator must return:
+//   { po_token: "...", visitor_data: "..." }
+async function tryRefreshPoToken(env) {
+  const generatorUrl = env?.YT_PO_TOKEN_GENERATOR_URL;
+  if (!generatorUrl) return;
+  try {
+    const res = await fetch(generatorUrl, { cf: { cacheTtl: 0 } });
+    if (!res.ok) return;
+    const { po_token, visitor_data } = await res.json();
+    if (po_token) {
+      await upstashCmd(env, 'SET', 'ytm:po_token', po_token, 'EX', 21600);
+      console.log(LOG_PREFIX, 'PO token refreshed from generator');
+    }
+    if (visitor_data) {
+      await upstashCmd(env, 'SET', 'ytm:po_visitor_data', visitor_data, 'EX', 21600);
+    }
+  } catch (e) {
+    console.log(LOG_PREFIX, 'PO token auto-refresh failed:', e.message);
+  }
+}
 
 async function upstashCmd(env, ...args) {
   const url = env?.UPSTASH_REDIS_REST_URL, token = env?.UPSTASH_REDIS_REST_TOKEN;
@@ -511,10 +583,16 @@ async function handleSearch(query, env, userToken, mode) {
 // iOS client — for /stream (gives hlsManifestUrl)
 async function fetchPlayerData(trackId, env, userToken) {
   const visitorData=await getVisitorData(env,userToken);
+  const baseBody = {
+    context:{ client:buildIosContext(visitorData) },
+    videoId:trackId,
+    contentCheckOk:true,
+    racyCheckOk:true,
+  };
   const resp=await fetch(`${YTM_BASE}/youtubei/v1/player?prettyPrint=false`,{
     method:'POST',
     headers:{ 'Content-Type':'application/json', 'User-Agent': IOS_UA },
-    body:JSON.stringify({ context:{client:buildIosContext(visitorData)}, videoId:trackId, contentCheckOk:true, racyCheckOk:true }),
+    body:JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Player HTTP ${resp.status}`);
   const data=await resp.json();
@@ -537,16 +615,17 @@ async function fetchPlayerData(trackId, env, userToken) {
 // Android Music client — for /download
 // ANDROID_MUSIC adaptiveFormats URLs are directly fetchable server-side;
 // no CDN signature mismatch, no &alr= or &cpn= requirements.
-async function fetchPlayerDataAndroid(trackId) {
+async function fetchPlayerDataAndroid(trackId, env) {
+  const baseBody = {
+    context:{ client: ANDROID_MUSIC_CLIENT },
+    videoId: trackId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
   const resp=await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`,{
     method:'POST',
     headers:{ 'Content-Type':'application/json', 'User-Agent': ANDROID_MUSIC_UA, 'X-Goog-Api-Format-Version': '2' },
-    body:JSON.stringify({
-      context:{ client: ANDROID_MUSIC_CLIENT },
-      videoId: trackId,
-      contentCheckOk: true,
-      racyCheckOk: true,
-    }),
+    body:JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} Android player HTTP ${resp.status}`);
   const data=await resp.json();
@@ -560,7 +639,16 @@ async function fetchPlayerDataAndroid(trackId) {
 // TVHTML5_SIMPLY_EMBEDDED_PLAYER — primary server-side client
 // The `embedUrl` context field is required; without it YouTube rejects the request.
 // Returns hlsManifestUrl reliably from Cloudflare datacenter IPs.
-async function fetchPlayerDataTV(trackId) {
+async function fetchPlayerDataTV(trackId, env) {
+  const baseBody = {
+    context: {
+      client: TVHTML5_CLIENT,
+      thirdParty: { embedUrl: TVHTML5_EMBED_URL + trackId },
+    },
+    videoId: trackId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -569,15 +657,7 @@ async function fetchPlayerDataTV(trackId) {
       'Origin': 'https://www.youtube.com',
       'Referer': 'https://www.youtube.com/',
     },
-    body: JSON.stringify({
-      context: {
-        client: TVHTML5_CLIENT,
-        thirdParty: { embedUrl: TVHTML5_EMBED_URL + trackId },
-      },
-      videoId: trackId,
-      contentCheckOk: true,
-      racyCheckOk: true,
-    }),
+    body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} TV player HTTP ${resp.status}`);
   const data = await resp.json();
@@ -588,7 +668,16 @@ async function fetchPlayerDataTV(trackId) {
 }
 
 // WEB_EMBEDDED_PLAYER — secondary server-side client
-async function fetchPlayerDataWebEmbedded(trackId) {
+async function fetchPlayerDataWebEmbedded(trackId, env) {
+  const baseBody = {
+    context: {
+      client: WEB_EMBEDDED_CLIENT,
+      thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` },
+    },
+    videoId: trackId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -597,15 +686,7 @@ async function fetchPlayerDataWebEmbedded(trackId) {
       'Origin': 'https://www.youtube.com',
       'Referer': `https://www.youtube.com/embed/${trackId}`,
     },
-    body: JSON.stringify({
-      context: {
-        client: WEB_EMBEDDED_CLIENT,
-        thirdParty: { embedUrl: `https://www.youtube.com/embed/${trackId}` },
-      },
-      videoId: trackId,
-      contentCheckOk: true,
-      racyCheckOk: true,
-    }),
+    body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} WebEmbedded player HTTP ${resp.status}`);
   const data = await resp.json();
@@ -617,7 +698,13 @@ async function fetchPlayerDataWebEmbedded(trackId) {
 
 // Android VR client player fetch — returns adaptiveFormats with direct URLs
 // Used as fallback in /stream when iOS hlsManifestUrl is unavailable
-async function fetchPlayerDataAndroidVR(trackId) {
+async function fetchPlayerDataAndroidVR(trackId, env) {
+  const baseBody = {
+    context: { client: ANDROID_VR_CLIENT },
+    videoId: trackId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+  };
   const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -625,12 +712,7 @@ async function fetchPlayerDataAndroidVR(trackId) {
       'User-Agent': ANDROID_VR_UA,
       'X-Goog-Api-Format-Version': '2',
     },
-    body: JSON.stringify({
-      context: { client: ANDROID_VR_CLIENT },
-      videoId: trackId,
-      contentCheckOk: true,
-      racyCheckOk: true,
-    }),
+    body: JSON.stringify(await withPoToken(baseBody, env)),
   });
   if (!resp.ok) throw new Error(`${LOG_PREFIX} AndroidVR player HTTP ${resp.status}`);
   const data = await resp.json();
@@ -689,7 +771,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
   // This client is whitelisted by YouTube for embedded use and is the most
   // reliable client from Cloudflare datacenter IPs. Returns hlsManifestUrl.
   try {
-    const tvData = await fetchPlayerDataTV(trackId);
+    const tvData = await fetchPlayerDataTV(trackId, env);
     const hlsUrl = tvData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
       console.log(LOG_PREFIX, `TV HLS stream for ${trackId}`);
@@ -726,7 +808,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
 
   // ── Step 3: WEB_EMBEDDED_PLAYER → HLS or proxy ───────────────────────────
   try {
-    const webData = await fetchPlayerDataWebEmbedded(trackId);
+    const webData = await fetchPlayerDataWebEmbedded(trackId, env);
     const hlsUrl = webData?.streamingData?.hlsManifestUrl;
     if (hlsUrl) {
       console.log(LOG_PREFIX, `WebEmbedded HLS stream for ${trackId}`);
@@ -746,7 +828,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
 
   // ── Step 4: Android Music proxy — last resort ─────────────────────────────
   try {
-    const androidData = await fetchPlayerDataAndroid(trackId);
+    const androidData = await fetchPlayerDataAndroid(trackId, env);
     const best = pickBestAudio(androidData?.streamingData);
     if (best) {
       console.log(LOG_PREFIX, `Android adaptive proxy for ${trackId}`);
@@ -766,7 +848,7 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
 // Validates that the upstream response is actually audio before streaming to Eclipse.
 async function proxyDownload(trackId, incomingRequest, env, userToken) {
   // Fetch player data with Android client (URLs work without CDN header tricks)
-  const data = await fetchPlayerDataAndroid(trackId);
+  const data = await fetchPlayerDataAndroid(trackId, env);
   const sd = data.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
 
@@ -972,7 +1054,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.0.0', description:v.description,
+    id:v.id, name:v.name, version:'2.1.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','download','catalog'],
     types:['track','album','artist','playlist'],
@@ -1072,80 +1154,47 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URLs</button>
   <div class="box" id="genBox">
     <div class="blbl">Songs &amp; Videos (both) &mdash; paste into Eclipse</div>
-    <div class="burl" id="genUrl"></div>
-    <button class="bd" id="copyGenBtn" onclick="copyGen()">Copy Both URL</button>
+    <div class="burl" id="urlBoth"></div>
+    <div class="blbl">Songs only</div>
+    <div class="burl" id="urlSongs"></div>
+    <div class="blbl">Videos only</div>
+    <div class="burl" id="urlVideos"></div>
+    <button class="bg" onclick="copyUrl('both')">Copy Songs &amp; Videos URL</button>
+    <button class="bg" onclick="copyUrl('songs')">Copy Songs URL</button>
+    <button class="bg" onclick="copyUrl('videos')">Copy Videos URL</button>
   </div>
-  <div class="box" id="genBoxSongs">
-    <div class="blbl">Songs tab only &mdash; paste into Eclipse</div>
-    <div class="burl" id="genUrlSongs"></div>
-    <button class="bd" id="copyGenBtnSongs" onclick="copyGenSongs()">Copy Songs URL</button>
-  </div>
-  <div class="box" id="genBoxVideos">
-    <div class="blbl">Videos tab only &mdash; paste into Eclipse</div>
-    <div class="burl" id="genUrlVideos"></div>
-    <button class="bd" id="copyGenBtnVideos" onclick="copyGenVideos()">Copy Videos URL</button>
-  </div>
+  <input id="savedUrl" placeholder="Paste a saved URL here to copy it again" oninput="checkSaved()">
+  <button class="bd" id="reCopyBtn" disabled onclick="reCopy()">Copy Saved URL</button>
   <hr>
-  <h2>Refresh existing URL</h2>
-  <input type="text" id="existingUrl" placeholder="Paste your existing addon URL here">
-  <div class="hint">Keeps the same token &mdash; nothing to reinstall in Eclipse.</div>
-  <button class="bg" id="refBtn" onclick="doRefresh()">Refresh Existing URL</button>
-  <div class="box" id="refBox">
-    <div class="blbl">Refreshed &mdash; same URL still works in Eclipse</div>
-    <div class="burl" id="refUrl"></div>
-    <button class="bd" id="copyRefBtn" onclick="copyRef()">Copy URL</button>
-  </div>
-  <hr>
+  <h2>How to install</h2>
   <div class="steps">
-    <div class="step"><div class="sn">1</div><div class="st">Generate and copy any URL above</div></div>
-    <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>
-    <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>
-    <div class="step"><div class="sn">4</div><div class="st">Install all 3 as separate addons, or just the one you want</div></div>
+    <div class="step"><div class="sn">1</div><div class="st">Tap <b>Generate My Addon URLs</b> above</div></div>
+    <div class="step"><div class="sn">2</div><div class="st">Copy the URL for the tab you want</div></div>
+    <div class="step"><div class="sn">3</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Addons &rarr; Add Addon &rarr; paste the URL</div></div>
   </div>
-  <div class="warn">
-    /stream &rarr; iOS client, HLS manifest (AVPlayer live playback)<br>
-    /download &rarr; Android Music client, proxied AAC mp4 bytes<br>
-    content-type validated before streaming — no silent garbage files
-  </div>
+  <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse v1.9.0 &bull; by ricky &bull; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.1.0 &middot; Cloudflare Workers</footer>
 <script>
-var gu=null,guSongs=null,guVideos=null,ru=null;
+let tok=null,urls={};
+function base(){return location.origin;}
 function generate(){
-  var btn=document.getElementById('genBtn');btn.disabled=true;btn.textContent='Generating...';
-  fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
-    .then(function(r){return r.json()}).then(function(d){
-      if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Generate My Addon URLs';return;}
-      gu=d.manifestUrl;guSongs=d.manifestUrlSongs;guVideos=d.manifestUrlVideos;
-      document.getElementById('genUrl').textContent=gu;
-      document.getElementById('genUrlSongs').textContent=guSongs;
-      document.getElementById('genUrlVideos').textContent=guVideos;
-      document.getElementById('genBox').style.display='block';
-      document.getElementById('genBoxSongs').style.display='block';
-      document.getElementById('genBoxVideos').style.display='block';
-      btn.disabled=false;btn.textContent='Generate New URLs';
-    }).catch(function(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate My Addon URLs'});
+  tok=Array.from(crypto.getRandomValues(new Uint8Array(14)),b=>b.toString(16).padStart(2,'0')).join('');
+  urls={both:base()+'/u/'+tok+'/',songs:base()+'/u/'+tok+'/songs/',videos:base()+'/u/'+tok+'/videos/'};
+  document.getElementById('urlBoth').textContent=urls.both;
+  document.getElementById('urlSongs').textContent=urls.songs;
+  document.getElementById('urlVideos').textContent=urls.videos;
+  document.getElementById('genBox').style.display='block';
+  document.getElementById('genBtn').textContent='Regenerate URLs';
 }
-function copyGen(){if(gu)copyText(gu,document.getElementById('copyGenBtn'));}
-function copyGenSongs(){if(guSongs)copyText(guSongs,document.getElementById('copyGenBtnSongs'));}
-function copyGenVideos(){if(guVideos)copyText(guVideos,document.getElementById('copyGenBtnVideos'));}
-function doRefresh(){
-  var eu=document.getElementById('existingUrl').value.trim();
-  if(!eu){alert('Paste your existing addon URL first.');return;}
-  var btn=document.getElementById('refBtn');btn.disabled=true;btn.textContent='Refreshing...';
-  fetch('/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({existingUrl:eu})})
-    .then(function(r){return r.json()}).then(function(d){
-      if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Refresh Existing URL';return;}
-      ru=d.manifestUrl;document.getElementById('refUrl').textContent=ru;
-      document.getElementById('refBox').style.display='block';
-      btn.disabled=false;btn.textContent='Refresh Again';
-    }).catch(function(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Refresh Existing URL'});
+function copyUrl(type){navigator.clipboard.writeText(urls[type]);}
+function checkSaved(){
+  const v=document.getElementById('savedUrl').value.trim();
+  document.getElementById('reCopyBtn').disabled=!v;
 }
-function copyRef(){if(ru)copyText(ru,document.getElementById('copyRefBtn'));}
-function copyText(text,btn){
-  var o=btn.textContent;
-  if(navigator.clipboard){navigator.clipboard.writeText(text).then(function(){btn.textContent='Copied!';setTimeout(function(){btn.textContent=o},1500)});}
-  else{var ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;opacity:0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);btn.textContent='Copied!';setTimeout(function(){btn.textContent=o},1500);}
+function reCopy(){
+  const v=document.getElementById('savedUrl').value.trim();
+  if(v)navigator.clipboard.writeText(v);
 }
 </script>
 </body>
@@ -1154,43 +1203,52 @@ function copyText(text,btn){
 
 export default {
   async fetch(request, env) {
-    const url=new URL(request.url), pathname=url.pathname;
-    if (request.method==='OPTIONS') return new Response(null,{status:204,headers:{'access-control-allow-origin':'*','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'Content-Type, Range'}});
-    try {
-      if (pathname==='/') return htmlRes(buildPage());
-      if (pathname==='/generate'&&request.method==='POST') {
-        const token=generateToken();
-        return jsonRes({ token, manifestUrl:`${url.origin}/u/${token}/manifest.json`, manifestUrlSongs:`${url.origin}/u/${token}/songs/manifest.json`, manifestUrlVideos:`${url.origin}/u/${token}/videos/manifest.json` });
-      }
-      if (pathname==='/refresh'&&request.method==='POST') {
-        let body; try{body=await request.json();}catch{}
-        const m=String(body?.existingUrl||'').match(/[a-f0-9]{28}/);
-        if (!m) return jsonRes({error:'Paste your full addon URL — must contain a valid token'},400);
-        return jsonRes({token:m[0],manifestUrl:`${url.origin}/u/${m[0]}/manifest.json`,refreshed:true});
-      }
-      if (pathname==='/health') return jsonRes({status:'ok',version:'2.0.0',ts:new Date().toISOString()});
+    const url = new URL(request.url);
+    const path = url.pathname;
 
-      const tp=parseTokenPath(pathname);
-      if (tp) {
-        if (!isValidToken(tp.token)) return jsonRes({error:'Invalid token.'},400);
-        if (tp.rest.startsWith('/download/')) {
-          const id=lastSegment(tp.rest);
-          if (!id) return jsonRes({error:'Missing ID'},400);
-          return await proxyDownload(id,request,env,tp.token);
-        }
-        const r=await handleRoute(tp.rest,url,request,env,tp.token,tp.mode);
-        return r||jsonRes({error:'Not found',path:tp.rest},404);
-      }
-      if (pathname.startsWith('/download/')) {
-        const id=lastSegment(pathname);
-        if (!id) return jsonRes({error:'Missing ID'},400);
-        return await proxyDownload(id,request,env,null);
-      }
-      const base=await handleRoute(pathname,url,request,env,null,'both');
-      return base||jsonRes({error:'Not found'},404);
-    } catch(err) {
-      console.error(LOG_PREFIX,err);
-      return jsonRes({error:err.message||'Internal error'},500);
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'access-control-allow-origin':  '*',
+          'access-control-allow-methods': 'GET, POST, OPTIONS',
+          'access-control-allow-headers': 'Content-Type, Range',
+        },
+      });
     }
+
+    // Kick off a background PO token refresh on every request (non-blocking)
+    // Only runs if YT_PO_TOKEN_GENERATOR_URL is set AND Upstash is configured.
+    if (env?.YT_PO_TOKEN_GENERATOR_URL && env?.UPSTASH_REDIS_REST_URL) {
+      const cached = await upstashCmd(env, 'GET', 'ytm:po_token');
+      if (!cached) tryRefreshPoToken(env); // fire and forget
+    }
+
+    // ── Root: landing page
+    if (path === '/' || path === '') return htmlRes(buildPage());
+
+    // ── Token-scoped routes: /u/<token>/...
+    const parsed = parseTokenPath(path);
+    if (parsed) {
+      if (!isValidToken(parsed.token)) return jsonRes({ error: 'Invalid token' }, 400);
+      try {
+        const result = await handleRoute(parsed.rest, url, request, env, parsed.token, parsed.mode);
+        if (result) return result;
+      } catch (e) {
+        console.log(LOG_PREFIX, 'Route error:', e.message);
+        return jsonRes({ error: e.message }, 500);
+      }
+      return jsonRes({ error: 'Not found' }, 404);
+    }
+
+    // ── Bare routes (no token): /manifest, /search, /stream/..., etc.
+    try {
+      const result = await handleRoute(path, url, request, env, null, 'both');
+      if (result) return result;
+    } catch (e) {
+      console.log(LOG_PREFIX, 'Bare route error:', e.message);
+      return jsonRes({ error: e.message }, 500);
+    }
+
+    return jsonRes({ error: 'Not found' }, 404);
   },
 };
