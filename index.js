@@ -890,160 +890,83 @@ function mimeToExtension(mimeType) {
 
 // /stream/{id}
 //
-// Cascade strategy — TVHTML5 is dead from Cloudflare IPs (returns "no longer supported").
-// New cascade uses clients that are harder to bot-detect from datacenter IPs:
+// Returns the Eclipse-docs JSON contract: { url, format, quality, expiresAt }.
+// The adaptiveFormats CDN URLs from these clients are IP-locked to the worker,
+// so `url` points back at this addon's /download/{id} byte proxy (range-aware)
+// instead of leaking an unwritable googlevideo URL to the client.
 //
-//  1. MWEB          → hlsManifestUrl → 302 redirect  (primary: mobile web, lowest block rate)
-//  2. WEB_CREATOR   → hlsManifestUrl → 302, else proxy adaptiveFormats
-//  3. iOS           → hlsManifestUrl → 302 redirect
-//  4. WebEmbedded   → hlsManifestUrl → 302, else proxy adaptiveFormats
-//  5. VISIONOS      → proxy adaptiveFormats           (Metrolist default client, no PO token)
-//  6. Android VR    → proxy adaptiveFormats           (last resort)
-//
-// HLS redirect (302) is safe — HLS URLs are NOT IP-locked.
-// adaptiveFormats URLs ARE IP-locked and must be proxied, never 302-redirected.
+// Cascade order (skips clients that are dead without their required secrets):
+//  1. MWEB          → adaptive audio  (only with PO token)
+//  2. WEB_CREATOR   → adaptive audio  (only with signed-in cookie)
+//  3. iOS           → adaptive audio
+//  4. WebEmbedded   → adaptive audio
+//  5. VISIONOS      → adaptive audio  (Metrolist default client, no PO token)
+//  6. Android VR    → adaptive audio  (last resort)
 async function handleStream(trackId, incomingRequest, env, userToken) {
+  const reqUrl = new URL(incomingRequest.url);
+  const seg = reqUrl.pathname.split('/');
+  let base = reqUrl.origin;
+  if (seg[1] === 'u') base += '/u/' + seg[2];
 
-  // Helper: proxy an adaptiveFormats URL through the worker (range-aware)
-  async function proxyAdaptiveUrl(best, ua, origin) {
-    const cdnUrl = best.url.includes('?') ? best.url + '&alr=yes' : best.url + '?alr=yes';
-    const reqHeaders = { 'User-Agent': ua, 'Accept': '*/*', 'Origin': origin, 'Referer': origin + '/' };
-    const range = incomingRequest.headers.get('range');
-    if (range) reqHeaders['Range'] = range;
-    const upstream = await fetch(cdnUrl, { headers: reqHeaders });
-    if (!upstream.ok && upstream.status !== 206) throw new Error(`CDN ${upstream.status}`);
-    const ct = upstream.headers.get('content-type') || '';
-    if (!ct.includes('audio') && !ct.includes('octet-stream') && !ct.includes('video')) {
-      throw new Error(`CDN non-audio content-type: ${ct}`);
+  async function tryClient(key, label, fetchFn) {
+    try {
+      const data = await cachedPlayer(key, fetchFn);
+      const best = pickBestAudio(data?.streamingData);
+      if (best) {
+        console.log(LOG_PREFIX, `${label} audio for ${trackId}`);
+        return best;
+      }
+    } catch (e) {
+      console.log(LOG_PREFIX, `${label} failed for ${trackId}: ${e.message}`);
     }
-    const resHeaders = {
-      'content-type': mimeToContentType(best.mimeType),
-      'access-control-allow-origin': '*',
-      'cache-control': 'no-store',
-    };
-    const cl = best.contentLength || upstream.headers.get('content-length');
-    if (cl) resHeaders['content-length'] = String(cl);
-    if (upstream.headers.get('content-range')) resHeaders['content-range'] = upstream.headers.get('content-range');
-    if (upstream.headers.get('accept-ranges')) resHeaders['accept-ranges'] = upstream.headers.get('accept-ranges');
-    return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+    return null;
   }
 
-  // ── Step 1: MWEB → hlsManifestUrl ────────────────────────────────────────
-  // Mobile web client — primary replacement for dead TVHTML5. Requires a PO
-  // token; without one it is always bot-blocked, so skip the wasted attempt.
+  // ── Step 1: MWEB (requires PO token, else always bot-blocked) ───────────
+  let best = null;
   if (await getPoToken(env)) {
-    try {
-      const mwebData = await cachedPlayer(`player:MWEB:${trackId}`, () => fetchPlayerDataMWeb(trackId, env));
-      const hlsUrl = mwebData?.streamingData?.hlsManifestUrl;
-      if (hlsUrl) {
-        console.log(LOG_PREFIX, `MWEB HLS stream for ${trackId}`);
-        return new Response(null, {
-          status: 302,
-          headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
-        });
-      }
-      // MWEB responded OK but no HLS — try proxying adaptiveFormats
-      const best = pickBestAudio(mwebData?.streamingData);
-      if (best) {
-        console.log(LOG_PREFIX, `MWEB adaptive proxy for ${trackId}`);
-        return await proxyAdaptiveUrl(best, MWEB_UA, 'https://m.youtube.com');
-      }
-    } catch (mwebErr) {
-      console.log(LOG_PREFIX, `MWEB failed for ${trackId}: ${mwebErr.message}`);
-    }
+    best = await tryClient(`player:MWEB:${trackId}`, 'MWEB', () => fetchPlayerDataMWeb(trackId, env));
   } else {
     console.log(LOG_PREFIX, `MWEB skipped for ${trackId} (no PO token)`);
   }
 
-  // ── Step 2: WEB_CREATOR → hlsManifestUrl or proxy ────────────────────────
-  // loginRequired client per Metrolist — needs a signed-in cookie; skipped
-  // when none is configured.
-  if (env?.YT_COOKIE) {
-    try {
-      const creatorData = await cachedPlayer(`player:WEB_CREATOR:${trackId}`, () => fetchPlayerDataWebCreator(trackId, env));
-      const hlsUrl = creatorData?.streamingData?.hlsManifestUrl;
-      if (hlsUrl) {
-        console.log(LOG_PREFIX, `WebCreator HLS stream for ${trackId}`);
-        return new Response(null, {
-          status: 302,
-          headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
-        });
-      }
-      const best = pickBestAudio(creatorData?.streamingData);
-      if (best) {
-        console.log(LOG_PREFIX, `WebCreator adaptive proxy for ${trackId}`);
-        return await proxyAdaptiveUrl(best, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36', 'https://www.youtube.com');
-      }
-    } catch (creatorErr) {
-      console.log(LOG_PREFIX, `WebCreator failed for ${trackId}: ${creatorErr.message}`);
-    }
-  } else {
+  // ── Step 2: WEB_CREATOR (loginRequired — needs signed-in cookie) ────────
+  if (!best && env?.YT_COOKIE) {
+    best = await tryClient(`player:WEB_CREATOR:${trackId}`, 'WebCreator', () => fetchPlayerDataWebCreator(trackId, env));
+  } else if (!best) {
     console.log(LOG_PREFIX, `WebCreator skipped for ${trackId} (no cookie)`);
   }
 
-  // ── Step 3: iOS → hlsManifestUrl ─────────────────────────────────────────
-  try {
-    const iosData = await cachedPlayer(`player:IOS:${trackId}`, () => fetchPlayerData(trackId, env, userToken));
-    const hlsUrl = iosData?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) {
-      console.log(LOG_PREFIX, `iOS HLS stream for ${trackId}`);
-      return new Response(null, {
-        status: 302,
-        headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
-      });
-    }
-    console.log(LOG_PREFIX, `iOS no HLS for ${trackId} — trying WebEmbedded`);
-  } catch (iosErr) {
-    console.log(LOG_PREFIX, `iOS failed for ${trackId}: ${iosErr.message}`);
+  // ── Step 3: iOS ──────────────────────────────────────────────────────────
+  if (!best) {
+    best = await tryClient(`player:IOS:${trackId}`, 'iOS', () => fetchPlayerData(trackId, env, userToken));
   }
 
-  // ── Step 4: WEB_EMBEDDED_PLAYER → HLS or proxy ───────────────────────────
-  try {
-    const webData = await cachedPlayer(`player:WEB_EMBEDDED:${trackId}`, () => fetchPlayerDataWebEmbedded(trackId, env));
-    const hlsUrl = webData?.streamingData?.hlsManifestUrl;
-    if (hlsUrl) {
-      console.log(LOG_PREFIX, `WebEmbedded HLS stream for ${trackId}`);
-      return new Response(null, {
-        status: 302,
-        headers: { 'location': hlsUrl, 'access-control-allow-origin': '*', 'cache-control': 'no-store' },
-      });
-    }
-    const best = pickBestAudio(webData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `WebEmbedded adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36', 'https://www.youtube.com');
-    }
-  } catch (webErr) {
-    console.log(LOG_PREFIX, `WebEmbedded failed for ${trackId}: ${webErr.message}`);
+  // ── Step 4: WEB_EMBEDDED_PLAYER ──────────────────────────────────────────
+  if (!best) {
+    best = await tryClient(`player:WEB_EMBEDDED:${trackId}`, 'WebEmbedded', () => fetchPlayerDataWebEmbedded(trackId, env));
   }
 
-  // ── Step 5: VISIONOS proxy — Metrolist's default stream client ───────────
-  try {
-    const visionData = await cachedPlayer(`player:VISIONOS:${trackId}`, () => fetchPlayerDataVisionOS(trackId, env, userToken));
-    const best = pickBestAudio(visionData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `VISIONOS adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, VISIONOS_UA, YTM_BASE);
-    }
-    throw new Error('no audio format from VISIONOS client');
-  } catch (visionErr) {
-    console.log(LOG_PREFIX, `VISIONOS failed for ${trackId}: ${visionErr.message}`);
+  // ── Step 5: VISIONOS — Metrolist's default stream client ─────────────────
+  if (!best) {
+    best = await tryClient(`player:VISIONOS:${trackId}`, 'VISIONOS', () => fetchPlayerDataVisionOS(trackId, env, userToken));
   }
 
-  // ── Step 6: Android VR proxy — last resort ────────────────────────────────
-  try {
-    const vrData = await cachedPlayer(`player:ANDROID_VR:${trackId}`, () => fetchPlayerDataAndroidVR(trackId, env, userToken));
-    const best = pickBestAudio(vrData?.streamingData);
-    if (best) {
-      console.log(LOG_PREFIX, `AndroidVR adaptive proxy for ${trackId}`);
-      return await proxyAdaptiveUrl(best, ANDROID_VR_UA, YTM_BASE);
-    }
-    throw new Error('no audio format from AndroidVR client');
-  } catch (vrErr) {
-    console.log(LOG_PREFIX, `AndroidVR failed for ${trackId}: ${vrErr.message}`);
+  // ── Step 6: Android VR — last resort ─────────────────────────────────────
+  if (!best) {
+    best = await tryClient(`player:ANDROID_VR:${trackId}`, 'AndroidVR', () => fetchPlayerDataAndroidVR(trackId, env, userToken));
   }
 
-  throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
+  if (!best) throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
+
+  const format = mimeToExtension(best.mimeType);
+  const bitrate = best.bitrate || 0;
+  return jsonRes({
+    url: `${base}/download/${trackId}`,
+    format,
+    quality: bitrate ? `${Math.round(bitrate / 1000)}kbps` : undefined,
+    expiresAt: Date.now() + PLAYER_CACHE_TTL_MS,
+  });
 }
 
 
@@ -1271,15 +1194,15 @@ function lastSegment(rest){ return rest.split('/').filter(Boolean).pop()||''; }
 function buildManifest(mode) {
   const m=mode||'both';
   const variants={
-    both:   { id:'com.ricky.youtube-music',        name:'YouTube Music',          description:'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. HLS + AAC.' },
-    songs:  { id:'com.ricky.youtube-music-songs',  name:'YouTube Music — Songs',  description:'Stream from YouTube Music — Songs tab only. Albums, Artists & Playlists. HLS + AAC.' },
-    videos: { id:'com.ricky.youtube-music-videos', name:'YouTube Music — Videos', description:'Stream from YouTube Music — Videos tab. Artists & Playlists. HLS + AAC.' },
+    both:   { id:'com.ricky.youtube-music',        name:'YouTube Music',          description:'Stream from YouTube Music — Songs & Videos, Albums, Artists, Playlists. M4A/AAC + FLAC.' },
+    songs:  { id:'com.ricky.youtube-music-songs',  name:'YouTube Music — Songs',  description:'Stream from YouTube Music — Songs tab only. Albums, Artists & Playlists. M4A/AAC + FLAC.' },
+    videos: { id:'com.ricky.youtube-music-videos', name:'YouTube Music — Videos', description:'Stream from YouTube Music — Videos tab. Artists & Playlists. M4A/AAC + FLAC.' },
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.2.0', description:v.description,
+    id:v.id, name:v.name, version:'2.3.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
-    resources:['search','stream','download','catalog'],
+    resources:['search','stream','catalog'],
     types:['track','album','artist','playlist'],
     contentType:'music',
   };
@@ -1288,7 +1211,20 @@ function buildManifest(mode) {
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q=url.searchParams.get('q')||url.searchParams.get('query')||'';
   if (rest==='/manifest.json'||rest==='/manifest') return jsonRes(buildManifest(mode));
-  if (rest==='/search')              return jsonRes(await handleSearch(q,env,userToken,mode));
+  if (rest==='/search') {
+    // Cross-instance cache (Cloudflare Cache API) so repeat queries beat the
+    // docs' <5s search budget even when YouTube throttles datacenter IPs.
+    const cache = caches.default;
+    const cacheReq = new Request(url.href, { method: 'GET' });
+    const cached = await cache.match(cacheReq);
+    if (cached) return cached;
+    const res = jsonRes(await handleSearch(q,env,userToken,mode));
+    if (res.status === 200) {
+      res.headers.set('cache-control', 'public, max-age=30');
+      await cache.put(cacheReq, res.clone());
+    }
+    return res;
+  }
   if (rest.startsWith('/stream/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return await handleStream(id,request,env,userToken); }
   if (rest.startsWith('/download/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return await proxyDownload(id,request,env,userToken); }
   if (rest.startsWith('/album/'))    { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id,env,userToken)); }
