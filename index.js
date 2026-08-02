@@ -1300,17 +1300,21 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </svg>
   <h1>YouTube Music for Eclipse</h1>
   <p class="sub">Full YouTube Music catalog &mdash; Songs, Videos, Albums, Artists &amp; Playlists. No account required.</p>
-  <div class="tip"><b>Save your URLs.</b> Paste one below any time to copy it again without reinstalling.</div>
+  <div class="tip"><b>Web setup:</b> paste the URL at <b>eclipsemusic.app/configure &rarr; Configure Addons</b> &mdash; it syncs to every device you're signed in to.</div>
   <div class="pills">
     <span class="pill">Songs &middot; Videos</span>
     <span class="pill">Albums &middot; Artists &middot; Playlists</span>
-    <span class="pill hi">HLS Streaming</span>
-    <span class="pill gr">Proxied AAC Downloads</span>
+    <span class="pill hi">M4A &middot; AAC Streaming</span>
+    <span class="pill gr">Proxied Downloads</span>
     <span class="pill gr">Offline Playback</span>
-    <span class="pill gr">Upstash Redis</span>
     <span class="pill bl">No Account</span>
   </div>
-  <button class="bw" id="genBtn" onclick="generate()">Generate My Addon URLs</button>
+  <button class="bw" id="mBtn" onclick="copyManifest()">Copy Manifest URL</button>
+  <div class="hint" style="margin-top:8px;text-align:center">One URL installs everything &mdash; search, stream, albums, artists &amp; playlists.</div>
+  <hr>
+  <h2>Tab-specific URLs</h2>
+  <div class="hint">Optional &mdash; use these to limit search to Songs-only or Videos-only tabs. Each is unique to your session.</div>
+  <button class="bg" id="genBtn" onclick="generate()">Generate My Addon URLs</button>
   <div class="box" id="genBox">
     <div class="blbl">Songs &amp; Videos (both) &mdash; paste into Eclipse</div>
     <div class="burl" id="urlBoth"></div>
@@ -1327,16 +1331,18 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   <hr>
   <h2>How to install</h2>
   <div class="steps">
-    <div class="step"><div class="sn">1</div><div class="st">Tap <b>Generate My Addon URLs</b> above</div></div>
-    <div class="step"><div class="sn">2</div><div class="st">Copy the URL for the tab you want</div></div>
-    <div class="step"><div class="sn">3</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Addons &rarr; Add Addon &rarr; paste the URL</div></div>
+    <div class="step"><div class="sn">1</div><div class="st">Tap <b>Copy Manifest URL</b> above (or generate a tab-specific URL)</div></div>
+    <div class="step"><div class="sn">2</div><div class="st"><b>On the web:</b> open <b>eclipsemusic.app/configure</b> &rarr; <b>Configure Addons</b> &rarr; <b>Community Addons</b> &rarr; paste &rarr; <b>Add</b></div></div>
+    <div class="step"><div class="sn">3</div><div class="st"><b>In the app:</b> Settings &rarr; Cloud Storage &rarr; Add Connection &rarr; Addons &rarr; paste the URL</div></div>
+    <div class="step"><div class="sn">4</div><div class="st">Open Eclipse (app or <b>Web Player</b> at <b>eclipsemusic.app/web</b>), search anything, press play</div></div>
   </div>
-  <div class="warn">Each URL is unique to your session. Regenerating creates a new URL — old ones keep working.</div>
+  <div class="warn">Each generated URL is unique to your session. Regenerating creates a new URL &mdash; old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.2.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.3.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
+function copyManifest(){navigator.clipboard.writeText(base()+'/manifest.json');}
 function generate(){
   tok=Array.from(crypto.getRandomValues(new Uint8Array(14)),b=>b.toString(16).padStart(2,'0')).join('');
   urls={both:base()+'/u/'+tok+'/',songs:base()+'/u/'+tok+'/songs/',videos:base()+'/u/'+tok+'/videos/'};
