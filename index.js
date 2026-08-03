@@ -266,6 +266,14 @@ function tryRefreshVisitor(data, env, userToken) {
   if (vd) upstashCmd(env, 'SET', key, vd, 'EX', VISITOR_TTL_SEC);
   if (vd) memSet(key, vd, VISITOR_TTL_SEC * 1000);
 }
+// YouTube intermittently bot-blocks a visitor (LOGIN_REQUIRED / no formats).
+// Dropping the cached visitor forces a fresh visitor_id next request, which
+// usually passes — call before retrying a fully-failed resolution.
+function invalidateVisitorData(env, userToken) {
+  const key = userToken ? `ytm:visitor:${userToken}` : 'ytm:visitor';
+  memCache.delete(key);
+  upstashCmd(env, 'DEL', key);
+}
 
 function parseDuration(text) {
   if (!text) return 0;
@@ -962,14 +970,18 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     console.log(LOG_PREFIX, `WebCreator skipped for ${trackId} (no cookie)`);
   }
 
-  // ── Step 3: iOS ──────────────────────────────────────────────────────────
-  if (!best) {
+  // ── Step 3: iOS (usable streams need a signed-in cookie) ─────────────────
+  if (!best && env?.YT_COOKIE) {
     best = await tryClient(`player:IOS:${trackId}`, 'iOS', () => fetchPlayerData(trackId, env, userToken));
+  } else if (!best) {
+    console.log(LOG_PREFIX, `iOS skipped for ${trackId} (no cookie)`);
   }
 
-  // ── Step 4: WEB_EMBEDDED_PLAYER ──────────────────────────────────────────
-  if (!best) {
+  // ── Step 4: WEB_EMBEDDED_PLAYER (usually needs a PO token) ───────────────
+  if (!best && await getPoToken(env)) {
     best = await tryClient(`player:WEB_EMBEDDED:${trackId}`, 'WebEmbedded', () => fetchPlayerDataWebEmbedded(trackId, env));
+  } else if (!best) {
+    console.log(LOG_PREFIX, `WebEmbedded skipped for ${trackId} (no PO token)`);
   }
 
   // ── Step 5: VISIONOS — Metrolist's default stream client ─────────────────
@@ -982,16 +994,26 @@ async function handleStream(trackId, incomingRequest, env, userToken) {
     best = await tryClient(`player:ANDROID_VR:${trackId}`, 'AndroidVR', () => fetchPlayerDataAndroidVR(trackId, env, userToken));
   }
 
+  // YouTube intermittently bot-blocks the whole anonymous visitor — retry the
+  // device clients once with a fresh visitorData before giving up.
+  if (!best) {
+    invalidateVisitorData(env, userToken);
+    best = await tryClient(`player:VISIONOS:${trackId}`, 'VISIONOS (retry)', () => fetchPlayerDataVisionOS(trackId, env, userToken));
+    if (!best) {
+      best = await tryClient(`player:ANDROID_VR:${trackId}`, 'AndroidVR (retry)', () => fetchPlayerDataAndroidVR(trackId, env, userToken));
+    }
+  }
+
   if (!best) throw new Error(`${LOG_PREFIX} No playable audio for ${trackId} — all clients exhausted`);
 
   const format = mimeToExtension(best.mimeType);
   const bitrate = best.bitrate || 0;
-  return jsonRes({
+  return cfCached(new URL(incomingRequest.url), 60, () => jsonRes({
     url: `${base}/download/${trackId}`,
     format,
     quality: bitrate ? `${Math.round(bitrate / 1000)}kbps` : undefined,
     expiresAt: Date.now() + PLAYER_CACHE_TTL_MS,
-  });
+  }));
 }
 
 
@@ -1013,13 +1035,23 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
     { fetch: () => cachedPlayer(`player:ANDROID_VR:${trackId}`, () => fetchPlayerDataAndroidVR(trackId, env, userToken)), ua: ANDROID_VR_UA },
   );
   let data = null, ua = VISIONOS_UA;
-  for (const s of sources) {
-    try {
-      const d = await s.fetch();
-      if (d?.streamingData) { data = d; ua = s.ua; break; }
-    } catch (e) {
-      console.log(LOG_PREFIX, `download source failed for ${trackId}: ${e.message}`);
+  async function resolve() {
+    for (const s of sources) {
+      try {
+        const d = await s.fetch();
+        if (d?.streamingData) { data = d; ua = s.ua; return true; }
+      } catch (e) {
+        console.log(LOG_PREFIX, `download source failed for ${trackId}: ${e.message}`);
+      }
     }
+    return false;
+  }
+  let ok = await resolve();
+  // YouTube intermittently bot-blocks the whole anonymous visitor — retry
+  // once with a fresh visitorData before giving up.
+  if (!ok) {
+    invalidateVisitorData(env, userToken);
+    ok = await resolve();
   }
   const sd = data?.streamingData;
   if (!sd) throw new Error(`${LOG_PREFIX} No streaming data for download`);
@@ -1040,7 +1072,21 @@ async function proxyDownload(trackId, incomingRequest, env, userToken) {
   const range = incomingRequest.headers.get('range');
   if (range) reqHeaders['Range'] = range;
 
-  const upstream = await fetch(cdnUrl, { headers: reqHeaders });
+  // googlevideo IP-locks each URL to the IP the player request came from.
+  // Cloudflare's egress IP varies per fetch, so when it mismatches, the CDN
+  // echoes the URL back as text/plain. Retry — a later attempt may egress
+  // from the locked IP (observed ~60-75% success per attempt).
+  let upstream = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    upstream = await fetch(cdnUrl, { headers: reqHeaders });
+    const ct = upstream.headers.get('content-type') || '';
+    const isAudio = ct.includes('audio') || ct.includes('octet-stream') || ct.includes('video');
+    if (upstream.ok || upstream.status === 206) {
+      if (isAudio) break;
+      if (attempt < 3) { await upstream.body?.cancel?.(); continue; }
+    }
+    break;
+  }
 
   const upstreamCT = upstream.headers.get('content-type') || '';
   if (!upstream.ok && upstream.status !== 206) {
@@ -1227,7 +1273,7 @@ function buildManifest(mode) {
   };
   const v=variants[m]||variants.both;
   return {
-    id:v.id, name:v.name, version:'2.3.0', description:v.description,
+    id:v.id, name:v.name, version:'2.4.0', description:v.description,
     icon:'https://www.gstatic.com/youtube/media/ytm/images/applauncher/music_icon_144x144.png',
     resources:['search','stream','catalog'],
     types:['track','album','artist','playlist'],
@@ -1237,27 +1283,32 @@ function buildManifest(mode) {
 
 async function handleRoute(rest, url, request, env, userToken, mode) {
   const q=url.searchParams.get('q')||url.searchParams.get('query')||'';
-  if (rest==='/manifest.json'||rest==='/manifest') return jsonRes(buildManifest(mode));
-  if (rest==='/search') {
-    // Cross-instance cache (Cloudflare Cache API) so repeat queries beat the
-    // docs' <5s search budget even when YouTube throttles datacenter IPs.
-    const cache = caches.default;
-    const cacheReq = new Request(url.href, { method: 'GET' });
-    const cached = await cache.match(cacheReq);
-    if (cached) return cached;
-    const res = jsonRes(await handleSearch(q,env,userToken,mode));
-    if (res.status === 200) {
-      res.headers.set('cache-control', 'public, max-age=30');
-      await cache.put(cacheReq, res.clone());
-    }
-    return res;
-  }
+  if (rest==='/manifest.json'||rest==='/manifest')
+    return cfCached(url, 300, () => jsonRes(buildManifest(mode)));
+  if (rest==='/search')
+    return cfCached(url, 30, async () => jsonRes(await handleSearch(q,env,userToken,mode)));
   if (rest.startsWith('/stream/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return await handleStream(id,request,env,userToken); }
   if (rest.startsWith('/download/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return await proxyDownload(id,request,env,userToken); }
-  if (rest.startsWith('/album/'))    { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleAlbum(id,env,userToken)); }
-  if (rest.startsWith('/artist/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handleArtist(id,env,userToken,mode)); }
-  if (rest.startsWith('/playlist/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return jsonRes(await handlePlaylist(id,env,userToken)); }
+  if (rest.startsWith('/album/'))    { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return cfCached(url, 300, async () => jsonRes(await handleAlbum(id,env,userToken))); }
+  if (rest.startsWith('/artist/'))   { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return cfCached(url, 300, async () => jsonRes(await handleArtist(id,env,userToken,mode))); }
+  if (rest.startsWith('/playlist/')) { const id=lastSegment(rest); if(!id)return jsonRes({error:'Missing ID'},400); return cfCached(url, 300, async () => jsonRes(await handlePlaylist(id,env,userToken))); }
   return null;
+}
+
+// Cloudflare edge cache — repeat requests are served straight from the
+// nearest colo (no worker, no YouTube round trip). TTLs are short because
+// the underlying data is stable; docs want search <5s, stream <3s.
+async function cfCached(url, ttlSec, build) {
+  const cache = caches.default;
+  const cacheReq = new Request(url.href, { method: 'GET' });
+  const cached = await cache.match(cacheReq);
+  if (cached) return cached;
+  const res = await build();
+  if (res.status === 200) {
+    res.headers.set('cache-control', `public, max-age=${ttlSec}`);
+    await cache.put(cacheReq, res.clone());
+  }
+  return res;
 }
 
 function jsonRes(data, status) {
@@ -1365,7 +1416,7 @@ footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-heigh
   </div>
   <div class="warn">Each generated URL is unique to your session. Regenerating creates a new URL &mdash; old ones keep working.</div>
 </div>
-<footer>YouTube Music for Eclipse &middot; v2.3.0 &middot; Cloudflare Workers</footer>
+<footer>YouTube Music for Eclipse &middot; v2.4.0 &middot; Cloudflare Workers</footer>
 <script>
 let tok=null,urls={};
 function base(){return location.origin;}
