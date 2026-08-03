@@ -6,6 +6,21 @@ const YTM_BASE    = 'https://music.youtube.com';
 // Falls back to the public key if the env secret is not set.
 const YTM_API_KEY_FALLBACK = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
 function getApiKey(env) { return env?.YTM_API_KEY || YTM_API_KEY_FALLBACK; }
+
+// ─── Credentials (embedded) ──────────────────────────────────────────────────
+// Declared in code per setup — mirrors credentials.json. Fill the empty slots
+// to unlock extras (see comments). Worker secrets / .dev.vars override these.
+const EMBEDDED_CREDENTIALS = {
+  YTM_API_KEY:               'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30', // innertube key
+  YT_PO_TOKEN:               '', // PO token — bypasses bot checks on web clients
+  YT_VISITOR_DATA:           '', // visitor data paired with the PO token
+  YT_COOKIE:                 '', // signed-in YouTube cookie — unlocks itag 141 (256kbps) on Android Music
+  YT_PO_TOKEN_GENERATOR_URL: '', // self-hosted PO token generator (auto-rotation)
+  YOUTUBE_DATA_API_KEY:      '', // YouTube Data API v3 key (channel search fallback)
+  UPSTASH_REDIS_REST_URL:    '', // shared cross-region cache (visitor, PO token)
+  UPSTASH_REDIS_REST_TOKEN:  '',
+};
+
 const VISITOR_TTL_SEC = 300;
 
 const STREAM_EXPIRES_SEC = 5 * 3600 + 50 * 60;
@@ -1242,7 +1257,7 @@ async function handlePlaylist(playlistId, env, userToken) {
   const hdr=extractResponsiveHeader(data)||{};
   const title=runsText(hdr.title?.runs)||'Playlist';
   const creator=(hdr.subtitle?.runs||[])
-    .filter(r=>!isBullet(r.text)&&r.text!=='Playlist')
+    .filter(r=>!isBullet(r.text)&&r.text!=='Playlist'&&!/^\d{4}$/.test(r.text.trim()))
     .map(r=>r.text.trim()).filter(Boolean).join('').trim();
   const artworkURL=bestThumbnail(hdr.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails||hdr.thumbnail?.croppedSquareThumbnailRenderer?.thumbnail?.thumbnails||[]);
   const tracks=extractSecondaryTracks(data);
@@ -1446,6 +1461,8 @@ function reCopy(){
 
 export default {
   async fetch(request, env) {
+    // Merge embedded credentials (secrets / .dev.vars take precedence)
+    env = { ...EMBEDDED_CREDENTIALS, ...(env || {}) };
     const url = new URL(request.url);
     const path = url.pathname;
 
